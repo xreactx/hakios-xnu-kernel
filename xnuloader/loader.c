@@ -940,6 +940,8 @@ static struct loader_battery charger_shared __attribute__((aligned(0x2000))) = {
 };
 static efi_charger_ex *CHARGER_EX;
 static efi_qcom_charger *QCOM_CHARGER;
+static efi_pmic_fg *PMIC_FG;            /* the 6T's fuel gauge, once it has passed fg_start()'s checks */
+static uint32_t pmic_fg_index;
 static int charger_enabled;
 
 /* The screen recording the last kernel left in memory, if it made one ("oem recording" stages it). */
@@ -1072,7 +1074,7 @@ charger_poll(void)
 	uint32_t action = 0xffffffffu, flags = 0, voltage = 0;
 	uint8_t present = 0, plugged = 0;
 	efi_status s;
-	int have_soc = 0, have_voltage = 0;
+	int have_soc = 0, have_voltage = 0, fg_current = 0;
 
 	if (!charger_enabled) {
 		return;
@@ -1125,11 +1127,29 @@ charger_poll(void)
 			charger_shared.temperature_c = status.battery_temperature_c;
 		}
 	}
+	if (PMIC_FG != NULL) {
+		efi_pmic_fg_status fg;
+
+		memset(&fg, 0, sizeof(fg));
+		s = PMIC_FG->get_battery_status(pmic_fg_index, &fg);
+		if (!EFI_ERROR(s) && fg.state_of_charge <= 100 && fg.battery_voltage_mv >= 2500 && fg.battery_voltage_mv <= 5000) {
+			charger_shared.soc_percent = (int32_t)fg.state_of_charge;
+			charger_shared.voltage_mv = (int32_t)fg.battery_voltage_mv;
+			charger_shared.current_ma = fg.charge_current_ma;
+			charger_shared.temperature_c = fg.battery_temperature_c;
+			have_soc = have_voltage = fg_current = 1;
+			flags |= LOADER_BATTERY_VALID | LOADER_BATTERY_VOLTAGE_VALID;
+		}
+	}
 	if (!have_soc && have_voltage) {
 		charger_shared.soc_percent = soc_from_voltage((uint32_t)charger_shared.voltage_mv);
 		flags |= LOADER_BATTERY_VALID | LOADER_BATTERY_SOC_ESTIMATED;
 	}
-	if (plugged && charger_shared.soc_percent < 100) {
+	/*
+	 * With the 6T's fuel gauge the current says it (negative: into the battery). A computer's USB port
+	 * does not keep up with the phone at work: plugged in, the battery gave 716 mA while it booted.
+	 */
+	if (fg_current ? plugged && charger_shared.current_ma < 0 : plugged && charger_shared.soc_percent < 100) {
 		flags |= LOADER_BATTERY_CHARGING;
 	}
 	charger_shared.flags = flags;
@@ -2188,8 +2208,9 @@ block_poll(void)
  * layout -- its first three entries take a pointer, refuse NULL and only answer through it. QcomCharger
  * revision 0x10007 does NOT: its fourth entry, redwood's get_charging_action, takes a 32-bit value and
  * hands it to the PMIC's charger protocol (a setter), and so does the third. On this phone QcomCharger
- * is therefore never called, initialize() included; ChargerEx alone gives presence and voltage, and the
- * charge is estimated from the voltage (LOADER_BATTERY_SOC_ESTIMATED).
+ * is therefore never called, initialize() included; ChargerEx gives presence and voltage, and PmicDxe's
+ * fuel gauge (fg_start()) the charge, current and temperature -- or, without it, the charge is estimated
+ * from the voltage (LOADER_BATTERY_SOC_ESTIMATED).
  */
 #define FAJITA_CHARGER_EX_REVISION      0x10003
 static void
@@ -2212,6 +2233,54 @@ charger_look(void)
 		print("battery: %s at %x, revision %x; words 1-7: %x %x %x %x %x %x %x\n", protocols[i].name,
 		    (uint64_t)(uintptr_t)table, table[0], table[1], table[2], table[3], table[4], table[5], table[6], table[7]);
 	}
+}
+
+/*
+ * The 6T's fuel gauge, if it is the one disassembled (PmicDxeWp.efi): revision 0x10016, and its third
+ * entry beginning "sub sp, sp, #64; str x19, [sp, #32]" with "bl 0x1992c" (the helper that reads the four
+ * values) 0x2c into it. Then the PMIC it is on: GetBatteryStatus is asked for PMIC 1 and 2 (a wrong one
+ * is only reads of a PMIC without a gauge) and the first with a believable voltage is kept.
+ */
+#define FAJITA_PMIC_FG_REVISION         0x10016
+#define FAJITA_PMIC_FG_ENTRY3_BL        0x940003e1      /* bl +0xf84: from 0x189a8 to 0x1992c */
+
+static void
+fg_start(void)
+{
+	static const efi_guid fg_guid = QCOM_PMIC_FG_GUID;
+	efi_pmic_fg *fg = NULL;
+	efi_status s = BS->locate_protocol(&fg_guid, NULL, (void **)&fg);
+	const uint32_t *entry3;
+
+	if (EFI_ERROR(s) || fg == NULL) {
+		print("battery: fuel gauge: not found (%x)\n", s);
+		return;
+	}
+	entry3 = (const uint32_t *)fg->get_battery_status;
+	print("battery: fuel gauge at %x, revision %x; entry 3 %x: %x %x ... %x\n", (uint64_t)(uintptr_t)fg, fg->revision,
+	    (uint64_t)(uintptr_t)entry3, (uint64_t)entry3[0], (uint64_t)entry3[1], (uint64_t)entry3[11]);
+	if (fg->revision != FAJITA_PMIC_FG_REVISION || entry3[0] != 0xd10103ff || entry3[1] != 0xf90013f3 ||
+	    entry3[11] != FAJITA_PMIC_FG_ENTRY3_BL) {
+		print("battery: fuel gauge: not the one disassembled: not called\n");
+		return;
+	}
+	for (uint32_t pmic = 1; pmic <= 2; pmic++) {
+		efi_pmic_fg_status info;
+
+		memset(&info, 0, sizeof(info));
+		s = fg->get_battery_status(pmic, &info);
+		print("battery: fuel gauge, PMIC %d: status %x: %d%% %d mA %d mV %d C\n", (uint64_t)pmic, s,
+		    (uint64_t)info.state_of_charge, (uint64_t)(int64_t)info.charge_current_ma, (uint64_t)info.battery_voltage_mv,
+		    (uint64_t)(int64_t)info.battery_temperature_c);
+		if (!EFI_ERROR(s) && info.state_of_charge <= 100 && info.battery_voltage_mv >= 2500 &&
+		    info.battery_voltage_mv <= 5000) {
+			PMIC_FG = fg;
+			pmic_fg_index = pmic;
+			print("battery: fuel gauge: PMIC %d it is\n", (uint64_t)pmic);
+			return;
+		}
+	}
+	print("battery: fuel gauge: no PMIC answered believably: the voltage estimate stays\n");
 }
 
 static void
@@ -2237,6 +2306,7 @@ charger_start(void)
 		charger_enabled = 1;
 		print("battery: ChargerEx only (QcomCharger is not called on this phone); shared=%x\n",
 		    (uint64_t)(uintptr_t)&charger_shared);
+		fg_start();
 		charger_poll();
 		print("battery: flags=%x SOC=%d%% V=%d mV I=%d mA T=%d C action=%d\n", (uint64_t)charger_shared.flags,
 		    (uint64_t)(int64_t)charger_shared.soc_percent, (uint64_t)(int64_t)charger_shared.voltage_mv,
