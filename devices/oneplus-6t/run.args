@@ -6,4 +6,5 @@ soc_vtimer=19   # the SDM845's virtual timer interrupt (PPI 3, intid 19); withou
 cpufreq_osm=2   # the cores' clocks raised (bsd/dev/hakios.cpufreq.c): big 825 -> 2400 MHz, small 1612 -> 1766; the home screen in 32 s, not 70
 thermal=1       # the SoC's 21 temperature sensors (bsd/dev/hakios.thermal.c), read only: cores every 10 s, the most at the end
 buttons=2       # power, volume up and down (bsd/dev/hakios.buttons.c, the 6T's layout): read from the PM8998, reported to SpringBoard
+battery=1       # the battery through the loader (UEFI's ChargerEx and PmicDxe's fuel gauge): charge, current, temperature for the status bar
 synaptics=3     # the touch screen (bsd/dev/hakios.synaptics.c): powered, configured, touches to SpringBoard
