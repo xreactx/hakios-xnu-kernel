@@ -32,7 +32,7 @@ typedef struct efi_text_output {
 	efi_status (EFIAPI *output_string)(struct efi_text_output *self, const char16 *str);
 } efi_text_output;
 
-enum { EfiLoaderData = 2, EfiConventionalMemory = 7 };
+enum { EfiReservedMemoryType = 0, EfiLoaderData = 2, EfiConventionalMemory = 7 };
 enum { AllocateAnyPages = 0, AllocateMaxAddress = 1, AllocateAddress = 2 };
 enum { ByProtocol = 2 };
 
