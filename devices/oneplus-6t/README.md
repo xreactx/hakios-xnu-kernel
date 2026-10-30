@@ -333,13 +333,13 @@ What `hakios.sound.c` needs instead of redwood's numbers (its first TDM, a group
 |---|---|---|
 | interface, port | quaternary MI2S, AFE port `0x1006` (QUAT_MI2S_RX), no group; configured by AFE's I2S parameter (`0x1020d`) | primary TDM, port `0x9000` in group `0x9100` |
 | lines | playback on SD1 (`qcom,msm-mi2s-rx-lines = 2`), the amplifier's feedback on SD0 (`tx-lines = 1`) | |
-| bit clock | QUAD_MI2S_IBIT (`0x106`), 48 kHz x 32-bit slots x 2 = 3.072 MHz for 24 bits (below) | PRI_TDM_IBIT (`0x200`), 3.072 MHz |
+| bit clock | QUAD_MI2S_IBIT (`0x106`), 48 kHz x 16 bits x 2 = 1.536 MHz (below) | PRI_TDM_IBIT (`0x200`), 3.072 MHz |
 | pins | GPIO 58 bit clock, 59 frame sync (output high), 60 SD0, 61 SD1: function 1 (`qua_mi2s`), 8 mA, no pull; north tile (`0x3400000 + 0x500000`, a page each) | GPIO 97-100, function 1 |
 | the DSP's view of our memory | SMMU stream `0x1821` (mask `0xf`: bit 32 of its addresses, as redwood's `0x1801`) | `0x1801` |
 
-The format: Android's `/vendor/etc/audio_platform_info.xml` gives the speaker `bit_width="24"`, which its audio HAL
-applies to the speaker's back end -- so 24 bits in 32-bit slots, and the I2S parameter's bit width 24, rather than the
-back end's default of 16 (1.536 MHz). Not yet seen on the running phone: `/proc/asound` needs root (the Magisk image).
+The format is **16 bits**, seen on the running phone: Android's TFA driver logs every start's `hw_params` --
+"Requested rate: 48000, sample size: 16, physical size: 16" -- although `/vendor/etc/audio_platform_info.xml` gives the
+speaker `bit_width="24"` (the HAL's, not what reaches the port). So `soc_sound_bits=16`: 1.536 MHz.
 
 **The speaker's path up to the amplifier works** (30 October 2026). `hakios.sound.c` takes the port by boot-args
 (`soc_sound_port=0x1006 soc_sound_clock=0x106 soc_sound_bits=24 soc_audio_stream=0x1821`): a port in `0x1000`-`0x10ff`
@@ -359,7 +359,17 @@ the step limit no longer turns that into `adsp_step`):
       soc_audio_stream=0x1821 soc_smem=0x86000000 soc_cmd_db=0x85fe0000 soc_rsc=0x179e0000 soc_aoss=0xc300000
       soc_adsp_mem=0x8c500000 soc_adsp_mem_size=0x1a00000 soc_apcs_ipc=0x1799000c soc_adsp_cx=1" ./xl run
 
-Nothing is heard: the amplifier (TFA9894) is next. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
+Nothing is heard: the amplifier (TFA9894) is next. (Those runs had 24 bits; it is 16, as below.)
+
+**The amplifier under Android, rooted** (30 October 2026; `magisk_patched-31100_llnZs.img`, the phone's own 2021-11
+build, booted once with `fastboot boot`, nothing flashed). NXP's driver v6.5.2 has it on I2C bus 2 (the serial engine at
+`0x890000`), address `0x34`: a TFA9894 (register 3 = `0x1a94`), container `tfa98xx.cnt` with five profiles --
+`MUSIC_48000` (what music plays with), `VOICE_48000`, `MMITest_48000`, `dsp_bypass_P` -- loaded at boot, when its first
+start sends the "cold boot patch". `tools/tfa_regs.c` reads its 16-bit registers (toybox's `i2cget` reads bytes); the
+dumps idle and while a tone plays through QUAT_MI2S (`tinyplay`, MultiMedia1) are in `fw-audio/tfa-dumps/`. Playing
+changes only the control register `0x00` (`0xa275` to `0xa27c`: out of power-down, amplifier and boost on), `0x04`
+(`0x40` to 0) and status registers: everything else was set up at boot. HakiOS starts the phone cold, so it must send
+that whole set-up itself -- next: record it with the kernel's I2C trace while Android's driver does it. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
 
 **11. Then** Wi-Fi; cellular last.
 
