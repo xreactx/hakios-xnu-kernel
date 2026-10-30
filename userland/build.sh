@@ -444,6 +444,8 @@ done
 if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
+	# the OnePlus 6T's speaker amplifier: its set-up as Android's driver did it (tools/tfa-trace2replay.py; hakios.tfa9894.c)
+	[ ! -f ../fw-audio/tfa9894-coldboot.replay ] || install -m 0644 ../fw-audio/tfa9894-coldboot.replay root/fw/
 fi
 # Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
 # device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone

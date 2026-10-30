@@ -66,7 +66,8 @@
  * soc_sound_bits, soc_audio_stream): the OnePlus 6T's is its quaternary MI2S, QUAT_MI2S_RX 0x1006, no
  * group, the AFE's I2S parameter instead (SD1, stereo, 24 bits, our clocks), clock 0x106 at 3.072 MHz,
  * GPIO 58 to 61, stream 0x1821 (devices/oneplus-6t/README.md, step 10). Its amplifier is not redwood's:
- * there, sound=1 and sound=2 only.
+ * there sound=3 sets up and switches on its TFA9894 (hakios.tfa9894.c) for the tone, and sound=4 is not
+ * done yet.
  *
  * What is started is stopped, and what is written is put back, when the time is over -- or, if
  * the DSP is to be shut down earlier (the run's end), before that (hakios_sound_dsp_down()).
@@ -1142,7 +1143,7 @@ play(uint32_t ms, bool amplifiers)
 
 		say("sound: %u periods written, %u given back (%u with an error), %u underflows, in %llu ms: the DSP took %llu frames a "
 		    "second%s\n", sent, done, write_errors, underflows, us / 1000, us ? frames * 1000000 / us : 0,
-		    amplifiers ? "" : " (the amplifiers off: nothing to hear)");
+		    amplifiers ? "" : level >= 3 && mi2s ? " (through the 6T's amplifier)" : " (the amplifiers off: nothing to hear)");
 		if (amplifiers) {
 			say("sound: the amplifiers' status looked at %u times while it played\n", healthy_looks);
 		}
@@ -1439,7 +1440,11 @@ take_down(void)
 	lck_mtx_lock(&sound_lock);
 	if (running && !taken_down) {
 		taken_down = true;
-		hakios_speaker_stop();
+		if (mi2s) {
+			hakios_tfa9894_stop();
+		} else {
+			hakios_speaker_stop();
+		}
 		stream_off();
 		afe_off();
 		pins_off();
@@ -1472,7 +1477,13 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		    "the port and a stream with a test tone, the amplifiers off" :
 		    "the port, a stream with a test tone, and the amplifiers", seconds);
 	}
-	if (level >= 3) {
+	if (level >= 3 && mi2s) {
+		/* the 6T's amplifier: reset and set up now, powered down; switched on once the port's clocks run */
+		announce("the amplifier (TFA9894): reset, and set up as Android's driver set it up");
+		if (!hakios_tfa9894_prepare()) {
+			goto out;
+		}
+	} else if (level >= 3) {
 		acf = hakios_adsp_fw_file("aw882xx_acf.bin", &acf_size);
 		if (acf == NULL) {
 			say("sound: no /fw/aw882xx_acf.bin: put the phone's /vendor/etc/aw882xx_acf.bin into fw-audio/ and run SYSTEM=1 "
@@ -1538,6 +1549,21 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		watch();
 		thread_terminate(current_thread());
 	}
+	if (level >= 3 && mi2s) {
+		/* the clock runs (the port is started, the stream as well): the amplifier can lock to it */
+		announce("the amplifier switched on, as Android's driver switches it on");
+		if (!hakios_tfa9894_start()) {
+			goto out;
+		}
+		say("sound: THE TONE PLAYS NOW for %u s: 1 kHz at -20 dBFS, through the 6T's speaker at the amplifier's own level\n",
+		    seconds);
+		say_when("the tone begins");
+		ok = play(seconds * 1000, false);
+		say_when("the tone has ended");
+		hakios_tfa9894_stop();
+		space_faults();
+		goto out;
+	}
 	if (level >= 3) {
 		/* the clock runs (the port is started, the stream as well): the amplifiers can lock to it */
 		announce("the amplifiers, set up from Android's Music profile, then started at the lowest volume");
@@ -1587,9 +1613,10 @@ hakios_sound_dsp_up(void)
 		pins = quat_mi2s_pins;          /* (the only MI2S port there is so far: the OnePlus 6T's speaker) */
 		say("sound: another phone's port: MI2S %#x, clock %#x, %u bits; SMMU stream %#x\n", port, clock_id, port_bits,
 		    audio_stream);
-		if (level > 2) {
-			say("sound: sound=%u needs redwood's amplifiers, which this phone has not: sound=2 is done, not more\n", level);
-			level = 2;
+		if (level > 3) {
+			say("sound: sound=%u is redwood's amplifiers' with iOS's sound: on this phone sound=3 (the tone through its amplifier, "
+			    "hakios.tfa9894.c) is done, not more\n", level);
+			level = 3;
 		}
 	}
 	PE_parse_boot_argn("sound_secs", &seconds, sizeof(seconds));

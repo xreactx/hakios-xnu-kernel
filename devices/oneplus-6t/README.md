@@ -390,7 +390,23 @@ taken, as the driver reads a profile's items in order.
 
 For the kernel's driver: the amplifier's bus is the serial engine at `0x890000` on GPIO 89 and 90 (function `qup4`,
 2 mA, no pull; Linux's `pinctrl-sdm845.c`: south tile), done by hand as the touch screen's; its reset GPIO 69 (east
-tile); and the port at 16 bits, the format Android plays. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
+tile); and the port at 16 bits, the format Android plays.
+
+**Sound** (30 October 2026, run 233354): `hakios.tfa9894.c` replays that set-up over I2C done by hand on GPIO 89 (data)
+and 90 (clock), after a pulse of the reset (GPIO 69 high for 1 ms, as the driver's probe does), from
+`fw/tfa9894-coldboot.replay` in the small image (`ADSP=1 userland/build.sh` puts it there). `tfa9894=1` looks (the pins,
+register 3 = `0x1a94`), `tfa9894=2` sets it up and powers it down (run 233243: 139 writes taken, 10 of 121 reads not
+as Android's -- register `0x10` one bit apart while there are no clocks, `0x93` `0x0300` for `0x0200` three times --
+and the registers then as in Android's idle dump). With `sound=3` (and `soc_sound_bits=16`) the sound's path sets it
+up, switches it on as Android does once the port's clocks run -- register `0x10` reads `0x785e`, Android's value while
+it plays -- and a 1 kHz tone at -20 dBFS plays for 3 s: **heard from the speaker**. 159 periods, no error, 48400 frames
+a second; then the amplifier is muted and powered down and everything put back.
+
+    XL_SECS=120 XL_CMDLINE="-v adsp=1 sound=3 soc_sound_port=0x1006 soc_sound_clock=0x106 soc_sound_bits=16
+      soc_audio_stream=0x1821 soc_smem=0x86000000 soc_cmd_db=0x85fe0000 soc_rsc=0x179e0000 soc_aoss=0xc300000
+      soc_adsp_mem=0x8c500000 soc_adsp_mem_size=0x1a00000 soc_apcs_ipc=0x1799000c soc_adsp_cx=1" ./xl run
+
+Next: iOS's sound through it (`sound=4`), and a volume -- the amplifier plays at its own level, there is no fade yet. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
 
 **11. Then** Wi-Fi; cellular last.
 

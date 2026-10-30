@@ -70,6 +70,12 @@ bool hakios_speaker_volume(uint32_t below, uint32_t step_ms); /* below Android's
 bool hakios_speaker_healthy(void);     /* no fault reported; on one, both are powered down at once */
 void hakios_speaker_stop(void);        /* faded out, muted, powered down, in Android's order */
 void hakios_speaker_quiesce(void);     /* powered down at once, without sleeping: on a panic's way out */
+/* The OnePlus 6T's speaker amplifier (bsd/dev/hakios.tfa9894.c): its set-up as Android's driver did it, replayed. */
+void hakios_tfa9894_init(void);        /* boot-arg tfa9894=N: a look (1), or set up and powered down (2) */
+bool hakios_tfa9894_prepare(void);     /* reset, the recorded set-up, powered down */
+bool hakios_tfa9894_start(void);       /* switched on: only while the port's clocks run */
+void hakios_tfa9894_stop(void);        /* muted and powered down */
+void hakios_tfa9894_quiesce(void);     /* the same without sleeping, and its reset pin as found: the run's end, a panic */
 /* the amplifiers' own temperature and battery voltage read (every second while they play): the reduction they call for */
 uint32_t hakios_speaker_monitor(bool tell);
 

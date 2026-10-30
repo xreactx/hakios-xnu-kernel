@@ -9,6 +9,7 @@
 #include <sys/conf.h>
 #include <sys/errno.h>
 #include <sys/proc.h>
+#include <sys/hakios.audio.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
@@ -222,6 +223,7 @@ hakios_input_init(void)
 	hakios_buttons_init();
 	hakios_pmi_haptics_init();
 	hakios_slider_init();
+	hakios_tfa9894_init();
 	hakios_battery_init();
 	hakios_ufs_init();
 	hakios_net_init();
