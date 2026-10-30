@@ -20,6 +20,8 @@
  *                   pattern, and "direct" play (the motor driven at the maximum voltage while PLAY is set;
  *                   Android plays from a buffer of wave samples instead). Enable and play stay 0: nothing
  *                   moves. At the run's end the three registers are put back as they were found.
+ *   pmi_haptics=3   ... and one pulse of pmi_haptics_ms=N milliseconds (100) 3 s after that: enable, play,
+ *                   the status read while it plays, then play and enable off again.
  *
  * Registers (offsets in the block): 0x46 enable ([7]), 0x4e play mode ([5:4]: 0 buffer, 1 direct), 0x51 the
  * maximum voltage ([6:1] x 116 mV), 0x52 current limit ([0]: 400 or 800 mA), 0x54/0x55 the play rate (x 5 us),
@@ -32,6 +34,7 @@
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
@@ -54,20 +57,26 @@ say(const char *format, ...)
 	for (const char *c = line; *c != 0; c++) {
 		loader_log_putc(*c);
 	}
-	printf("%s", line);
+	/* (not with interrupts off, at a run's end: console output there is a panic, and the panic's way out ends here again) */
+	if (ml_get_interrupts_enabled()) {
+		printf("%s", line);
+	}
 	return length;
 }
 
 #define HAPTICS_ID              0x3c0           /* slave 3, peripheral 0xc0 */
 #define REG_TYPE                0x04            /* and 0x05, the subtype */
 
-static uint32_t level, after_s = 25;
+static uint32_t level, after_s = 25, pulse_ms = 100;
 
 #define REG_ENABLE              0x46
 #define REG_PLAY_MODE           0x4e
 #define REG_ILIM                0x52
 #define REG_BRAKE               0x5c
 #define REG_PLAY                0x70
+#define REG_STATUS              0x0a            /* (read while it plays) */
+#define ENABLE_ON               0x80
+#define PLAY_ON                 0x80
 
 /* what level 2 writes, and what it found there (put back at the run's end) */
 static struct {
@@ -97,6 +106,9 @@ write_checked(uint8_t reg, uint8_t value, const char *what)
 	say("pmi_haptics: 0x%02x <- 0x%02x (%s), read back\n", reg, value, what);
 	return true;
 }
+
+/* level 3: one pulse */
+static void pulse(void);
 
 /* level 2: the test's configuration, after the originals are kept */
 static bool
@@ -135,6 +147,32 @@ dump(uint8_t from, uint8_t to)
 }
 
 static void
+pulse(void)
+{
+	uint8_t on_enable = ENABLE_ON, on_play = PLAY_ON, off = 0, status = 0xff;
+	const char *problem, *stop_problem;
+
+	say("pmi_haptics: a pulse of %u ms in 3 s\n", pulse_ms);
+	delay_for_interval(3000, NSEC_PER_MSEC);
+	problem = hakios_spmi_write(HAPTICS_ID, REG_ENABLE, &on_enable, 1);
+	if (problem == NULL) {
+		problem = hakios_spmi_write(HAPTICS_ID, REG_PLAY, &on_play, 1);
+	}
+	if (problem == NULL) {
+		delay_for_interval(pulse_ms / 2, NSEC_PER_MSEC);
+		(void)hakios_spmi_read(HAPTICS_ID, REG_STATUS, &status, 1);
+		delay_for_interval(pulse_ms - pulse_ms / 2, NSEC_PER_MSEC);
+	}
+	/* stopped whatever happened above */
+	stop_problem = hakios_spmi_write(HAPTICS_ID, REG_PLAY, &off, 1);
+	if (stop_problem == NULL) {
+		stop_problem = hakios_spmi_write(HAPTICS_ID, REG_ENABLE, &off, 1);
+	}
+	say("pmi_haptics: PULSE %s: status while playing 0x%02x; stopped%s%s\n", problem == NULL ? "played" : problem, status,
+	    stop_problem != NULL ? " -- NOT: " : "", stop_problem != NULL ? stop_problem : "");
+}
+
+static void
 pmi_haptics_thread(__unused void *arg, __unused wait_result_t wr)
 {
 	uint32_t owner = 0;
@@ -143,7 +181,8 @@ pmi_haptics_thread(__unused void *arg, __unused wait_result_t wr)
 	int channel;
 
 	say("pmi_haptics: level %u: %s; the bus is left to the loader's core for %u s\n", level,
-	    level == 1 ? "a look, reading only" : "a look, then configured (nothing moves)", after_s);
+	    level == 1 ? "a look, reading only" : level == 2 ? "a look, then configured (nothing moves)" : "configured, then one pulse",
+	    after_s);
 	delay_for_interval(after_s * 1000, NSEC_PER_MSEC);
 	channel = hakios_spmi_channel(HAPTICS_ID, &owner);
 	if (channel < 0) {
@@ -170,6 +209,9 @@ pmi_haptics_thread(__unused void *arg, __unused wait_result_t wr)
 			say("pmi_haptics: configured; enable and play left at 0 (nothing moves)\n");
 			dump(0x40, 0x5f);
 			dump(0x70, 0x77);
+			if (level >= 3) {
+				pulse();
+			}
 		}
 	}
 out:
@@ -185,10 +227,14 @@ hakios_pmi_haptics_init(void)
 	if (!PE_parse_boot_argn("pmi_haptics", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (level > 2) {
-		level = 2;
+	if (level > 3) {
+		level = 3;
 	}
 	PE_parse_boot_argn("pmi_haptics_after", &after_s, sizeof(after_s));
+	PE_parse_boot_argn("pmi_haptics_ms", &pulse_ms, sizeof(pulse_ms));
+	if (pulse_ms == 0 || pulse_ms > 1000) {
+		pulse_ms = 100;
+	}
 	if (kernel_thread_start(pmi_haptics_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
@@ -200,18 +246,19 @@ hakios_pmi_haptics_quiesce(void)
 {
 	uint8_t off = 0;
 	const char *problem;
+	unsigned count = configured;
 
-	if (configured == 0) {
+	if (count == 0) {
 		return;
 	}
+	configured = 0;         /* (once, whatever happens below) */
 	problem = hakios_spmi_write(HAPTICS_ID, REG_PLAY, &off, 1);
 	if (problem == NULL) {
 		problem = hakios_spmi_write(HAPTICS_ID, REG_ENABLE, &off, 1);
 	}
-	for (unsigned i = configured; problem == NULL && i-- > 0;) {
+	for (unsigned i = count; problem == NULL && i-- > 0;) {
 		problem = hakios_spmi_write(HAPTICS_ID, config[i].reg, &config[i].found, 1);
 	}
-	say("pmi_haptics: at the run's end: play and enable off, %u registers as they were found%s%s\n", configured,
+	say("pmi_haptics: at the run's end: play and enable off, %u registers as they were found%s%s\n", count,
 	    problem != NULL ? ": " : "", problem != NULL ? problem : "");
-	configured = 0;
 }
