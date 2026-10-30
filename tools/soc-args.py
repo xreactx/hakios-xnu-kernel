@@ -140,6 +140,25 @@ def main():
     pas_id('qcom,mss', 'soc_pas_mpss')
     pas_id('qcom,ipa_fws', 'soc_pas_ipa')
 
+    # the audio DSP (bsd/dev/hakios.adsp.c): the node whose firmware is "adsp", its reserved memory (2 address
+    # and 2 size cells), and a rail that is the SoC's CX (SDM845's downstream vdd_cx-supply, alone) rather than LPASS's own.
+    # Without IPCC, its GLINK rings through a register of the APCS: the second reg of the GLINK transport to it.
+    for path, props in nodes.items():
+        if props.get('qcom,firmware-name', b'').split(b'\0')[0] != b'adsp' or 'memory-region' not in props:
+            continue
+        target = by_phandle.get(u32(props['memory-region']))
+        if target and 'reg' in target[1] and len(target[1]['reg']) >= 16:
+            args.append(('soc_adsp_mem', u32(target[1]['reg'], 1)))
+            args.append(('soc_adsp_mem_size', u32(target[1]['reg'], 3)))
+        if 'vdd_cx-supply' in props and 'vdd_mx-supply' not in props:   # (SC7280's has both: LPASS's own LCX and LMX)
+            args.append(('soc_adsp_cx', 1))
+        break
+    if not any(name == 'soc_ipcc' for name, _ in args):
+        for path, props in nodes.items():
+            if props.get('label', b'').split(b'\0')[0] == b'lpass' and 'reg' in props and len(props['reg']) >= 16:
+                args.append(('soc_apcs_ipc', u32(props['reg'], 2)))   # reg = shared memory, size, the IPC register, size
+                break
+
     _, ipa_fws = find_named(nodes, 'qcom,ipa_fws')
     ipa_fw_name = None
     if ipa_fws and 'qcom,firmware-name' in ipa_fws:

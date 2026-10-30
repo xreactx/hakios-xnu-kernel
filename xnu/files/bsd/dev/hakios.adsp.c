@@ -29,6 +29,11 @@
  *     only the audio DSP's are cleared from here
  * The code is a copy, not a shared library, for now: step 1 is not to change what the Wi-Fi does.
  *
+ * Another phone gives its own numbers as boot-args (soc_override(), below). The OnePlus 6T's SoC, the
+ * SDM845, has no IPCC: the doorbells are bits of the APCS's IPC register one way and GIC interrupts
+ * the other (ring_dsp(), heard()), and the DSP's rail is the SoC's CX (rails()). There only the steps
+ * that have been ported are done (PORTED_APCS).
+ *
  * Boot-arg adsp_step=N performs steps 1 to N and stops; as with wifi_step, a step says what it is
  * about to touch before it touches it, and a step that does not find what it needs ends the
  * sequence. adsp=1 is all of them, on a thread beside the system's start.
@@ -287,7 +292,7 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 
 /* ---- the shared memory (hakios.wifi.c, step 1) --------------------------------------------------- */
 
-#define SMEM_PHYS               0x80900000UL
+#define SMEM_PHYS_DEFAULT       0x80900000UL
 #define SMEM_SIZE               0x00200000u
 #define SMEM_US                 0
 #define SMEM_ADSP               2               /* dt: qcom,remote-pid of qcom,smp2p-adsp and qcom,glink/adsp */
@@ -328,12 +333,13 @@ struct smem_item {
 #define ITEM_CRASH_REASON       423
 
 static const volatile uint8_t *smem;
+static unsigned long smem_phys = SMEM_PHYS_DEFAULT;     /* soc_smem */
 
 static bool
 smem_peek(uint64_t offset, void *to, uint32_t size)
 {
 	if (smem == NULL) {
-		smem = (const volatile uint8_t *)ml_io_map_unmappable(SMEM_PHYS, SMEM_SIZE, VM_WIMG_WCOMB);
+		smem = (const volatile uint8_t *)ml_io_map_unmappable(smem_phys, SMEM_SIZE, VM_WIMG_WCOMB);
 	}
 	if (offset + size > SMEM_SIZE) {
 		return false;
@@ -469,7 +475,7 @@ show_partition(void)
 	}
 	count = smem_items(partition, cacheline, found, 256);
 	printf("adsp: %u: the partition for us and the audio DSP (0 and 2): at %#lx, %#x bytes, of which %#x free; %u items\n", step,
-	    SMEM_PHYS + partition, size, header.free_cached - header.free_uncached, count);
+	    smem_phys + partition, size, header.free_cached - header.free_uncached, count);
 	for (unsigned i = 0; i < count && i < 256;) {
 		int at = 0;
 
@@ -617,6 +623,100 @@ static struct block aoss = { "mailbox", 0x0c300000, 0x400 };
 
 static struct block ipcc = { "ipcc", 0x00408000, 0x1000 };
 
+/*
+ * A SoC without IPCC (the SDM845; soc_apcs_ipc=0x1799000c, the APCS's IPC register) rings every other
+ * processor by a bit of that one register, written alone: the audio DSP's GLINK is bit 8, its SMP2P bit
+ * 10, the always-on processor bit 0 (dt: qcom,irq-mask of qcom,glink-smem-native-xprt-adsp, qcom,irq-bitmask
+ * of the qcom,smp2p with remote-pid 2, the second reg of qcom,qmp-aop). The DSP's rings to us are the
+ * GIC's interrupts 156 (GLINK) and 158 (SMP2P), edge-triggered; nothing here takes interrupts, so their
+ * pending bits in the distributor are what is looked at, and cleared.
+ */
+static uint32_t apcs_ipc;               /* 0: the IPCC's way (redwood) */
+static struct block apcs = { "apcs", 0, 0x1000 };
+static struct block gicd = { "gic", 0x17a00000, 0x1000 };
+#define APCS_AOP                0
+#define APCS_GLINK              8
+#define APCS_SMP2P              10
+#define SPI_GLINK               156
+#define SPI_SMP2P               158
+#define GICD_ISPENDR(id)        (0x200 + 4 * ((id) / 32))
+#define GICD_ICPENDR(id)        (0x280 + 4 * ((id) / 32))
+
+/* A ring of the audio DSP's doorbell for that signal (IPCC_GLINK or IPCC_SMP2P). */
+static void
+ring_dsp(uint32_t signal)
+{
+	if (apcs_ipc != 0) {
+		need(&apcs);
+		wr(apcs.base + (apcs_ipc & 0xfff), 1u << (signal == IPCC_GLINK ? APCS_GLINK : APCS_SMP2P));
+		return;
+	}
+	need(&ipcc);
+	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | signal);
+}
+
+/* A ring from the audio DSP, cleared: its signal (IPCC_GLINK or IPCC_SMP2P), or -1: none. */
+static int
+heard(void)
+{
+	uint32_t who;
+
+	if (apcs_ipc != 0) {
+		static const uint32_t spis[2] = { SPI_GLINK, SPI_SMP2P }, signals[2] = { IPCC_GLINK, IPCC_SMP2P };
+
+		need(&gicd);
+		for (unsigned i = 0; i < 2; i++) {
+			uint32_t id = 32 + spis[i], bit = 1u << (id % 32);
+
+			if (rd(gicd.base + GICD_ISPENDR(id)) & bit) {
+				wr(gicd.base + GICD_ICPENDR(id), bit);
+				return (int)signals[i];
+			}
+		}
+		return -1;
+	}
+	need(&ipcc);
+	who = rd(ipcc.base + IPCC_RECEIVED);
+	if (who == IPCC_NOBODY || who >> 16 != IPCC_LPASS) {
+		return -1;
+	}
+	wr(ipcc.base + IPCC_CLEAR, who);
+	return (int)(who & 0xffff);
+}
+
+/* What the doorbells say now, for the log: IPCC's received register, or the two pending bits. */
+static void
+say_doorbells(void)
+{
+	if (apcs_ipc != 0) {
+		need(&gicd);
+		printf("adsp: %u: the DSP's doorbells to us (GIC interrupts %u and %u) are %s and %s\n", step, SPI_GLINK, SPI_SMP2P,
+		    rd(gicd.base + GICD_ISPENDR(32 + SPI_GLINK)) & (1u << ((32 + SPI_GLINK) % 32)) ? "pending" : "quiet",
+		    rd(gicd.base + GICD_ISPENDR(32 + SPI_SMP2P)) & (1u << ((32 + SPI_SMP2P) % 32)) ? "pending" : "quiet");
+		return;
+	}
+	need(&ipcc);
+	printf("adsp: %u: the doorbells say %#x\n", step, rd(ipcc.base + IPCC_RECEIVED));
+}
+
+/* Rings that came before, heard and cleared; then the DSP's two signals listened for (IPCC), or not. */
+static void
+listen_doorbells(bool on)
+{
+	for (unsigned i = 0; on && i < 8 && heard() >= 0; i++) {
+	}
+	if (apcs_ipc != 0) {
+		return;                 /* (a pending bit is set whether anyone listens or not) */
+	}
+	if (!on) {
+		need(&ipcc);
+		wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_SMP2P);  /* (unsaid: this is on a panic's way out too) */
+		return;
+	}
+	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
+	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_GLINK);
+}
+
 static struct {
 	uint32_t glink, smp2p, said;
 	uint64_t since;
@@ -631,20 +731,19 @@ static void
 doorbells(void)
 {
 	for (unsigned i = 0; i < 8; i++) {
-		uint32_t who = rd(ipcc.base + IPCC_RECEIVED);
+		int who = heard();
 
-		if (who == IPCC_NOBODY || who >> 16 != IPCC_LPASS) {
+		if (who < 0) {
 			return;
 		}
-		wr(ipcc.base + IPCC_CLEAR, who);
-		doorbell.glink += (who & 0xffff) == IPCC_GLINK;
-		doorbell.smp2p += (who & 0xffff) == IPCC_SMP2P;
+		doorbell.glink += (uint32_t)who == IPCC_GLINK;
+		doorbell.smp2p += (uint32_t)who == IPCC_SMP2P;
 		if (doorbell.said < 24) {
 			uint64_t now = now_us() - doorbell.since;
 
 			doorbell.said++;
 			printf("adsp: doorbell: +%llu.%03llu ms: signal %u of the audio DSP; heard and cleared\n", now / 1000, now % 1000,
-			    who & 0xffff);
+			    who);
 		}
 	}
 }
@@ -666,6 +765,12 @@ mailbox_wait(uint32_t offset, uint32_t value, uint32_t ms)
 static void
 ring_aop(void)
 {
+	if (apcs_ipc != 0) {
+		need(&apcs);
+		wr(apcs.base + (apcs_ipc & 0xfff), 1u << APCS_AOP);
+		return;
+	}
+	need(&ipcc);
 	wr(ipcc.base + IPCC_SEND, IPCC_AOP << 16 | 0);
 }
 
@@ -676,7 +781,6 @@ mailbox_open(void)
 	uint32_t box, size;
 
 	need(&aoss);
-	need(&ipcc);
 	if (get(&aoss, "magic", QMP_MAGIC) != QMP_MAGIC_VALUE || get(&aoss, "version", QMP_VERSION) != 1) {
 		printf("adsp: %u: not a mailbox this knows\n", step);
 		return false;
@@ -783,7 +887,7 @@ out:
  * the list of its levels that the boot loader's command database keeps (cmd-db.c), the first
  * position at or above the level wanted.
  */
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_PHYS_DEFAULT     0x80860000UL
 #define CMD_DB_SIZE             0x20000UL
 
 struct cmd_db_slave {
@@ -804,6 +908,7 @@ struct cmd_db_entry {
 };
 
 static const struct cmd_db_header *cmd_db;
+static unsigned long cmd_db_phys = CMD_DB_PHYS_DEFAULT;   /* soc_cmd_db */
 
 static struct block rsc = { "rsc", 0x18220000, 0x10000 };
 #define RSC_TCS_BASE            0xd00
@@ -827,7 +932,7 @@ rail_position(const char *name, uint32_t level, uint32_t *address)
 	char id[8] = { 0 };
 
 	if (cmd_db == NULL) {
-		cmd_db = (const struct cmd_db_header *)ml_io_map_unmappable(CMD_DB_PHYS, CMD_DB_SIZE, VM_WIMG_WCOMB);
+		cmd_db = (const struct cmd_db_header *)ml_io_map_unmappable(cmd_db_phys, CMD_DB_SIZE, VM_WIMG_WCOMB);
 	}
 	if (!(cmd_db->magic[0] == 0xdb && cmd_db->magic[1] == 0x30 && cmd_db->magic[2] == 0x03 && cmd_db->magic[3] == 0x0c)) {
 		printf("adsp: %u: the boot loader's command database is not there\n", step);
@@ -876,15 +981,32 @@ rail_position(const char *name, uint32_t level, uint32_t *address)
 	return -1;
 }
 
-/* The two rails at that level (Linux's proxy request), or given back (level 0). True: RPMh has said done. */
+/*
+ * Where the DSP runs from the SoC's own CX (soc_adsp_cx=1: the SDM845, dt: vdd_cx-supply of the
+ * pil-tz-generic "adsp", asked for at level 385), there is one rail, and it is everybody's: what UEFI
+ * left asked for it by the application processor -- for the display, the storage -- is not known
+ * here, and a request of level 0 would replace it. So CX is raised while the DSP boots and is never
+ * given back; the DSP asks for its own on top.
+ */
+static bool rail_cx;
+#define RAIL_LEVEL_LPASS        384
+#define RAIL_LEVEL_CX           385
+
+/* The rails at that level (Linux's proxy request), or given back (level 0). True: RPMh has said done. */
 static bool
 rails(uint32_t level)
 {
-	static const char *const names[2] = { "lcx.lvl", "lmx.lvl" };
+	static const char *const lpass[2] = { "lcx.lvl", "lmx.lvl" }, *const cx[1] = { "cx.lvl" };
+	const char *const *names = rail_cx ? cx : lpass;
+	unsigned count = rail_cx ? 1 : 2;
 	uint32_t addresses[2] = { 0, 0 }, values[2] = { 0, 0 }, done = 0;
 	uint64_t began;
 
-	for (unsigned r = 0; r < 2; r++) {
+	if (rail_cx && level == 0) {
+		printf("adsp: %u: cx.lvl is not given back: it is the SoC's, and what was asked of it before is not known\n", step);
+		return true;
+	}
+	for (unsigned r = 0; r < count; r++) {
 		int position = level == 0 ? 0 : rail_position(names[r], level, &addresses[r]);
 
 		if (level == 0) {
@@ -905,18 +1027,19 @@ rails(uint32_t level)
 		lck_mtx_unlock(&hakios_rsc_lock);
 		return false;
 	}
-	printf("adsp: %u: about to ask RPMh, through TCS %u, for lcx.lvl (%#x) = %u and lmx.lvl (%#x) = %u (level %u%s)\n", step,
-	    RPMH_TCS, addresses[0], values[0], addresses[1], values[1], level, level == 0 ? ": given back" : "");
+	printf("adsp: %u: about to ask RPMh, through TCS %u, for %s (%#x) = %u%s%s (%#x) = %u (level %u%s)\n", step, RPMH_TCS,
+	    names[0], addresses[0], values[0], count > 1 ? " and " : "", count > 1 ? names[1] : "", addresses[1], values[1], level,
+	    level == 0 ? ": given back" : "");
 	snprintf(last_write, sizeof(last_write), "step %u asked RPMh for the audio DSP's rails at level %u", step, level);
 	hold();
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
-	for (unsigned r = 0; r < 2; r++) {
+	for (unsigned r = 0; r < count; r++) {
 		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r), MSGID_WRITE_WAITED);
 		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 4, addresses[r]);
 		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 8, values[r]);
 	}
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_WAIT_FOR_DONE, 3);
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 3);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_WAIT_FOR_DONE, (1u << count) - 1);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, (1u << count) - 1);
 	settle();
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~TCS_TRIGGER);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_ACTIVE_MODE);
@@ -947,7 +1070,12 @@ step_survey(void)
 	struct smp2p words;
 	uint32_t size = 0;
 
-	announce("read our partition with the audio DSP in the shared memory (0x80900000), and its items");
+	{
+		char what[120];
+
+		snprintf(what, sizeof(what), "read our partition with the audio DSP in the shared memory (%#lx), and its items", smem_phys);
+		announce(what);
+	}
 	show_partition();
 	if (dsp_words(&words)) {
 		show_words("the DSP's item (443) is there: it has run since the phone was started", &words);
@@ -958,15 +1086,15 @@ step_survey(void)
 	    smem_item(ITEM_SMP2P_OURS, &size) ? "there" : "not there", smem_item(478, &size) ? "there" : "NOT THERE",
 	    smem_item(479, &size) ? "there" : "NOT THERE", smem_item(480, &size) ? "there" : "not there (the DSP makes it)");
 	show_crash_reason();
-	need(&ipcc);
-	printf("adsp: %u: the doorbells say %#x\n", step, rd(ipcc.base + IPCC_RECEIVED));
+	say_doorbells();
 	return smem_partition(SMEM_US, SMEM_ADSP, &size, &size) != 0;
 }
 
 /* ---- step 2: the firmware -------------------------------------------------------------------------- */
 
-#define ADSP_MEMORY             0x86700000u     /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
-#define ADSP_MEMORY_SIZE        0x04000000u
+#define ADSP_MEMORY_DEFAULT     0x86700000u     /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
+#define ADSP_MEMORY_SIZE_DEFAULT 0x04000000u
+static uint32_t adsp_memory = ADSP_MEMORY_DEFAULT, adsp_memory_size = ADSP_MEMORY_SIZE_DEFAULT;    /* soc_adsp_mem, soc_adsp_mem_size */
 #define PAS_ADSP                1               /* dt: qcom,pas-id */
 
 
@@ -996,7 +1124,7 @@ root_file(const char *name, uint64_t *size)
 	VATTR_INIT(&attributes);
 	VATTR_WANTED(&attributes, va_data_size);
 	if (vnode_getattr(vnode, &attributes, context) != 0 || attributes.va_data_size == 0 ||
-	    attributes.va_data_size > ADSP_MEMORY_SIZE) {
+	    attributes.va_data_size > adsp_memory_size) {
 		vnode_put(vnode);
 		return NULL;
 	}
@@ -1135,13 +1263,13 @@ step_firmware(void)
 		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
 			continue;
 		}
-		if (segment.paddr < ADSP_MEMORY || segment.file_size > segment.memory_size ||
-		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)ADSP_MEMORY + ADSP_MEMORY_SIZE) {
+		if (segment.paddr < adsp_memory || segment.file_size > segment.memory_size ||
+		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)adsp_memory + adsp_memory_size) {
 			printf("adsp: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
 			    segment.memory_size);
 			goto fail;
 		}
-		image.segment[image.segments].at = segment.paddr - ADSP_MEMORY;
+		image.segment[image.segments].at = segment.paddr - adsp_memory;
 		image.segment[image.segments].file_size = segment.file_size;
 		image.segment[image.segments].memory_size = segment.memory_size;
 		image.segment[image.segments].file = NULL;
@@ -1164,17 +1292,17 @@ step_firmware(void)
 		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
 		image.segments++;
 	}
-	if (image.segments == 0 || lowest != ADSP_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
+	if (image.segments == 0 || lowest != adsp_memory || 52 + 32 * count + (uint64_t)hashes != size) {
 		printf("adsp: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
 		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
 		goto fail;
 	}
 	image.header = header;
 	image.header_size = size;
-	image.size = ((highest + 0xfff) & ~0xfffu) - ADSP_MEMORY;
+	image.size = ((highest + 0xfff) & ~0xfffu) - adsp_memory;
 	printf("adsp: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
 	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
-	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
+	    image.segments, files, image.size, adsp_memory_size, adsp_memory);
 	return true;
 fail:
 	image_forget();
@@ -1285,7 +1413,7 @@ dsp_listen(const struct smp2p *theirs)
 		    step, theirs->flags, smp2p_restart_acked);
 		smem_poke(our_item + SMP2P_AT_FLAGS, (ours.flags & ~SMP2P_RESTART_ACK) | (smp2p_restart_acked ? SMP2P_RESTART_ACK : 0));
 		settle();
-		wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+		ring_dsp(IPCC_SMP2P);
 	}
 }
 
@@ -1316,14 +1444,13 @@ dsp_ask_to_stop(uint32_t bound_ms)
 		printf("adsp: %u: the DSP is not asked to stop first: its entry says %#x, not \"up\"\n", step, state);
 		return false;
 	}
-	need(&ipcc);
 	value_at = at + SMP2P_AT_VALUE((uint32_t)entry);
 	printf("adsp: %u: about to ask the DSP to stop: bit 0 of our entry \"%s\" at %#lx, and its SMP2P doorbell\n", step,
-	    OUR_ENTRY_STOP, SMEM_PHYS + value_at);
+	    OUR_ENTRY_STOP, smem_phys + value_at);
 	snprintf(last_write, sizeof(last_write), "step %u asked the audio DSP to stop", step);
 	smem_poke(value_at, ours.entry[entry].value | DSP_STOP);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+	ring_dsp(IPCC_SMP2P);
 	asked = now = now_us();
 	while (now - asked < bound_ms * 1000ull) {
 		if (dsp_words(&theirs) && (dsp_state(&theirs) & (DSP_STOP_ACK | DSP_FATAL))) {
@@ -1338,7 +1465,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	    (now - asked) % 1000, state);
 	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+	ring_dsp(IPCC_SMP2P);
 	return (state & DSP_STOP_ACK) != 0;
 }
 
@@ -1363,8 +1490,7 @@ dsp_shutdown(const char *why)
 		return false;
 	}
 	printf("adsp: %u: THE AUDIO DSP IS SHUT DOWN\n", step);
-	need(&ipcc);
-	wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
+	listen_doorbells(false);
 	doorbells();
 	dsp_started = false;
 	mailbox_send("{class: image, res: load_state, name: adsp, val: off}");
@@ -1421,12 +1547,12 @@ step_header(void)
 	printf("adsp: %u: TRUSTZONE ACCEPTS THE AUDIO DSP'S SIGNATURE FROM THIS KERNEL\n", step);
 
 	announce("tell TrustZone where the image will be");
-	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_ADSP, ADSP_MEMORY, image.size, &answer);
+	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_ADSP, adsp_memory, image.size, &answer);
 	if (result != 0 || answer != 0) {
 		printf("adsp: %u: TRUSTZONE DOES NOT TAKE THE PLACE: the call returns %d, its answer is %#llx\n", step, result, answer);
 		return false;
 	}
-	printf("adsp: %u: TrustZone takes the place: %#x bytes at %#x\n", step, image.size, ADSP_MEMORY);
+	printf("adsp: %u: TrustZone takes the place: %#x bytes at %#x\n", step, image.size, adsp_memory);
 	return true;
 }
 
@@ -1454,16 +1580,22 @@ step_image(void)
 	if (image.segments == 0) {
 		return false;
 	}
-	announce("put the image's segments into the audio DSP's memory (0x86700000, 64 MB: memory of nobody's until TrustZone "
-	    "starts the DSP), with zeroes where a segment is longer than its file, and read them back");
-	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(ADSP_MEMORY, ADSP_MEMORY_SIZE, VM_WIMG_WCOMB);
-	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, ADSP_MEMORY);
+	{
+		char what[200];
+
+		snprintf(what, sizeof(what), "put the image's segments into the audio DSP's memory (%#x, %u MB: memory of nobody's until "
+		    "TrustZone starts the DSP), with zeroes where a segment is longer than its file, and read them back", adsp_memory,
+		    adsp_memory_size >> 20);
+		announce(what);
+	}
+	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(adsp_memory, adsp_memory_size, VM_WIMG_WCOMB);
+	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, adsp_memory);
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
 
 		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
 			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
-			ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
+			ml_io_unmap((vm_offset_t)dsp_memory, adsp_memory_size);
 			return false;
 		}
 		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
@@ -1483,7 +1615,7 @@ step_image(void)
 	printf("adsp: %u: %u segments, %llu bytes written and %llu cleared; read back, %llu words of eight bytes differ\n", step,
 	    image.segments, written, cleared, wrong);
 	settle();
-	ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
+	ml_io_unmap((vm_offset_t)dsp_memory, adsp_memory_size);
 	image_written = wrong == 0;
 	image_forget();                         /* (it is in the DSP's memory now: what was read of the root, given back) */
 	return image_written;
@@ -1577,7 +1709,7 @@ step_our_item(void)
 	our_item = our_item_find();
 	if (our_item != 0) {
 		printf("adsp: %u: item %u is there, at %#lx: a kernel before this one made it, and it is used again\n", step,
-		    ITEM_SMP2P_OURS, SMEM_PHYS + our_item);
+		    ITEM_SMP2P_OURS, smem_phys + our_item);
 	} else {
 		if (!our_item_make(partition)) {
 			return false;
@@ -1587,7 +1719,7 @@ step_our_item(void)
 			printf("adsp: %u: THE ITEM IS NOT FOUND where it was just made\n", step);
 			return false;
 		}
-		printf("adsp: %u: item %u made, at %#lx\n", step, ITEM_SMP2P_OURS, SMEM_PHYS + our_item);
+		printf("adsp: %u: item %u made, at %#lx\n", step, ITEM_SMP2P_OURS, smem_phys + our_item);
 	}
 	/* zeroes; from processor 0 to 2, room for 16 entries, "master-kernel" at zero, feature bit 0; last the version */
 	snprintf(last_write, sizeof(last_write), "step %u filled in our SMP2P item", step);
@@ -1607,8 +1739,7 @@ step_our_item(void)
 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8 | SMP2P_VERSION);
 	settle();
 	smp2p_agreed = smp2p_restart_acks = smp2p_restart_acked = false;
-	need(&ipcc);
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_SMP2P);
+	ring_dsp(IPCC_SMP2P);
 	if (!smem_peek(our_item, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC || smp2p_entry(&ours, OUR_ENTRY_STOP) < 0) {
 		printf("adsp: %u: OUR ITEM DOES NOT READ BACK AS WRITTEN\n", step);
 		return false;
@@ -1633,7 +1764,7 @@ step_start(void)
 {
 	struct smp2p words, last;
 	uint64_t answer = ~0ull, started, now, ready_at = 0, limit;
-	uint32_t state = 0, rang, changes = 0, wait_seconds = 10;
+	uint32_t state = 0, changes = 0, wait_seconds = 10;
 	int32_t result;
 	bool have, spoke = false, handed_over = false;
 
@@ -1646,15 +1777,10 @@ step_start(void)
 	have = dsp_words(&last);
 	announce("listen for the audio DSP's doorbells, ask RPMh for its rails, tell the always-on processor that its image is "
 	    "loaded, and ask TrustZone to authenticate the image and let the DSP out of reset");
-	need(&ipcc);
-	for (unsigned i = 0; i < 8 && (rang = rd(ipcc.base + IPCC_RECEIVED)) != IPCC_NOBODY && rang >> 16 == IPCC_LPASS; i++) {
-		put(&ipcc, "heard", IPCC_CLEAR, rang);
-	}
-	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
-	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_LPASS << 16 | IPCC_GLINK);
+	listen_doorbells(true);
 	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
-	if (!rails(384)) {
+	if (!rails(rail_cx ? RAIL_LEVEL_CX : RAIL_LEVEL_LPASS)) {
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
@@ -1877,7 +2003,7 @@ glink_reset(void)
 		return;
 	}
 	printf("adsp: %u: GLINK's descriptor at %#lx: our queue read to %#x and written to %#x, the DSP's read to %#x and written "
-	    "to %#x\n", step, SMEM_PHYS + descriptor, smem_word(descriptor + GLINK_OUR_TAIL), smem_word(descriptor + GLINK_OUR_HEAD),
+	    "to %#x\n", step, smem_phys + descriptor, smem_word(descriptor + GLINK_OUR_TAIL), smem_word(descriptor + GLINK_OUR_HEAD),
 	    smem_word(descriptor + GLINK_THEIR_TAIL), smem_word(descriptor + GLINK_THEIR_HEAD));
 	if (smem_word(descriptor + GLINK_OUR_HEAD) != 0 || smem_word(descriptor + GLINK_THEIR_TAIL) != 0) {
 		printf("adsp: %u: about to write our two marks there (+4, +8): 0\n", step);
@@ -1943,7 +2069,7 @@ glink_put(const void *first, uint32_t first_length, const void *second, uint32_t
 	settle();
 	smem_poke(glink.descriptor + GLINK_OUR_HEAD, (head + padded) % glink.ours_size);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_GLINK);
+	ring_dsp(IPCC_GLINK);
 	glink.said++;
 	return true;
 }
@@ -2174,7 +2300,7 @@ glink_pump(void)
 		}
 		case GLINK_READ_NOTIFY:
 			glink_advance(length);
-			wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | IPCC_GLINK);
+			ring_dsp(IPCC_GLINK);
 			break;
 		case GLINK_CLOSE:
 			glink_advance(length);
@@ -2945,8 +3071,8 @@ step_queues(void)
 	head = smem_word(glink.descriptor + GLINK_THEIR_HEAD);
 	tail = smem_word(glink.descriptor + GLINK_THEIR_TAIL);
 	printf("adsp: %u: our queue: %u bytes at %#lx, written to %#x, read by the DSP to %#x; the DSP's: %u bytes at %#lx, written "
-	    "to %#x, read by us to %#x\n", step, glink.ours_size, SMEM_PHYS + glink.ours, smem_word(glink.descriptor + GLINK_OUR_HEAD),
-	    smem_word(glink.descriptor + GLINK_OUR_TAIL), glink.theirs_size, SMEM_PHYS + glink.theirs, head, tail);
+	    "to %#x, read by us to %#x\n", step, glink.ours_size, smem_phys + glink.ours, smem_word(glink.descriptor + GLINK_OUR_HEAD),
+	    smem_word(glink.descriptor + GLINK_OUR_TAIL), glink.theirs_size, smem_phys + glink.theirs, head, tail);
 	for (uint32_t at = 0, shown = 0; at + sizeof(message) <= head && head < glink.theirs_size && tail == 0 && shown < 8; shown++) {
 		char name[33] = "";
 		uint32_t length = sizeof(message);
@@ -3195,6 +3321,45 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+/*
+ * Another Qualcomm phone's numbers, from boot-args over redwood's (as hakios.mpss.c's soc_override();
+ * tools/soc-args.py reads them off the phone's device tree): soc_smem, soc_cmd_db, soc_rsc, soc_aoss,
+ * soc_adsp_mem and soc_adsp_mem_size (the DSP's reserved memory), soc_apcs_ipc (no IPCC: the doorbells
+ * are that register's bits, above) and soc_adsp_cx=1 (the DSP's rail is CX, see rails()).
+ *
+ * On such a SoC only the steps that have been seen to work there are done: PORTED_APCS, until each
+ * of the others has been looked at for it (the OnePlus 6T, devices/oneplus-6t/README.md step 10).
+ */
+#define PORTED_APCS             2
+
+static void
+soc_override(void)
+{
+	uint32_t phys = 0, cx = 0;
+
+	PE_parse_boot_argn("soc_smem", &smem_phys, sizeof(smem_phys));
+	PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
+	if (PE_parse_boot_argn("soc_rsc", &phys, sizeof(phys)) && phys != 0) {
+		rsc.phys = phys;
+	}
+	phys = 0;
+	if (PE_parse_boot_argn("soc_aoss", &phys, sizeof(phys)) && phys != 0) {
+		aoss.phys = phys;
+	}
+	PE_parse_boot_argn("soc_adsp_mem", &adsp_memory, sizeof(adsp_memory));
+	PE_parse_boot_argn("soc_adsp_mem_size", &adsp_memory_size, sizeof(adsp_memory_size));
+	if (PE_parse_boot_argn("soc_apcs_ipc", &apcs_ipc, sizeof(apcs_ipc)) && apcs_ipc != 0) {
+		apcs.phys = apcs_ipc & ~0xfffu;
+	}
+	rail_cx = PE_parse_boot_argn("soc_adsp_cx", &cx, sizeof(cx)) && cx != 0;
+	if (smem_phys != SMEM_PHYS_DEFAULT || adsp_memory != ADSP_MEMORY_DEFAULT || apcs_ipc != 0 || rail_cx) {
+		printf("adsp: SoC numbers from boot-args: shared memory %#lx, command DB %#lx, RPMh's sequencer %#x, the always-on "
+		    "processor's mailbox %#x, the DSP's memory %#x (%u MB), doorbells %s %#x, rail%s\n", smem_phys, cmd_db_phys, rsc.phys,
+		    aoss.phys, adsp_memory, adsp_memory_size >> 20, apcs_ipc ? "the APCS's IPC register" : "IPCC's at",
+		    apcs_ipc ? apcs_ipc : ipcc.phys, rail_cx ? " CX" : "s LCX and LMX");
+	}
+}
+
 /* Called while the system starts (bsd/dev/hakios.input.c), after the Wi-Fi's start has been set going. */
 void
 hakios_adsp_init(void)
@@ -3209,6 +3374,12 @@ hakios_adsp_init(void)
 	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {
 		printf("adsp: adsp=1 and adsp_step=N are for the phone's audio DSP, and this is not the phone\n");
 		return;
+	}
+	soc_override();
+	if (apcs_ipc != 0 && (last_step == 0 || last_step > PORTED_APCS)) {
+		printf("adsp: on this SoC (no IPCC) only steps 1 to %u have been ported; adsp_step=%u is done, not more\n", PORTED_APCS,
+		    PORTED_APCS);
+		last_step = PORTED_APCS;
 	}
 	if (last_step == 0) {
 		/* all of it, on a thread of its own, and left up */

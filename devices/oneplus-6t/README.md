@@ -265,6 +265,20 @@ is for the earpiece, the headphones and the microphones, later. So, in this orde
 
 The DSP's firmware (`adsp.mdt`, `adsp.b00`-`b13`, 11 MB) comes off the flash with `xl flash-read` (see Firmware).
 
+`hakios.adsp.c` takes the SDM845's numbers from `soc.args` (`soc_adsp_mem`, `soc_adsp_mem_size`, `soc_apcs_ipc`,
+`soc_adsp_cx`, with `soc_smem`, `soc_rsc`, `soc_aoss`; `soc_cmd_db=0x85fe0000` by hand) and, on a SoC without IPCC,
+does only the steps ported so far (`PORTED_APCS`). `xl run` does not pass `soc.args`, so give them in `XL_CMDLINE`,
+with a root built `ADSP=1 REST=1 userland/build.sh` (the firmware in the small image):
+
+    XL_SECS=45 XL_CMDLINE="-v adsp_step=2 soc_smem=0x86000000 soc_cmd_db=0x85fe0000 soc_rsc=0x179e0000 soc_aoss=0xc300000
+      soc_adsp_mem=0x8c500000 soc_adsp_mem_size=0x1a00000 soc_apcs_ipc=0x1799000c soc_adsp_cx=1" ./xl run
+
+Steps 1 and 2 work (30 October 2026, run 201813): the partition of the application processor and the DSP is in the
+shared memory (`0x861af000`, 192 KB) but empty -- the DSP has not run since power-on, its doorbells are quiet -- and the
+image is whole, 13 segments filling the 26 MB exactly. Unlike redwood's, the partition has **no GLINK items (478,
+479)**: on this phone our side must allocate them (as Linux's `qcom_glink_smem` does), which step 6 has to learn.
+Steps 3 (the AOP's mailbox) and 7 (RPMh, TrustZone) touch what UEFI uses in the first 24 s, and must wait as touch does.
+
 **11. Then** Wi-Fi; cellular last.
 
 ## Firmware
