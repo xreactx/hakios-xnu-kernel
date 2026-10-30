@@ -10,6 +10,14 @@
  * says more).
  *
  * Register layout: Linux drivers/cpufreq/qcom-cpufreq-hw.c ("epss" variant).
+ *
+ * Boot-arg cpufreq_osm=1, for the OnePlus 6T (SDM845) instead: a look only. Its cores' clocks are set by
+ * the older "OSM" (the same file, its first variant), whose tables and state are read and logged, and
+ * each kind of core's clock is measured; nothing is written. Out of the boot loader the big cores are at
+ * the bottom of their table, 825 MHz, and the small ones at 1612 MHz.
+ * cpufreq_osm=2: ... and, first, each group asked for the highest row of its table at or under
+ * cpufreq_osm_mhz (default 2400: the big cores' 2.4 GHz, the small ones' top 1766 MHz). Nothing here
+ * watches the temperature; the SoC's own limits hardware (LMh) holds the clock down when it is hot.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -75,6 +83,121 @@ loop_speed(void)
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - start, &nanos);
 	return nanos ? (uint32_t)(2000000ULL * 1000 / nanos) : 0;
+}
+
+/* ---- the SDM845's OSM: a look (boot-arg cpufreq_osm=1) ------------------------------------------- */
+
+extern processor_t thread_bind(processor_t processor);
+extern processor_t cpu_to_processor(int cpu);
+
+#define OSM_SMALL_PHYS          0x17d43000UL    /* "osm_pwrcl_base": cores 0-3, Kryo 385 Silver */
+#define OSM_BIG_PHYS            0x17d45800UL    /* "osm_perfcl_base": cores 4-7, Kryo 385 Gold */
+#define OSM_SIZE                0x1400UL
+#define OSM_ENABLE              0x0
+#define OSM_FREQ_TABLE          0x110           /* a row every 32 bytes: [31:30] source, [18:16] cores, [7:0] multiple of 19.2 MHz */
+#define OSM_ROW_BYTES           32
+#define OSM_TABLE_ROWS          40
+#define OSM_CURRENT_VOTE        0x704
+#define OSM_PERF_STATE          0x920           /* the row that is wanted */
+#define OSM_LOOK_AT_S           35              /* after the slower cores have joined (small_cores_after, 28 s) */
+#define OSM_MHZ_DEFAULT         2400
+
+/* This core's clock: a chain of dependent adds, one a cycle on both kinds of Kryo 385. */
+static uint32_t
+clock_mhz(void)
+{
+	uint64_t x = 0, start, nanos;
+
+	start = mach_absolute_time();
+	for (uint32_t i = 0; i < 100000; i++) {
+		__asm__ volatile (".rept 100\n\tadd %0, %0, #1\n\t.endr" : "+r"(x));
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - start, &nanos);
+	return nanos ? (uint32_t)(x * 1000 / nanos) : 0;
+}
+
+static void
+osm_table(const char *what, vm_offset_t phys)
+{
+	vm_offset_t base = ml_io_map(phys, OSM_SIZE);
+	uint32_t wanted = *(volatile uint32_t *)(base + OSM_PERF_STATE), last_khz = 0;
+	char line[200];
+	size_t used = 0;
+
+	tell("cpufreq_osm: %s (%#lx): enable %#x, row %u wanted, current vote %#x\n", what, phys,
+	    *(volatile uint32_t *)(base + OSM_ENABLE), wanted, *(volatile uint32_t *)(base + OSM_CURRENT_VOTE));
+	line[0] = 0;
+	for (uint32_t row = 0; row < OSM_TABLE_ROWS; row++) {
+		uint32_t entry = *(volatile uint32_t *)(base + OSM_FREQ_TABLE + OSM_ROW_BYTES * row);
+		uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
+
+		if (row > 0 && khz == last_khz) {
+			break;                  /* the table ends by repeating its last row */
+		}
+		last_khz = khz;
+		used += snprintf(line + used, sizeof(line) - used, " %u:%u%s", row, khz / 1000, row == wanted ? "*" : "");
+		if (used > sizeof(line) - 24 || row == OSM_TABLE_ROWS - 1) {
+			tell("cpufreq_osm: %s MHz:%s\n", what, line);
+			used = 0;
+			line[0] = 0;
+		}
+	}
+	if (used != 0) {
+		tell("cpufreq_osm: %s MHz:%s (* = wanted)\n", what, line);
+	}
+}
+
+/* The highest row at or under `most_mhz' asked for; the OSM moves the clock and the voltage itself. */
+static void
+osm_raise(const char *what, vm_offset_t phys, uint32_t most_mhz)
+{
+	vm_offset_t base = ml_io_map(phys, OSM_SIZE);
+	uint32_t pick = 0, pick_khz = 0, last_khz = 0, was;
+
+	for (uint32_t row = 0; row < OSM_TABLE_ROWS; row++) {
+		uint32_t entry = *(volatile uint32_t *)(base + OSM_FREQ_TABLE + OSM_ROW_BYTES * row);
+		uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
+
+		if (row > 0 && khz == last_khz) {
+			break;
+		}
+		last_khz = khz;
+		if (khz <= most_mhz * 1000 && khz > pick_khz) {
+			pick = row;
+			pick_khz = khz;
+		}
+	}
+	was = *(volatile uint32_t *)(base + OSM_PERF_STATE);
+	*(volatile uint32_t *)(base + OSM_PERF_STATE) = pick;
+	delay_for_interval(20, NSEC_PER_MSEC);
+	tell("cpufreq_osm: %s: row %u -> %u, %u MHz (at most %u asked)\n", what, was, pick, pick_khz / 1000, most_mhz);
+}
+
+static void
+osm_look(void *arg __unused, wait_result_t wr __unused)
+{
+	const ml_topology_info_t *topology = ml_get_topology_info();
+	bool measured[2] = { false, false };
+
+	delay_for_interval(OSM_LOOK_AT_S * 1000, NSEC_PER_MSEC);
+	osm_table("small cores", OSM_SMALL_PHYS);
+	osm_table("big cores", OSM_BIG_PHYS);
+	/* one core of each kind, as numbered by the kernel (their MPIDR core number tells the kind) */
+	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+		uint32_t core = (topology->cpus[i].phys_id >> 8) & 0xff;
+		bool big = core >= 4;
+		processor_t processor = cpu_to_processor(topology->cpus[i].cpu_id);
+
+		if (measured[big] || processor == PROCESSOR_NULL) {
+			continue;
+		}
+		thread_bind(processor);
+		thread_block(THREAD_CONTINUE_NULL);
+		tell("cpufreq_osm: core %u (%s, on core %u now): %u MHz measured\n", core, big ? "big" : "small",
+		    (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff, clock_mhz());
+		measured[big] = true;
+	}
+	thread_bind(PROCESSOR_NULL);
 }
 
 /* The group of the core with that number in its MPIDR (the device tree's "reg": the number is the second field). */
@@ -568,6 +691,25 @@ hakios_cpufreq_init(void)
 		ddr_slots();
 	} else if (enabled == 2 && cpufreq_wanted()) {
 		ddr_raise();
+	}
+	enabled = 0;
+	if (PE_parse_boot_argn("cpufreq_osm", &enabled, sizeof(enabled)) && enabled) {
+		thread_t thread;
+
+		if (enabled >= 2) {
+			uint32_t most_mhz = OSM_MHZ_DEFAULT;
+
+			PE_parse_boot_argn("cpufreq_osm_mhz", &most_mhz, sizeof(most_mhz));
+			before = clock_mhz();
+			osm_raise("small cores", OSM_SMALL_PHYS, most_mhz);
+			osm_raise("big cores", OSM_BIG_PHYS, most_mhz);
+			tell("cpufreq_osm: this core (%u) measured %u MHz before, %u now\n",
+			    (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff, before, clock_mhz());
+		}
+		if (kernel_thread_start(osm_look, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+		return;
 	}
 	enabled = 0;
 	if (!PE_parse_boot_argn("cpufreq", &enabled, sizeof(enabled)) || !enabled) {
