@@ -101,6 +101,8 @@ intid 19, not the architecture's 27, and without it the kernel gets one tick and
 `lo0`, on any other core sooner). Two loader and image fixes came with it: uploads are received 16 KB at a time
 (this driver sends no reply after a receive of 29696 bytes or more), and `userland/build.sh` sets `umask 022`
 (launchd refuses SpringBoard's plist when its group may write it).
+`soc_vtimer=19` and the touch screen's `synaptics=3` are now in `run.args`, which `xl run` adds to every run
+on this phone (`DEVICE=oneplus-6t`), so `XL_CMDLINE="-v cpus=8 bootcpu=7"` is enough.
 
 **5. Storage** (`ufs=2`), so the system image is read from the phone instead of RAM.
 

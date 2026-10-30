@@ -1,2 +1,3 @@
 # Boot-args that xl adds to every run on this phone (unless XL_CMDLINE already gives them by name).
+soc_vtimer=19   # the SDM845's virtual timer interrupt (PPI 3, intid 19); without it the kernel waits for a timer that never comes
 synaptics=3     # the touch screen (bsd/dev/hakios.synaptics.c): powered, configured, touches to SpringBoard
