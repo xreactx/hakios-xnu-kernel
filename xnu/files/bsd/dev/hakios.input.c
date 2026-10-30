@@ -215,6 +215,7 @@ hakios_input_init(void)
 	}
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
 	hakios_cpufreq_init();
+	hakios_thermal_init();
 	hakios_virtio_input_init();
 	hakios_goodix_init();
 	hakios_synaptics_init();
