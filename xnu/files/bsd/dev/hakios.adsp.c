@@ -3343,7 +3343,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
  * seconds (25) from this driver's start: the loader's core runs UEFI's own work for a run's first 24 s
  * (xnuloader's NOTE_SECONDS), as hakios.synaptics.c waits for too.
  */
-#define PORTED_APCS             3
+#define PORTED_APCS             4
 
 static void
 soc_override(void)
