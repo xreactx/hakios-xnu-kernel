@@ -121,7 +121,31 @@ filesystem; `userland/build.sh`). It took 67-72 s from the logo at the boot load
 phone starting them at once made no measurable difference (three runs each: 39.1 and 38.9 s from launchd to
 the home screen).
 
-**5. Storage** (`ufs=2`), so the system image is read from the phone instead of RAM.
+**5. Storage.**
+
+Done in part on 30 October 2026: the system image is read from the phone's flash instead of uploaded over USB.
+`ufs=1` (a look through UEFI's storage driver, reading only) sees all six units and their GPTs. The 6T has no
+`super` (no dynamic partitions), and its `userdata` (229 GB, ext4) cannot be cut down without root, so redwood's
+`darwin` partition is not to be had. But Android's two system slots are 2.79 GB each, and the image
+(`userland/system.apfs`, 2.36 GB) fits: it is flashed into the slot Android does **not** boot from, with the
+phone's own bootloader, nothing else written:
+
+```sh
+fastboot getvar current-slot                    # here b: so system_a is the free one
+fastboot flash system_a userland/system.apfs    # 94 s; Android boots from b as before
+./xl enter && ./xl ramdisk-flash system_a       # after every restart, instead of "xl ramdisk": 12 s, not 104
+```
+
+`xl ramdisk-flash PART [FILE]` has the loader read the first `FILE`-size bytes of `PART` into the resident area
+through UEFI's `ReadBlocks` (`oem ramdisk flash`, then `oem ramdisk flash-next` 256 MB at a time; 2.36 GB in
+4.6 s) and compares the CRC-32 of a sample -- the first 4 KB of every MB and the last 4 KB -- with the file's: the
+resident area is slow to the loader's own loads (a CRC of all of it took 10 minutes; that full CRC, once, was the
+file's). The OnePlus 6's USB driver loses a question asked while the loader is busy -- it is never answered, a new
+one asked after is at once -- so xl asks again after each step. An OTA would overwrite system_a; flash it again.
+What it costs: Android's other slot is not an Android any more (no falling back to it until an update rewrites it).
+
+The rest -- the kernel reading the flash itself (`ufs=2`, `root_apfs=`), iOS's data kept between boots -- needs
+a partition of the port's own, as redwood's `darwin` (Apple's root container alone is 5.6 GB).
 
 **6. Touch and buttons.**
 
