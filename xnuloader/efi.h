@@ -158,6 +158,27 @@ typedef struct {
 	efi_status (EFIAPI *take_action)(uint32_t action, const void *battery_status);
 } efi_qcom_charger;
 
+/*
+ * The fuel gauge protocol of the OnePlus 6T's PmicDxe, read from the disassembly of the build its UEFI
+ * carries (Binaries/enchilada/QcomPkg/Drivers/PmicDxe/PmicDxeWp.efi: PmicDxeLa.inf packages that one, not
+ * PmicDxeLa.efi beside it): no header was published with it. Only its third entry is used,
+ * GetBatteryStatus(pmic, &info): it refuses a NULL info, and the 13 functions under it reach the PMIC
+ * only through the SPMI protocol's ReadLong (its WriteLong routine, 0x14798, is not among them).
+ */
+typedef struct {
+	uint32_t state_of_charge;       /* percent */
+	int32_t charge_current_ma;
+	uint32_t battery_voltage_mv;
+	int32_t battery_temperature_c;
+} efi_pmic_fg_status;
+
+typedef struct {
+	uint64_t revision;
+	void *basic_init, *extended_init;
+	efi_status (EFIAPI *get_battery_status)(uint32_t pmic, efi_pmic_fg_status *info);
+	void *more[13];
+} efi_pmic_fg;
+
 /* Block I/O + Partition Info (used to persist the log on the phone) */
 typedef struct {
 	uint32_t media_id; uint8_t removable, present, logical, read_only, write_caching; uint8_t pad[3];
@@ -258,5 +279,7 @@ typedef struct {
 #define EFI_PARTITION_INFO_GUID { 0x8cf2f62c, 0xbc9b, 0x4821, { 0x80, 0x8d, 0xec, 0x9e, 0xc4, 0x21, 0xa1, 0xa0 } }
 #define QCOM_CHARGER_EX_GUID     { 0x6edc8a6d, 0x2663, 0x43cd, { 0x90, 0xff, 0x46, 0x21, 0xff, 0xd1, 0x0d, 0xf5 } }
 #define QCOM_CHARGER_GUID        { 0x21bfb78b, 0x02ea, 0x4ab7, { 0x99, 0x40, 0xb5, 0x8a, 0x2a, 0xd6, 0x58, 0x29 } }
+/* the OnePlus 6T's PmicDxe (PmicDxeWp.efi): its fuel gauge (installed with the table at .data 0x2e7a8, revision 0x10016) */
+#define QCOM_PMIC_FG_GUID        { 0x9aed0312, 0x724a, 0x4209, { 0x86, 0x20, 0xf9, 0x3d, 0xe0, 0xbb, 0xd8, 0xfb } }
 
 #endif /* XNULOADER_EFI_H */
