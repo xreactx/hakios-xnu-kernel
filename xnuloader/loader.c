@@ -918,7 +918,7 @@ struct loader_battery {
 	uint32_t charger_action;
 	uint32_t polls;
 	uint32_t failures;
-	uint32_t reserved;
+	volatile uint32_t bus_busy;     /* not 0 while charger_poll() may use the PMIC bus; see there */
 };
 
 /*
@@ -1074,6 +1074,8 @@ soc_from_voltage(uint32_t mv)
 	return 100;
 }
 
+#define BUS_HANDOVER_US         5000
+
 /* Read-only status query.  No TakeAction call and no charger-limit writes are made here. */
 static void
 charger_poll(void)
@@ -1088,6 +1090,18 @@ charger_poll(void)
 		return;
 	}
 	memset(&status, 0, sizeof(status));
+	/*
+	 * UEFI's PMIC reads below share the arbiter's system 0 with the kernel's (hakios.buttons.c), and two
+	 * transfers of one system at once make it drop one -- which UEFI's code may not survive. So the
+	 * kernel is told first, and given BUS_HANDOVER_US to finish: it looks at bus_busy before each
+	 * transfer with its interrupts off, and a transfer of its own ends within 2 ms (its timeout).
+	 */
+	charger_shared.bus_busy = 1;
+	clean_dcache((uint64_t)(uintptr_t)&charger_shared,
+	    (uint64_t)(uintptr_t)&charger_shared + sizeof(charger_shared));
+	for (uint64_t from = READ_SYSREG(CNTVCT_EL0);
+	    (READ_SYSREG(CNTVCT_EL0) - from) * 1000000 / READ_SYSREG(CNTFRQ_EL0) < BUS_HANDOVER_US;) {
+	}
 
 	charger_shared.sequence++;
 	__asm__ volatile ("dmb ish" ::: "memory");
@@ -1161,6 +1175,7 @@ charger_poll(void)
 		flags |= LOADER_BATTERY_CHARGING;
 	}
 	charger_shared.flags = flags;
+	charger_shared.bus_busy = 0;
 	charger_shared.polls++;
 	if (!(flags & LOADER_BATTERY_VALID)) charger_shared.failures++;
 	__asm__ volatile ("dmb ish" ::: "memory");

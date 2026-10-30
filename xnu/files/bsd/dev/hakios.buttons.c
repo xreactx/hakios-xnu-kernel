@@ -55,6 +55,7 @@
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
@@ -166,6 +167,7 @@ static struct {
 	uint64_t reads, failed, total_ns, longest_ns, last_ns;
 	uint64_t dropped_early, dropped_late;   /* "dropped": in the first DROP_EARLY_S of watching, and after */
 	uint64_t retried;                       /* reads asked again after a drop */
+	uint64_t yielded;                       /* reads that waited for the loader's core to leave the bus */
 } bus;
 #define DROP_EARLY_S            20
 static uint64_t watch_started;
@@ -215,9 +217,30 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 	uint64_t start = mach_absolute_time(), now, interval, taken;
 	uint32_t status, data[2];
 	const char *problem = NULL;
+	boolean_t interrupts;
 
 	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
-	hakios_spmi_lock();
+	/*
+	 * Not while the loader's core reads the fuel gauge (battery=1, every 5 s): it says so 5 ms ahead,
+	 * and from this look to the transfer's end (2 ms at most) nothing here is interrupted.
+	 */
+	for (unsigned waited = 0;; waited++) {
+		interrupts = ml_set_interrupts_enabled(FALSE);
+		hakios_spmi_lock();
+		if (!hakios_battery_loader_bus_busy()) {
+			break;
+		}
+		hakios_spmi_unlock();
+		ml_set_interrupts_enabled(interrupts);
+		if (waited == 0) {
+			bus.yielded++;
+		}
+		if (waited >= 200) {
+			return "the loader's core keeps the bus";
+		}
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+	start = mach_absolute_time();
 	/* a dropped read is asked once more at once (see "dropped" below) */
 	for (int attempt = 0; attempt < 2; attempt++) {
 		if (attempt > 0) {
@@ -237,6 +260,7 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 	data[0] = rd(channel + OBSERVER_DATA0);
 	data[1] = count > 4 ? rd(channel + OBSERVER_DATA1) : 0;
 	hakios_spmi_unlock();
+	ml_set_interrupts_enabled(interrupts);
 
 	if (!(status & STATUS_DONE)) {
 		problem = "no answer from the arbiter";
@@ -523,13 +547,13 @@ say_summary(void)
 {
 	printf("buttons: so far %u presses of power, %u of volume up, %u of volume down; now%s%s%s%s; %llu reads of the bus, "
 	    "%llu us each (the longest %llu), %llu failed (dropped: %llu in the first %u s of watching, %llu after; %llu asked "
-	    "again)\n",
+	    "again; %llu waited for the loader's core)\n",
 	    power.presses, volume_up.presses,
 	    volume_down.presses + volume_down2.presses, power.down ? " power" : "", volume_up.down ? " volume-up" : "",
 	    (volume_down.down || volume_down2.down) ? " volume-down" : "",
 	    (power.down || volume_up.down || volume_down.down || volume_down2.down) ? " held" : " none held", bus.reads,
 	    bus.reads ? bus.total_ns / bus.reads / 1000 : 0, bus.longest_ns / 1000, bus.failed, bus.dropped_early, DROP_EARLY_S,
-	    bus.dropped_late, bus.retried);
+	    bus.dropped_late, bus.retried, bus.yielded);
 }
 
 static void

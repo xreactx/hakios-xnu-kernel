@@ -34,7 +34,8 @@ struct loader_battery {
 	volatile uint32_t sequence;
 	uint32_t flags;
 	int32_t soc_percent, voltage_mv, current_ma, temperature_c;
-	uint32_t charger_action, polls, failures, reserved;
+	uint32_t charger_action, polls, failures;
+	volatile uint32_t bus_busy;     /* not 0 while the loader's core may use the PMIC bus (xnuloader's charger_poll) */
 };
 
 static volatile struct loader_battery *shared_battery;
@@ -42,6 +43,17 @@ static int battery_soc_percent = -1, battery_voltage_mv = -1, battery_current_ma
 static int battery_temperature_c = -273, battery_present, battery_charger_present;
 static int battery_charging, battery_soc_estimated, battery_charger_action = -1;
 static uint64_t battery_updates, battery_failures;
+
+/*
+ * For hakios.buttons.c: whether the loader's core has said it is about to use the PMIC bus. It says so
+ * 5 ms before it starts, so a transfer begun before this read said "no" ends in time; without the
+ * loader's cache (no battery=1) the answer is always no.
+ */
+bool
+hakios_battery_loader_bus_busy(void)
+{
+	return shared_battery != NULL && shared_battery->bus_busy != 0;
+}
 
 /* for others in the kernel (the flashlight's thermal guard): -273 while it is not known */
 int
