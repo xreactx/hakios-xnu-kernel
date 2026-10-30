@@ -608,7 +608,7 @@ show_crash_reason(void)
 #define QMP_DOWN                0xffff0000u
 #define QMP_MESSAGE             64
 
-static struct block aoss = { "mailbox", 0x0c300000, 0x400 };
+static struct block aoss = { "mailbox", 0x0c300000, 0x1000 };   /* (its first page: where our mailbox is said to be is checked against it) */
 
 #define IPCC_SEND               0x0c
 #define IPCC_RECEIVED           0x10
@@ -3275,12 +3275,22 @@ hakios_adsp_quiesce(void)
 	dsp_shutdown("the kernel is on its way back to the loader");
 }
 
+static uint64_t init_us;                /* when hakios_adsp_init() began */
+static uint32_t adsp_after = 25;
+
 static void
 run_steps(void)
 {
 	uint32_t done = 0;
 
 	for (step = 1; step <= last_step; step++) {
+		if (step == 3 && apcs_ipc != 0 && now_us() - init_us < adsp_after * 1000000ull) {
+			uint64_t left = adsp_after * 1000000ull - (now_us() - init_us);
+
+			printf("adsp: nothing more for %llu.%03llu s, while the loader's core may use the mailbox and RPMh (adsp_after)\n",
+			    left / 1000000, left / 1000 % 1000);
+			sleep_ms((uint32_t)(left / 1000));
+		}
 		if (!steps[step - 1]()) {
 			printf("adsp: step %u: FAILED; the steps after it are not attempted\n", step);
 			break;
@@ -3329,8 +3339,11 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
  *
  * On such a SoC only the steps that have been seen to work there are done: PORTED_APCS, until each
  * of the others has been looked at for it (the OnePlus 6T, devices/oneplus-6t/README.md step 10).
+ * And from step 3 on -- the always-on processor's mailbox, RPMh, TrustZone -- not before adsp_after
+ * seconds (25) from this driver's start: the loader's core runs UEFI's own work for a run's first 24 s
+ * (xnuloader's NOTE_SECONDS), as hakios.synaptics.c waits for too.
  */
-#define PORTED_APCS             2
+#define PORTED_APCS             3
 
 static void
 soc_override(void)
@@ -3375,6 +3388,8 @@ hakios_adsp_init(void)
 		printf("adsp: adsp=1 and adsp_step=N are for the phone's audio DSP, and this is not the phone\n");
 		return;
 	}
+	init_us = now_us();
+	PE_parse_boot_argn("adsp_after", &adsp_after, sizeof(adsp_after));
 	soc_override();
 	if (apcs_ipc != 0 && (last_step == 0 || last_step > PORTED_APCS)) {
 		printf("adsp: on this SoC (no IPCC) only steps 1 to %u have been ported; adsp_step=%u is done, not more\n", PORTED_APCS,
