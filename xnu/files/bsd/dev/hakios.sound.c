@@ -66,8 +66,9 @@
  * soc_sound_bits, soc_audio_stream): the OnePlus 6T's is its quaternary MI2S, QUAT_MI2S_RX 0x1006, no
  * group, the AFE's I2S parameter instead (SD1, stereo, 24 bits, our clocks), clock 0x106 at 3.072 MHz,
  * GPIO 58 to 61, stream 0x1821 (devices/oneplus-6t/README.md, step 10). Its amplifier is not redwood's:
- * there sound=3 sets up and switches on its TFA9894 (hakios.tfa9894.c) for the tone, and sound=4 is not
- * done yet.
+ * there sound=3 sets up and switches on its TFA9894 (hakios.tfa9894.c) for the tone, and sound=4 plays
+ * what iOS plays through it, switched on and off as redwood's are; its volume is applied to the samples
+ * (gain_of()), the amplifier having none of ours.
  *
  * What is started is stopped, and what is written is put back, when the time is over -- or, if
  * the DSP is to be shut down earlier (the run's end), before that (hakios_sound_dsp_down()).
@@ -1231,6 +1232,71 @@ guard_say(const char *when, bool quiet)
 	    db_text(t[5], hakios_guard_decibels(r.slow)));
 }
 
+/*
+ * The OnePlus 6T's amplifier has no volume of ours: set up as Android's driver set it up, it plays at
+ * Android's level. There the volume (sound_below, and iOS's setting under the loudest) is applied to
+ * the samples instead, after the guard -- whose reckoning of what reaches the speaker is the same
+ * either way -- in whole decibels: 1.0 to 0.1 per 20 dB in 16.16 fixed point (no floating point here).
+ */
+static volatile uint32_t digital_gain = 0;      /* 16.16; 0 (silence) until a volume is set */
+
+static uint32_t
+gain_of(uint32_t below_eighths)
+{
+	static const uint32_t per_db[20] = { 65536, 58409, 52057, 46396, 41350, 36854, 32846, 29274, 26090, 23253, 20724, 18471,
+		                             16462, 14672, 13076, 11654, 10387, 9257, 8250, 7353 };
+	uint32_t db = (below_eighths + 4) / 8, gain;
+
+	if (db >= 100) {
+		return 0;
+	}
+	gain = per_db[db % 20];
+	for (uint32_t tens = db / 20; tens > 0; tens--) {
+		gain /= 10;
+	}
+	return gain;
+}
+
+/* The amplifiers: redwood's two (hakios.speaker.c), or the 6T's one (hakios.tfa9894.c) on an MI2S port. */
+static bool
+amp_start(void)
+{
+	return mi2s ? hakios_tfa9894_start() : hakios_speaker_start();
+}
+
+static bool
+amp_volume(uint32_t below_eighths, uint32_t step_ms)
+{
+	if (mi2s) {
+		digital_gain = gain_of(below_eighths);
+		return true;
+	}
+	return hakios_speaker_volume(below_eighths, step_ms);
+}
+
+static void
+amp_stop(void)
+{
+	if (mi2s) {
+		hakios_tfa9894_stop();
+	} else {
+		hakios_speaker_stop();
+	}
+}
+
+/* (the TFA9894's own DSP watches its speaker: the protection of NXP's patch, set up from Android's container) */
+static bool
+amp_healthy(void)
+{
+	return mi2s ? true : hakios_speaker_healthy();
+}
+
+static uint32_t
+amp_monitor(bool tell)
+{
+	return mi2s ? 0 : hakios_speaker_monitor(tell);
+}
+
 /* A period from the ring, the rest of it silence. */
 static void
 period_fill_ios(unsigned period)
@@ -1250,6 +1316,13 @@ period_fill_ios(unsigned period)
 	silent_frames += PERIOD_FRAMES - n;
 	/* the guard, on every period, silence too: its filter and its averages go on (hakios.guard.c) */
 	hakios_guard_process(samples, PERIOD_FRAMES);
+	if (mi2s) {
+		uint32_t gain = digital_gain;
+
+		for (uint32_t i = 0; i < 2 * PERIOD_FRAMES; i++) {
+			samples[i] = (int16_t)(((int32_t)samples[i] * (int32_t)gain) >> 16);
+		}
+	}
 	if (n != 0 && hakios_audio_recording_fed()) {
 		hakios_audio_record_fed(samples, n);
 	}
@@ -1358,10 +1431,10 @@ watch(void)
 			if (muted) {
 				guard_off(true);
 				if (on) {
-					hakios_speaker_stop();
+					amp_stop();
 					on = false;
 				}
-			} else if (on && !hakios_speaker_volume(below + extra, 1)) {
+			} else if (on && !amp_volume(below + extra, 1)) {
 				guard_off(true);
 				on = false;
 				given_up = true;
@@ -1373,7 +1446,7 @@ watch(void)
 			say_when("iOS plays: the amplifiers are started");
 			starts++;
 			ios_peak = 0;
-			if (!hakios_speaker_start() || !hakios_speaker_volume(below + extra, 1)) {
+			if (!amp_start() || !amp_volume(below + extra, 1)) {
 				say("sound: THE AMPLIFIERS DID NOT START; iOS's sound goes on to the DSP, unheard\n");
 				guard_off(true);
 				given_up = true;
@@ -1393,11 +1466,11 @@ watch(void)
 			say("sound: what iOS wrote while they were on peaked at %u%% of full scale (%u)\n", ios_peak * 100 / 32768,
 			    ios_peak);
 			guard_off(false);
-			hakios_speaker_stop();
+			amp_stop();
 			on = false;
 		} else if (on && now - last_look >= 200000) {
 			last_look = now;
-			if (!hakios_speaker_healthy()) {
+			if (!amp_healthy()) {
 				guard_off(true);
 				on = false;
 				given_up = true;
@@ -1406,7 +1479,7 @@ watch(void)
 				uint32_t wanted;
 
 				last_monitor = now;
-				wanted = hakios_speaker_monitor(monitor_looks++ % 10 == 0);
+				wanted = amp_monitor(monitor_looks++ % 10 == 0);
 				if (wanted != monitor) {
 					say("sound: the amplifiers' watch asks for %u.%03u dB less (it was %u.%03u)\n", wanted / 8, wanted % 8 * 125,
 					    monitor / 8, monitor % 8 * 125);
@@ -1440,11 +1513,7 @@ take_down(void)
 	lck_mtx_lock(&sound_lock);
 	if (running && !taken_down) {
 		taken_down = true;
-		if (mi2s) {
-			hakios_tfa9894_stop();
-		} else {
-			hakios_speaker_stop();
-		}
+		amp_stop();
 		stream_off();
 		afe_off();
 		pins_off();
@@ -1522,12 +1591,14 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	if (level == 4) {
 		thread_t feeder;
 
-		announce("the amplifiers, set up from Android's Music profile, powered down until iOS plays");
-		if (!hakios_speaker_prepare(acf, acf_size)) {
-			goto out;
-		}
-		hakios_adsp_fw_free(acf, acf_size);
-		acf = NULL;
+		if (!mi2s) {
+			announce("the amplifiers, set up from Android's Music profile, powered down until iOS plays");
+			if (!hakios_speaker_prepare(acf, acf_size)) {
+				goto out;
+			}
+			hakios_adsp_fw_free(acf, acf_size);
+			acf = NULL;
+		}               /* (the 6T's was set up at the start, and is powered down) */
 		feeder_runs = true;
 		if (kernel_thread_start(feeder_thread, NULL, &feeder) != KERN_SUCCESS) {
 			feeder_runs = false;
@@ -1613,11 +1684,7 @@ hakios_sound_dsp_up(void)
 		pins = quat_mi2s_pins;          /* (the only MI2S port there is so far: the OnePlus 6T's speaker) */
 		say("sound: another phone's port: MI2S %#x, clock %#x, %u bits; SMMU stream %#x\n", port, clock_id, port_bits,
 		    audio_stream);
-		if (level > 3) {
-			say("sound: sound=%u is redwood's amplifiers' with iOS's sound: on this phone sound=3 (the tone through its amplifier, "
-			    "hakios.tfa9894.c) is done, not more\n", level);
-			level = 3;
-		}
+		/* (its amplifier: hakios.tfa9894.c; its volume: in the samples, see gain_of()) */
 	}
 	PE_parse_boot_argn("sound_secs", &seconds, sizeof(seconds));
 	PE_parse_boot_argn("sound_below", &below, sizeof(below));
