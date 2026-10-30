@@ -1,3 +1,6 @@
-# Boot-args that xl adds to every run on this phone (unless XL_CMDLINE already gives them by name).
+# Boot-args that xl adds to every run on this phone (unless XL_CMDLINE already gives them by name:
+# XL_CMDLINE="-v cpus=1" for one core, "bootcpu=0" to stay on the core the firmware starts on).
+cpus=8          # all eight cores: small 0-3 (Kryo 385 Silver), big 4-7 (Kryo 385 Gold)
+bootcpu=7       # the kernel on the biggest core; the loader watches from core 0, so a kernel that hangs still gets its log out
 soc_vtimer=19   # the SDM845's virtual timer interrupt (PPI 3, intid 19); without it the kernel waits for a timer that never comes
 synaptics=3     # the touch screen (bsd/dev/hakios.synaptics.c): powered, configured, touches to SpringBoard
