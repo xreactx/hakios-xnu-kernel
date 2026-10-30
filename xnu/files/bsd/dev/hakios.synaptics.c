@@ -32,6 +32,15 @@
  *
  * At the run's end (and on a panic's way out) the two pins this changes are put back as they were and
  * the 3.0 V is switched off again.
+ *
+ * Nothing is done for the first synaptics_after=S seconds (25 by default). The 3.0 V is switched through
+ * the first command slot of the application processor's RPMh controller, and UEFI's own RPMh driver uses
+ * that same slot (it is found set after every cold start); the loader's core runs UEFI's timer events for
+ * a run's first 24 s (xnuloader's NOTE_SECONDS). Two writers in one slot's registers could send the
+ * always-on processor a mixed command -- one request's regulator with the other's voltage -- so the slot
+ * is left alone until that is over, as the buttons leave the PMIC bus. The touch screen answers from then
+ * on, about when the home screen comes. At the run's end the slot's state is said before it is used: what
+ * this driver left is 0, anything else is somebody else's.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -47,7 +56,7 @@ extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
 
 static vm_offset_t tlmm;
-static uint32_t level;
+static uint32_t level, synaptics_after = 25;
 static bool powered;
 static volatile bool leaving;
 
@@ -934,6 +943,11 @@ power_up(void)
 static void
 synaptics_thread(__unused void *arg, __unused wait_result_t wr)
 {
+	if (synaptics_after != 0) {
+		say("synaptics: nothing for %u s, while the loader's core may use the RPMh slot (synaptics_after)\n",
+		    synaptics_after);
+		delay_for_interval(synaptics_after * 1000, NSEC_PER_MSEC);
+	}
 	map_pins();
 	say("synaptics: level %u: %s\n", level,
 	    level == 1 ? "a look" : level == 2 ? "powered and probed, the chip only read" : "powered, configured, touches read and posted");
@@ -969,6 +983,7 @@ hakios_synaptics_init(void)
 	if (level > 3) {
 		level = 3;
 	}
+	PE_parse_boot_argn("synaptics_after", &synaptics_after, sizeof(synaptics_after));
 	if (kernel_thread_start(synaptics_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
@@ -995,6 +1010,11 @@ hakios_synaptics_quiesce(void)
 		say("synaptics: at the run's end: gpio%u and gpio%u as they were found\n", PIN_RESET, PIN_1V8);
 		if (avdd != 0) {
 			uint32_t address = avdd + VRM_ENABLE, off = 0;
+
+			/* (this driver's last write left both at 0: anything else was written by somebody else since) */
+			say("synaptics: the RPMh slot at the run's end: control %#x, commands enabled %#x, status %#x%s\n",
+			    rd(TCS(TCS_CONTROL)), rd(TCS(TCS_CMD_ENABLE)), rd(TCS(TCS_STATUS)),
+			    rd(TCS(TCS_CONTROL)) != 0 || rd(TCS(TCS_CMD_ENABLE)) != 0 ? " -- USED BY SOMEBODY ELSE during the run" : "");
 
 			say("synaptics: ... and the 3.0 V %s\n", rpmh_write(&address, &off, 1) ? "off" : "NOT switched off");
 		}
