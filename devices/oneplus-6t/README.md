@@ -110,7 +110,7 @@ intid 19, not the architecture's 27, and without it the kernel gets one tick and
 (this driver sends no reply after a receive of 29696 bytes or more), and `userland/build.sh` sets `umask 022`
 (launchd refuses SpringBoard's plist when its group may write it).
 These and everything after are now in `run.args` -- `cpus=8 bootcpu=7 soc_vtimer=19 cpufreq_osm=2 thermal=1
-buttons=2 battery=1 pmi_haptics=4 synaptics=3 slider=3` -- so `DEVICE=oneplus-6t ./xl run` is enough (`XL_CMDLINE="-v cpus=1"`,
+buttons=2 battery=1 pmi_haptics=4 synaptics=3 slider=3 adsp=1 sound=4` and the audio's `soc_*` -- so `DEVICE=oneplus-6t ./xl run` is enough (`XL_CMDLINE="-v cpus=1"`,
 `synaptics=0` and the like still win over them).
 
 The home screen takes a while, and runs shorter than about 2 minutes end before it: the screen shows the Apple
@@ -406,7 +406,17 @@ a second; then the amplifier is muted and powered down and everything put back.
       soc_audio_stream=0x1821 soc_smem=0x86000000 soc_cmd_db=0x85fe0000 soc_rsc=0x179e0000 soc_aoss=0xc300000
       soc_adsp_mem=0x8c500000 soc_adsp_mem_size=0x1a00000 soc_apcs_ipc=0x1799000c soc_adsp_cx=1" ./xl run
 
-Next: iOS's sound through it (`sound=4`), and a volume -- the amplifier plays at its own level, there is no fade yet. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
+**iOS's sound through the speaker** (`sound=4`, run 233909 with `RC_JOBS=rc.jobs.speakers`): the amplifier is set up
+once, switched on when iOS writes something that is not silence (29-59 ms after it, register `0x10` at `0x785e` every
+time) and off after three seconds of silence, as redwood's two are; a tone, the lock sound, keyboard clicks and a
+fanfare, 8162 periods without an error or an underflow. The amplifier has no volume of ours, so the volume
+(`sound_below`, 30 dB under Android's level by default, and iOS's own setting) is applied to the samples after the
+guard (`gain_of()` in `hakios.sound.c`); the speaker's protection is the amplifier's own DSP's.
+
+Since then `adsp=1 sound=4` and the `soc_*` they need are in `run.args`: every run has sound, given a small image
+built `ADSP=1 REST=1 userland/build.sh` (the DSP's firmware and the amplifier's set-up are in it; without them the DSP
+says so and the rest of the system starts as before). A plain run (234407) brings the DSP up at 30 s and the sound's
+path after it. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
 
 **11. Then** Wi-Fi; cellular last.
 
