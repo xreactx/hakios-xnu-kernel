@@ -2179,6 +2179,41 @@ block_poll(void)
 	    (uint64_t)(uintptr_t)&block_shared.answer + sizeof(block_shared.answer));
 }
 
+/*
+ * The OnePlus 6T's firmware has the same two charger protocols (fajitaPkg's APRIORI.inc: QcomChargerDxe,
+ * ChargerExDxe), but from another release than redwood's. For the record: where each is, its revision,
+ * and its first eight words.
+ *
+ * Disassembled (Binaries/enchilada/QcomPkg/Drivers: ChargerExDxe, QcomChargerDxe): ChargerEx revision 0x10003 has efi.h's
+ * layout -- its first three entries take a pointer, refuse NULL and only answer through it. QcomCharger
+ * revision 0x10007 does NOT: its fourth entry, redwood's get_charging_action, takes a 32-bit value and
+ * hands it to the PMIC's charger protocol (a setter), and so does the third. On this phone QcomCharger
+ * is therefore never called, initialize() included; ChargerEx alone gives presence and voltage, and the
+ * charge is estimated from the voltage (LOADER_BATTERY_SOC_ESTIMATED).
+ */
+#define FAJITA_CHARGER_EX_REVISION      0x10003
+static void
+charger_look(void)
+{
+	static const efi_guid charger_ex_guid = QCOM_CHARGER_EX_GUID;
+	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
+	const struct { const efi_guid *guid; const char *name; } protocols[] = {
+		{ &charger_ex_guid, "ChargerEx" }, { &qcom_charger_guid, "QcomCharger" },
+	};
+
+	for (unsigned i = 0; i < 2; i++) {
+		const uint64_t *table = NULL;
+		efi_status s = BS->locate_protocol(protocols[i].guid, NULL, (void **)&table);
+
+		if (EFI_ERROR(s) || table == NULL) {
+			print("battery: %s: not found (%x)\n", protocols[i].name, s);
+			continue;
+		}
+		print("battery: %s at %x, revision %x; words 1-7: %x %x %x %x %x %x %x\n", protocols[i].name,
+		    (uint64_t)(uintptr_t)table, table[0], table[1], table[2], table[3], table[4], table[5], table[6], table[7]);
+	}
+}
+
 static void
 charger_start(void)
 {
@@ -2186,6 +2221,29 @@ charger_start(void)
 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
 	efi_status ex_status, qcom_status, init_status = 0;
 
+	if (PLAT == &platform_fajita) {
+		if (charger_enabled) {
+			return;
+		}
+		charger_look();
+		ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
+		QCOM_CHARGER = NULL;
+		if (EFI_ERROR(ex_status) || CHARGER_EX == NULL || CHARGER_EX->revision != FAJITA_CHARGER_EX_REVISION) {
+			print("battery: ChargerEx is not the revision checked (%x): no battery\n",
+			    CHARGER_EX != NULL ? CHARGER_EX->revision : 0);
+			CHARGER_EX = NULL;
+			return;
+		}
+		charger_enabled = 1;
+		print("battery: ChargerEx only (QcomCharger is not called on this phone); shared=%x\n",
+		    (uint64_t)(uintptr_t)&charger_shared);
+		charger_poll();
+		print("battery: flags=%x SOC=%d%% V=%d mV I=%d mA T=%d C action=%d\n", (uint64_t)charger_shared.flags,
+		    (uint64_t)(int64_t)charger_shared.soc_percent, (uint64_t)(int64_t)charger_shared.voltage_mv,
+		    (uint64_t)(int64_t)charger_shared.current_ma, (uint64_t)(int64_t)charger_shared.temperature_c,
+		    (uint64_t)charger_shared.charger_action);
+		return;
+	}
 	if (charger_enabled || PLAT != &platform_redwood) {
 		return;
 	}
