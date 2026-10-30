@@ -298,6 +298,12 @@ Step 5 works (run 203147, with the regions reserved): the 13 segments into `0x8c
 16.1 MB of zeroes, read back with no word different. One change: the 6T's segment 9 is 84 bytes, so a segment's last
 word of eight may now run past its end (into the gap before the next one, which starts at a page).
 
+Step 6 works (run 203504): under the shared memory's hardware lock (`0x1f43000`, the same as redwood's: 8 locks of
+`0x1000`, the shared memory's is 3), our SMP2P item 429 is made at `0x861af030`, and -- what redwood's boot loader does
+for it, and this phone's does not -- GLINK's descriptor 478 (32 bytes) and our queue 479 (16 KB), zeroed, as Linux's
+`qcom_glink_smem_register()` makes them. They stay in the shared memory until the phone restarts; a later run finds
+and uses them.
+
 **11. Then** Wi-Fi; cellular last.
 
 ## Firmware
