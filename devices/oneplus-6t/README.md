@@ -282,6 +282,14 @@ as touch waits out UEFI; then the AOP's message RAM at `0xc300000` reads "MAIL",
 (`0x2d8` bytes), and link and channel open with every acknowledgement, the doorbell being the APCS's bit 0. The system
 starts on to the home screen as before. Step 7 (RPMh, TrustZone) waits the same way.
 
+Before step 5 writes the DSP's memory: Mu-Silicium's UEFI reports nearly all of Android's carveouts here as free
+(`0x8ab00000`-`0x97c00000`, type 7 in `logs/fajita-memmap.txt`). The kernel never gets them (its window is the largest
+free block, above `0xa1769000`), but UEFI runs on during a run and could allocate there. So the loader claims the
+thirteen that lie wholly in free memory -- qseecom, camera, ips_fw, ipa_gsi, gpu, adsp, wlan_fw, modem, video, cdsp,
+mba, slpi, pil_spss -- as reserved at its start (`fajita_reserved` in `xnuloader/loader.c`); its log says
+"reserved: 13 of the platform's regions claimed from UEFI, 0 not", and `xl memmap` (after `xl reload`: after a run
+`oem log` gives the kernel's log) shows them as type 0.
+
 Step 4 works as it is (run 202443): TrustZone takes the header of image 1 (`0x42000201`, the signature checked) and
 the place, 26 MB at `0x8c500000` (`0x42000202`), both answering 0. The mailbox, opened by the run before, is found
 open.

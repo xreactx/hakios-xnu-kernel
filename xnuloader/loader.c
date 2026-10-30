@@ -565,6 +565,37 @@ struct platform {
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 	int usb_old_driver;              /* its UEFI's USB driver repeats "connected" each time the host opens the device, and
 	                                    may not say it at all for a cable that was in from the start (usb_wait) */
+	const struct reserved_region *reserved;  /* memory its UEFI calls free and must not hand out (reserve_regions()) */
+};
+
+struct reserved_region {
+	const char *name;
+	uint64_t base, size;            /* 0 size: the end of the list */
+};
+
+/*
+ * The OnePlus 6T's UEFI (Mu-Silicium's) reports most of the memory Android's device tree reserves for
+ * the SoC's other processors as free (logs/fajita-memmap.txt: 0x8ab00000-0x97c00000 is type 7). The
+ * kernel never gets it -- its window is the largest free block, above 0xa1769000 -- but UEFI goes on
+ * running on core 0 during a run and could allocate there, and a region that TrustZone has given to a
+ * running DSP faults whoever touches it. So these are claimed from UEFI at the start, as reserved: the
+ * reserved-memory nodes of the phone's own tree that lie wholly in its free memory.
+ */
+static const struct reserved_region fajita_reserved[] = {
+	{ "qseecom", 0x8ab00000, 0x1400000 },
+	{ "camera", 0x8bf00000, 0x500000 },
+	{ "ips_fw", 0x8c400000, 0x10000 },
+	{ "ipa_gsi", 0x8c410000, 0x5000 },
+	{ "gpu", 0x8c415000, 0x2000 },
+	{ "adsp", 0x8c500000, 0x1a00000 },
+	{ "wlan_fw", 0x8df00000, 0x100000 },
+	{ "modem", 0x8e000000, 0x7800000 },
+	{ "video", 0x95800000, 0x500000 },
+	{ "cdsp", 0x95d00000, 0x900000 },
+	{ "mba", 0x96600000, 0x200000 },
+	{ "slpi", 0x96800000, 0x1400000 },
+	{ "pil_spss", 0x97c00000, 0x100000 },
+	{ NULL, 0, 0 },
 };
 
 static const struct platform platform_qemu_virt = {
@@ -608,6 +639,7 @@ static const struct platform platform_fajita = {
 	 * second one, and every other command from the host was lost.
 	 */
 	.usb_old_driver = 1,
+	.reserved = fajita_reserved,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -4430,6 +4462,32 @@ ramfb_phone_screen(void)
 	SCREEN.stride = PHONE_WIDTH * 4;
 }
 
+/*
+ * The platform's reserved regions claimed from UEFI (EfiReservedMemoryType at their own address), each
+ * said in the log: one that cannot be claimed is in use already, or not all free, and is left as it is.
+ */
+static void
+reserve_regions(void)
+{
+	unsigned claimed = 0, refused = 0;
+
+	for (const struct reserved_region *r = PLAT->reserved; r != NULL && r->size != 0; r++) {
+		uint64_t at = r->base;
+		efi_status s = BS->allocate_pages(AllocateAddress, EfiReservedMemoryType, (r->size + 0xfff) >> 12, &at);
+
+		if (EFI_ERROR(s)) {
+			print("reserved: %s %x size %x NOT CLAIMED (status %x): UEFI has it in use, or not all of it free\n", r->name,
+			    r->base, r->size, s);
+			refused++;
+		} else {
+			claimed++;
+		}
+	}
+	if (claimed + refused != 0) {
+		print("reserved: %d of the platform's regions claimed from UEFI, %d not\n", (uint64_t)claimed, (uint64_t)refused);
+	}
+}
+
 efi_status EFIAPI
 efi_main(efi_handle image, efi_system_table *st)
 {
@@ -4464,6 +4522,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	reserve_regions();
 
 	install_exception_hook();
 	wdt_arm();
