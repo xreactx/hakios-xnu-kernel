@@ -613,6 +613,7 @@ extern IOHIDEventRef IOHIDEventCreateKeyboardEvent(CFAllocatorRef allocator, uin
     Boolean down, uint32_t options);
 extern void IOHIDEventAppendEvent(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
 extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFIndex value);
+extern CFIndex IOHIDEventGetIntegerValue(IOHIDEventRef event, uint32_t field);
 
 #define HID_CLIENT_SIMPLE               4       /* a client that only sends */
 #define HID_CLIENT_RATE_CONTROLLED      3       /* what IOHIDEventSystemClientCreate() makes */
@@ -624,12 +625,17 @@ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFInd
 #define HID_USAGE_MENU                  0x40    /* the home button */
 #define HID_USAGE_VOLUME_UP             0xe9
 #define HID_USAGE_VOLUME_DOWN           0xea
+#define HID_PAGE_TELEPHONY              0x0b
+#define HID_USAGE_RINGER                0x2e    /* the iPhone's ring/silent switch: "down" = ring (backboardd, SpringBoard's _ringerChanged:) */
 #define DIGITIZER_HAND                  3       /* kIOHIDDigitizerTransducerTypeHand */
 #define DIGITIZER_RANGE                 0x1     /* event mask: what has changed */
 #define DIGITIZER_TOUCH                 0x2
 #define DIGITIZER_POSITION              0x4
 #define DIGITIZER_FROM_EDGE_TIP         0x800   /* not a change: this finger came in over an edge of the screen */
 #define FIELD_IS_BUILT_IN               0x4
+#define HID_EVENT_KEYBOARD              3
+#define FIELD_KEYBOARD_USAGE_PAGE       0x30000
+#define FIELD_KEYBOARD_USAGE            0x30001
 #define FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xb0019
 
 #define MAX_FINGERS     10
@@ -738,9 +744,34 @@ service_notification(__unused void *target, __unused void *refcon, __unused IOHI
 {
 }
 
+/* where the ring/silent switch is (HAKIOS_BUTTON_RINGER's last sample): 1 ring, 0 silent, -1 not told yet */
+static volatile int ringer = -1;
+
+/*
+ * The event server asks a service for its present event of a kind: backboardd does so when it starts,
+ * for the ring/silent switch's position (a keyboard event of the telephony page's usage 0x2e), which
+ * it then gives SpringBoard. Answered while the kernel has told us where the switch is.
+ */
+static IOHIDEventRef
+service_copy_event(__unused void *target, __unused void *refcon, __unused IOHIDServiceClientRef service, uint32_t type,
+    IOHIDEventRef matching, __unused uint32_t options)
+{
+	IOHIDEventRef event;
+
+	if (type != HID_EVENT_KEYBOARD || matching == NULL || ringer < 0 ||
+	    IOHIDEventGetIntegerValue(matching, FIELD_KEYBOARD_USAGE_PAGE) != HID_PAGE_TELEPHONY ||
+	    IOHIDEventGetIntegerValue(matching, FIELD_KEYBOARD_USAGE) != HID_USAGE_RINGER) {
+		return NULL;
+	}
+	say("hakios: input: the event server asks where the ring/silent switch is: %s\n", ringer ? "ring" : "silent");
+	event = IOHIDEventCreateKeyboardEvent(NULL, mach_absolute_time(), HID_PAGE_TELEPHONY, HID_USAGE_RINGER, ringer, 0);
+	IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
+	return event;
+}
+
 static const struct virtual_service_callbacks service_callbacks = {
 	.version = 2, .notification = service_notification, .setProperty = service_set_property,
-	.copyProperty = service_copy_property,
+	.copyProperty = service_copy_property, .copyEvent = service_copy_event,
 };
 
 /*
@@ -873,6 +904,16 @@ send_button(IOHIDServiceClientRef buttons, const struct hakios_touch *t)
 	    HID_USAGE_VOLUME_DOWN : 0;
 	IOHIDEventRef event;
 
+	/* the ring/silent switch (the 6T's alert slider, bsd/dev/hakios.slider.c): the telephony page's 0x2e, down = ring */
+	if (t->finger == HAKIOS_BUTTON_RINGER) {
+		ringer = t->type == HAKIOS_BUTTON_DOWN;
+		say("hakios: input: the ring/silent switch: %s\n", ringer ? "ring" : "silent");
+		event = IOHIDEventCreateKeyboardEvent(NULL, t->time, HID_PAGE_TELEPHONY, HID_USAGE_RINGER, ringer, 0);
+		IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
+		IOHIDVirtualServiceClientDispatchEvent(buttons, event);
+		CFRelease(event);
+		return;
+	}
 	if (usage == 0) {
 		return;
 	}

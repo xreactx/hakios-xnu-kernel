@@ -804,6 +804,52 @@ poster_switcher_allowed(__unused id self, __unused SEL selector, id *explanation
 #define SEND1(type, object, name, argument_type, argument) \
 	((type (*)(id, SEL, argument_type))objc_msgSend)((id)(object), sel_registerName(name), argument)
 
+/* ---- the ring/silent switch ---------------------------------------------------------------------- */
+
+/*
+ * The ring/silent switch (the OnePlus 6T's alert slider, through backboardd: inject.c). backboardd
+ * hands SpringBoard each position, and -[SpringBoard _updateRingerState:withVisuals:updatePreferenceRegister:]
+ * (state 1 = ring, 0 = silent) does nothing at all unless MobileGestalt says the device has a ringer
+ * switch (MGGetBoolAnswer("ringer-switch")). Where it does not, the replacement does what the original
+ * would: keeps the state in _ringerSwitchState, mutes or unmutes the ringer, shows the banner (with
+ * visuals) and tells whoever listens.
+ */
+static void (*original_update_ringer_state)(id self, SEL selector, int state, BOOL visuals, BOOL update_register);
+
+static void
+update_ringer_state(id self, SEL selector, int state, BOOL visuals, BOOL update_register)
+{
+	static int capable = -1;
+	Ivar ivar = class_getInstanceVariable(object_getClass(self), "_ringerSwitchState");
+	id control;
+
+	if (capable < 0) {
+		Boolean (*mg_bool)(CFStringRef) = (Boolean (*)(CFStringRef))dlsym(RTLD_DEFAULT, "MGGetBoolAnswer");
+
+		capable = mg_bool != NULL && mg_bool(CFSTR("ringer-switch"));
+		say("hakios: SpringBoard: MobileGestalt says %s ringer switch\n", capable ? "there is a" : "there is no");
+	}
+	original_update_ringer_state(self, selector, state, visuals, update_register);
+	control = SEND(id, self, "ringerControl");
+	if (!capable && ivar != NULL && control != NULL) {
+		id *name = (id *)dlsym(RTLD_DEFAULT, "SBUIRingerSwitchBehaviorDidChangeNotification");
+
+		*(int *)((char *)self + ivar_getOffset(ivar)) = state;
+		if (SEND(BOOL, control, "isRingerMuted") != (state == 0)) {
+			SEND1(void, control, "setRingerMuted:", BOOL, state == 0);
+			if (visuals) {
+				SEND1(void, control, "activateRingerHUDFromMuteSwitch:", int, state);
+			}
+		}
+		if (name != NULL) {
+			((void (*)(id, SEL, id, id))objc_msgSend)(SEND(id, objc_getClass("NSNotificationCenter"), "defaultCenter"),
+			    sel_registerName("postNotificationName:object:"), *name, NULL);
+		}
+	}
+	say("hakios: SpringBoard: the ring/silent switch: %s%s; the ringer is %s\n", state ? "ring" : "silent",
+	    visuals ? "" : " (no banner)", control && SEND(BOOL, control, "isRingerMuted") ? "muted" : "on");
+}
+
 static const char *layers_of = "";               /* in another program than SpringBoard: " of" and its name */
 
 static const char *
@@ -1293,6 +1339,8 @@ hakios_springboard_init(void)
 	    0x1c507e0fcUL, (IMP)poster_switcher_allowed);
 	original_switcher_wallpaper_overlay = (void (*)(id, SEL))replace_method("SBAppSwitcherPageView",
 	    "_createOrDestroyWallpaperOverlayView", 0x1c4af7860UL, (IMP)switcher_wallpaper_overlay);
+	original_update_ringer_state = (void (*)(id, SEL, int, BOOL, BOOL))replace_method("SpringBoard",
+	    "_updateRingerState:withVisuals:updatePreferenceRegister:", 0x1c4ac76e8UL, (IMP)update_ringer_state);
 	/*
 	 * Battery hooks on UIDevice: these are the methods every app and SpringBoard itself calls, so
 	 * hooking them here in the SpringBoard process covers both the status bar and any app that
