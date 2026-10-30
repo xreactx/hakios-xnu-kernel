@@ -313,6 +313,19 @@ requests to RPMh now take the same lock as the DSP's (one command slot, TCS 0, f
 the slot's completion enable as touch's does. Not yet seen: the DSP's doorbells to us (GIC 156 and 158 never pending
 here); the link polls the shared memory every millisecond all the same.
 
+**Steps 8 to 11: the audio services are up** (run 204424, all eleven steps on this phone). GLINK: versions agreed, and
+of the six channels the DSP opens, "IPCRTR" and "apr_audio_svc" are open both ways. QRTR: hello both ways, the DSP is
+node 5 with 7 services. APR: the DSP's core service says the audio services are up after 2.2 s and lists them. Then
+it stops when asked (1.4 ms) and is shut down. Started a second time in the same power-on, it says it has restarted
+(SMP2P flag), which is answered. Run as
+
+    XL_SECS=100 XL_CMDLINE="-v adsp_step=11 adsp_new=8 soc_smem=0x86000000 soc_cmd_db=0x85fe0000 soc_rsc=0x179e0000
+      soc_aoss=0xc300000 soc_adsp_mem=0x8c500000 soc_adsp_mem_size=0x1a00000 soc_apcs_ipc=0x1799000c soc_adsp_cx=1" ./xl run
+
+That run's log did not come back over USB ("usb: no completion for a send in 1 s: aborted" at the return, and
+`oem log` then gave the loader's own); the loader had written it to the `logdump` partition, read back with
+`./xl flash-read logdump 0 e4000 F` and `strings`. Next: the speaker's path, `hakios.sound.c` on QUAT MI2S.
+
 **11. Then** Wi-Fi; cellular last.
 
 ## Firmware
