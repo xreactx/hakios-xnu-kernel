@@ -110,7 +110,7 @@ intid 19, not the architecture's 27, and without it the kernel gets one tick and
 (this driver sends no reply after a receive of 29696 bytes or more), and `userland/build.sh` sets `umask 022`
 (launchd refuses SpringBoard's plist when its group may write it).
 These and everything after are now in `run.args` -- `cpus=8 bootcpu=7 soc_vtimer=19 cpufreq_osm=2 thermal=1
-buttons=2 battery=1 pmi_haptics=4 synaptics=3` -- so `DEVICE=oneplus-6t ./xl run` is enough (`XL_CMDLINE="-v cpus=1"`,
+buttons=2 battery=1 pmi_haptics=4 synaptics=3 slider=3` -- so `DEVICE=oneplus-6t ./xl run` is enough (`XL_CMDLINE="-v cpus=1"`,
 `synaptics=0` and the like still win over them).
 
 The home screen takes a while, and runs shorter than about 2 minutes end before it: the screen shows the Apple

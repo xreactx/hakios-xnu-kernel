@@ -9,3 +9,4 @@ buttons=2       # power, volume up and down (bsd/dev/hakios.buttons.c, the 6T's 
 battery=1       # the battery through the loader (UEFI's ChargerEx and PmicDxe's fuel gauge): charge, current, temperature for the status bar
 pmi_haptics=4   # the vibration motor for iOS's haptics (bsd/dev/hakios.pmi_haptics.c): taps and vibrations, from 25 s on
 synaptics=3     # the touch screen (bsd/dev/hakios.synaptics.c): powered, configured, touches to SpringBoard
+slider=3        # the alert slider as iOS's ring/silent switch (bsd/dev/hakios.slider.c): lower position ring, the other silent

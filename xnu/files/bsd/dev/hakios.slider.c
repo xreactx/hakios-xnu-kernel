@@ -9,7 +9,14 @@
  *              and each change said with its time. Nothing is written to the pins. (On the 6T UEFI leaves
  *              all three inputs with the SoC's pull-down on, and they read 0 whatever the slider does.)
  *   slider=2   ... with the pull switched off first, as Android has them (bias-disable): only the two pull
- *              bits of each pin's configuration change, and they are put back at the run's end.
+ *              bits of each pin's configuration change, and they are put back at the run's end. The
+ *              selected position pulls its pin low: key1 in the lower one (ring), key2 in the other; key3
+ *              (the third position) is not reached on this phone. Between two, all three read 1.
+ *   slider=3   ... and iOS told, as its ring/silent switch (HAKIOS_BUTTON_RINGER to /dev/hakios-touch,
+ *              which backboardd's libhakios.dylib makes a HID event of): ring while key1 is low, silent
+ *              in any other position, once at the start and at every change; between positions nothing.
+ *              (iOS's switch is the telephony page's usage 0x2e, "down" = ring; backboardd keeps the
+ *              last position and SpringBoard asks it for that when it starts.)
  *
  * No PMIC and no shared bus is involved: unlike the buttons there is nothing to wait out at the start.
  */
@@ -79,6 +86,26 @@ levels(void)
 	return bits;
 }
 
+/* level 3: the position to iOS -- ring while key1 (the lower position) is low, silent in any other */
+static int reported = -1;       /* 0 ring, 1 silent */
+
+static void
+report(unsigned bits)
+{
+	int silent;
+
+	if (bits == 7) {
+		return;                 /* between two positions */
+	}
+	silent = (bits & 1) != 0;
+	if (silent == reported) {
+		return;
+	}
+	reported = silent;
+	hakios_touch_post(silent ? HAKIOS_BUTTON_UP : HAKIOS_BUTTON_DOWN, HAKIOS_BUTTON_RINGER, 0, 0);
+	say("slider: iOS told: %s\n", silent ? "SILENT" : "RING");
+}
+
 static void
 slider_thread(__unused void *arg, __unused wait_result_t wr)
 {
@@ -88,7 +115,8 @@ slider_thread(__unused void *arg, __unused wait_result_t wr)
 	for (unsigned i = 0; i < PINS; i++) {
 		page[i] = ml_io_map(TLMM_PHYS + pins[i].tile + 0x1000UL * pins[i].pin, 0x1000);
 	}
-	say("slider: level %u: %s\n", level, level == 1 ? "a look, reading only" : "the pulls off, then a look");
+	say("slider: level %u: %s\n", level, level == 1 ? "a look, reading only" : level == 2 ? "the pulls off, then a look" :
+	    "the pulls off, and iOS told");
 	for (unsigned i = 0; i < PINS; i++) {
 		uint32_t cfg = *(volatile uint32_t *)page[i], io = *(volatile uint32_t *)(page[i] + 4);
 
@@ -110,6 +138,9 @@ slider_thread(__unused void *arg, __unused wait_result_t wr)
 	}
 	last = levels();
 	say("slider: key1 key2 key3 read %u %u %u -- move the slider\n", last & 1, (last >> 1) & 1, (last >> 2) & 1);
+	if (level >= 3) {
+		report(last);
+	}
 	for (;;) {
 		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
 		now = levels();
@@ -121,6 +152,9 @@ slider_thread(__unused void *arg, __unused wait_result_t wr)
 		say("slider: %llu.%03llu s: key1 key2 key3 read %u %u %u (change %u)\n", ns / NSEC_PER_SEC, ns / NSEC_PER_MSEC % 1000,
 		    now & 1, (now >> 1) & 1, (now >> 2) & 1, changes);
 		last = now;
+		if (level >= 3) {
+			report(now);
+		}
 	}
 }
 
@@ -132,8 +166,8 @@ hakios_slider_init(void)
 	if (!PE_parse_boot_argn("slider", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (level > 2) {
-		level = 2;
+	if (level > 3) {
+		level = 3;
 	}
 	if (kernel_thread_start(slider_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
