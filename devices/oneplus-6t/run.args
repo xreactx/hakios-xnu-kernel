@@ -7,4 +7,5 @@ cpufreq_osm=2   # the cores' clocks raised (bsd/dev/hakios.cpufreq.c): big 825 -
 thermal=1       # the SoC's 21 temperature sensors (bsd/dev/hakios.thermal.c), read only: cores every 10 s, the most at the end
 buttons=2       # power, volume up and down (bsd/dev/hakios.buttons.c, the 6T's layout): read from the PM8998, reported to SpringBoard
 battery=1       # the battery through the loader (UEFI's ChargerEx and PmicDxe's fuel gauge): charge, current, temperature for the status bar
+pmi_haptics=4   # the vibration motor for iOS's haptics (bsd/dev/hakios.pmi_haptics.c): taps and vibrations, from 25 s on
 synaptics=3     # the touch screen (bsd/dev/hakios.synaptics.c): powered, configured, touches to SpringBoard
