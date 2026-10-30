@@ -26,7 +26,7 @@ phone is here; the kernel, loader and user space are the common ones. `device.co
 | Temperatures | tsens v2, 21 sensors (TM `0xc263000`, `0xc265000`) | | `hakios.thermal.c` (`thermal=1`), reading only |
 | GPU | Adreno 630 (chipid `0x6030001`) | Adreno 642L | `hakios.adreno.c`'s steps hold; registers, GMU firmware and RPMh levels are a630's (Linux `a6xx_gmu.c`, the a630 paths) |
 | Wi-Fi | WCN3990, `icnss` | WCN6750 | Linux's ath10k_snoc, not ath11k: a new back end |
-| Audio | ADSP, Q6 APR, WCD934x "tavil" | ADSP | rework of `hakios.adsp.c` / `hakios.sound.c` |
+| Audio | ADSP (TrustZone PAS 1, 26 MB at `0x8c500000`), Q6 APR; the loudspeaker a TFA9894 on QUAT MI2S; WCD934x "tavil" on SLIMbus for the rest | ADSP; AW88261s on TDM | rework of `hakios.adsp.c` / `hakios.sound.c`, a TFA9894 driver (step 10) |
 | Battery, charging | PMI8998 (fuel gauge, SMB2) | through the ADSP | through the loader from UEFI, as redwood's first way was, but with other protocols (step 7) |
 | Haptics | PMI8998 haptics block (slave 3, peripheral `0xc0`), an LRA | Awinic AW86927 on I2C | `hakios.pmi_haptics.c` (`pmi_haptics=4`), through the PMIC arbiter; iOS's side is redwood's (`/dev/hakios-haptic`) |
 | Cellular | IPA 3.5.1; no IPCC; the modem loaded through the MBA (`qcom,pil-q6v55-mss`) | IPA 4.11; IPCC; TrustZone PAS | the largest piece, last |
@@ -247,7 +247,25 @@ up (the motor had been stopped the first time). Whatever a driver says at the ru
 
 **9. GPU** (`gpu=1`): run `adreno=N` step by step with a630 values, as `hakios.adreno.c` describes.
 
-**10. Then** the alert slider, Wi-Fi, audio; cellular last.
+**10. Audio** (started 30 October 2026).
+
+The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the
+serial engine at `0x890000`, address `0x34`, reset GPIO 69; the `max98927` beside it in the tree is disabled), fed by
+the audio DSP over the quaternary MI2S (Android's mixer paths: every speaker playback is `QUAT_MI2S_RX`). The codec
+is for the earpiece, the headphones and the microphones, later. So, in this order:
+
+1. the audio DSP up: `hakios.adsp.c` with the SDM845's numbers. TrustZone PAS image 1, as redwood's; its memory
+   `0x8c500000`, 26 MB (reserved-memory `adsp_region`); last words SMEM item 423; GLINK's shared memory at
+   `0x86000000`. No IPCC: every doorbell is a bit of the APCS IPC register `0x1799000c` -- GLINK bit 8
+   (interrupt 156), SMP2P bit 10 (interrupt 158; SMP2P "master-kernel"/"slave-kernel" with processor 2), the AOP's
+   mailbox (`0xc300000`) bit 0. Its rail is CX (`vdd_cx`, level 385), not LCX/LMX, and it goes through RPMh, so not
+   before the 25 s that UEFI uses it (step 6).
+2. `hakios.sound.c`'s AFE port on QUAT MI2S instead of redwood's first TDM.
+3. the TFA9894 set up from Android's container `/vendor/etc/firmware/tfa98xx.cnt` (in `fw-audio/`).
+
+The DSP's firmware (`adsp.mdt`, `adsp.b00`-`b13`, 11 MB) comes off the flash with `xl flash-read` (see Firmware).
+
+**11. Then** Wi-Fi; cellular last.
 
 ## Firmware
 
@@ -256,4 +274,6 @@ devices/oneplus-6t/pull-firmware.sh     # the phone in Android, on adb
 ```
 
 Pulls the GPU (`a630_*`), Wi-Fi (`wlanmdsp.mbn`, board files), the audio DSP and the modem (with `mba.mbn` and its TFTP
-`image/`). The vibration motor needs none; the cameras are not ported.
+`image/`). The vibration motor needs none; the cameras are not ported. On a phone without root, the firmware
+partition is not readable from adb; the loader reads it instead (`xl flash-read modem_b ...`, the script's comment
+says how): that is how `fw-audio/`, `fw-wifi/` and `fw-modem/` were filled on 30 October 2026.
