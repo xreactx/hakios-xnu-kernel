@@ -18,6 +18,9 @@
  * cpufreq_osm=2: ... and, first, each group asked for the highest row of its table at or under
  * cpufreq_osm_mhz (default 2400: the big cores' 2.4 GHz, the small ones' top 1766 MHz). Nothing here
  * watches the temperature; the SoC's own limits hardware (LMh) holds the clock down when it is hot.
+ * At the run's end (hakios_osm_quiesce()) each group is put back to the row it was found at: the
+ * OSM keeps what it was last told, and the loader would otherwise idle at 2.4 GHz until the phone
+ * is restarted.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -147,6 +150,14 @@ osm_table(const char *what, vm_offset_t phys)
 	}
 }
 
+/* each group raised: its registers and the row it was found at, for hakios_osm_quiesce() */
+static struct {
+	const char *what;
+	vm_offset_t base;
+	uint32_t found;
+} osm_raised[2];
+static unsigned osm_raised_count;
+
 /* The highest row at or under `most_mhz' asked for; the OSM moves the clock and the voltage itself. */
 static void
 osm_raise(const char *what, vm_offset_t phys, uint32_t most_mhz)
@@ -168,9 +179,28 @@ osm_raise(const char *what, vm_offset_t phys, uint32_t most_mhz)
 		}
 	}
 	was = *(volatile uint32_t *)(base + OSM_PERF_STATE);
+	if (osm_raised_count < sizeof(osm_raised) / sizeof(osm_raised[0])) {
+		osm_raised[osm_raised_count++] = (typeof(osm_raised[0])){ what, base, was };
+	}
 	*(volatile uint32_t *)(base + OSM_PERF_STATE) = pick;
 	delay_for_interval(20, NSEC_PER_MSEC);
 	tell("cpufreq_osm: %s: row %u -> %u, %u MHz (at most %u asked)\n", what, was, pick, pick_khz / 1000, most_mhz);
+}
+
+/* On every way back to the loader (a panic's too), with interrupts off: each group's row as it was found. */
+void hakios_osm_quiesce(void);
+
+void
+hakios_osm_quiesce(void)
+{
+	for (unsigned i = 0; i < osm_raised_count; i++) {
+		volatile uint32_t *state = (volatile uint32_t *)(osm_raised[i].base + OSM_PERF_STATE);
+		uint32_t now = *state;
+
+		*state = osm_raised[i].found;
+		tell("cpufreq_osm: at the run's end: %s back from row %u to %u\n", osm_raised[i].what, now, osm_raised[i].found);
+	}
+	osm_raised_count = 0;
 }
 
 static void
