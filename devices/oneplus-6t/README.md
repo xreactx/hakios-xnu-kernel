@@ -245,7 +245,22 @@ own; it keeps the bus rules above. A first version of the driver wrote to the co
 interrupts are off: that is a panic, and the panic's way out ran the run's end again, in a loop, until the loader gave
 up (the motor had been stopped the first time). Whatever a driver says at the run's end goes to the loader's log only.
 
-**9. GPU** (`gpu=1`): run `adreno=N` step by step with a630 values, as `hakios.adreno.c` describes.
+**9. GPU** (`gpu=1`): run `adreno=N` step by step with a630 values, as `hakios.adreno.c` describes. Started 30 October
+2026; what the phone's tree says, against redwood's (Adreno 642L, SC7280):
+
+| | OnePlus 6T (Adreno 630) | redwood |
+|---|---|---|
+| the 3D core | `0x5000000` (256 KB), CX debug `0x5061000`, `cx_misc` `0x509e000`; chip ID `0x6030001` | `0x3d00000` |
+| the GMU | `0x506a000` (192 KB), its RPMh PDC `0xb200000`; SMMU contexts 4 and 5 of the GPU's SMMU | `0x3d69000` |
+| the GPU's clock controller | `0x5090000` (`gpucc-sdm845-v2`); power switches CX `+0x106c`, GX `+0x100c` (Linux `gpucc-sdm845.c`) | `0x3d90000`, CX `0x3d9106c` |
+| the GPU's SMMU | `0x5040000` (`kgsl-smmu-v2`) | `0x3da0000` |
+| the zap shader | TrustZone image 13, into `gpu_region` (`0x8c415000`, 8 KB, reserved by the loader) | |
+| firmware (`fw-gpu/`, from `/vendor/firmware` with root) | `a630_sqe.fw` (32 KB), `a630_gmu.bin` (32 KB), `a630_zap.mdt`/`.b00`-`.b02` | `a660_*` |
+
+The real difference is the GMU: the a630's is the older one (`qcom,gpu-quirk-hfi-use-reg`; in Linux's `a6xx_gmu.c` the
+`legacy` paths): its firmware is a plain image for its instruction memory, its messages the first HFI. Steps 1 to 12
+(reads, the CX power switch, clocks, the SMMU, TrustZone's zap check) want new numbers; steps 13 to 17 (the GMU's
+firmware, start, HFI, the 3D core's power) a630 code, from `a6xx_gmu.c`'s legacy branches.
 
 **10. Audio** (started 30 October 2026).
 
