@@ -1593,8 +1593,12 @@ step_image(void)
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
 
-		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
-			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
+		/*
+		 * Written a word of eight bytes at a time; a segment's last word may run past its end (the 6T's
+		 * segment 9 is 84 bytes) with zeroes, which stay short of the next segment, itself at a multiple of eight.
+		 */
+		if (image.segment[s].at & 7) {
+			printf("adsp: %u: a segment that does not begin at a multiple of eight bytes: not written\n", step);
 			ml_io_unmap((vm_offset_t)dsp_memory, adsp_memory_size);
 			return false;
 		}
@@ -3343,7 +3347,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
  * seconds (25) from this driver's start: the loader's core runs UEFI's own work for a run's first 24 s
  * (xnuloader's NOTE_SECONDS), as hakios.synaptics.c waits for too.
  */
-#define PORTED_APCS             4
+#define PORTED_APCS             5
 
 static void
 soc_override(void)
