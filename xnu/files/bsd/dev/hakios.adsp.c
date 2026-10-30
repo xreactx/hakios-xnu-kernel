@@ -915,6 +915,7 @@ static unsigned long cmd_db_phys = CMD_DB_PHYS_DEFAULT;   /* soc_cmd_db */
 
 static struct block rsc = { "rsc", 0x18220000, 0x10000 };
 #define RSC_TCS_BASE            0xd00
+#define RSC_IRQ_ENABLE          (RSC_TCS_BASE + 0x00)   /* a bit per TCS: its done bit is set */
 #define RSC_IRQ_STATUS          (RSC_TCS_BASE + 0x04)   /* a bit per TCS: done */
 #define RSC_IRQ_CLEAR           (RSC_TCS_BASE + 0x08)
 #define RSC_TCS(n)              (RSC_TCS_BASE + 672 * (n))
@@ -944,6 +945,7 @@ rail_position(const char *name, uint32_t level, uint32_t *address)
 	strlcpy(id, name, sizeof(id));
 	for (unsigned s = 0; s < 8; s++) {
 		const struct cmd_db_slave *slave = &cmd_db->slave[s];
+		int highest;
 		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
 
 		if (slave->id == 0 || slave->count > 512) {
@@ -971,13 +973,25 @@ rail_position(const char *name, uint32_t level, uint32_t *address)
 				at += snprintf(levels + at, sizeof(levels) - (size_t)at, " %u", value);
 			}
 			printf("adsp: %u: RPMh has %s\n", step, levels);
+			highest = -1;
 			for (unsigned l = 0; l < entry[i].length / 2u && l < 16; l++) {
-				if ((uint32_t)(data[2 * l] | data[2 * l + 1] << 8) >= level) {
+				unsigned value = data[2 * l] | data[2 * l + 1] << 8;
+
+				if (l > 0 && value == 0) {
+					break;
+				}
+				if (value >= level) {
 					*address = entry[i].address;
 					return (int)l;
 				}
+				highest = (int)l;
 			}
-			return -1;
+			/* (above them all -- the SDM845's tree asks CX for 385, its levels end at 384 -- the highest, as Linux takes it) */
+			if (highest >= 0) {
+				printf("adsp: %u: no level of %s reaches %u: the highest, position %d\n", step, name, level, highest);
+				*address = entry[i].address;
+			}
+			return highest;
 		}
 	}
 	printf("adsp: %u: RPMh has no \"%s\"\n", step, name);
@@ -1002,7 +1016,7 @@ rails(uint32_t level)
 	static const char *const lpass[2] = { "lcx.lvl", "lmx.lvl" }, *const cx[1] = { "cx.lvl" };
 	const char *const *names = rail_cx ? cx : lpass;
 	unsigned count = rail_cx ? 1 : 2;
-	uint32_t addresses[2] = { 0, 0 }, values[2] = { 0, 0 }, done = 0;
+	uint32_t addresses[2] = { 0, 0 }, values[2] = { 0, 0 }, done = 0, irq_enable;
 	uint64_t began;
 
 	if (rail_cx && level == 0) {
@@ -1030,11 +1044,17 @@ rails(uint32_t level)
 		lck_mtx_unlock(&hakios_rsc_lock);
 		return false;
 	}
-	printf("adsp: %u: about to ask RPMh, through TCS %u, for %s (%#x) = %u%s%s (%#x) = %u (level %u%s)\n", step, RPMH_TCS,
-	    names[0], addresses[0], values[0], count > 1 ? " and " : "", count > 1 ? names[1] : "", addresses[1], values[1], level,
-	    level == 0 ? ": given back" : "");
+	if (count > 1) {
+		printf("adsp: %u: about to ask RPMh, through TCS %u, for %s (%#x) = %u and %s (%#x) = %u (level %u%s)\n", step, RPMH_TCS,
+		    names[0], addresses[0], values[0], names[1], addresses[1], values[1], level, level == 0 ? ": given back" : "");
+	} else {
+		printf("adsp: %u: about to ask RPMh, through TCS %u, for %s (%#x) = %u (level %u)\n", step, RPMH_TCS, names[0],
+		    addresses[0], values[0], level);
+	}
 	snprintf(last_write, sizeof(last_write), "step %u asked RPMh for the audio DSP's rails at level %u", step, level);
 	hold();
+	irq_enable = rd(rsc.base + RSC_IRQ_ENABLE);
+	wr(rsc.base + RSC_IRQ_ENABLE, irq_enable | 1u << RPMH_TCS);    /* (the done bit follows it, as hakios.synaptics.c found) */
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	for (unsigned r = 0; r < count; r++) {
 		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r), MSGID_WRITE_WAITED);
@@ -1061,6 +1081,7 @@ rails(uint32_t level)
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
+	wr(rsc.base + RSC_IRQ_ENABLE, irq_enable);
 	lck_mtx_unlock(&hakios_rsc_lock);
 	return done != 0;
 }
@@ -3393,7 +3414,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
  * seconds (25) from this driver's start: the loader's core runs UEFI's own work for a run's first 24 s
  * (xnuloader's NOTE_SECONDS), as hakios.synaptics.c waits for too.
  */
-#define PORTED_APCS             6
+#define PORTED_APCS             7
 
 static void
 soc_override(void)

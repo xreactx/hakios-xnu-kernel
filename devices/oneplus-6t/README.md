@@ -304,6 +304,15 @@ for it, and this phone's does not -- GLINK's descriptor 478 (32 bytes) and our q
 `qcom_glink_smem_register()` makes them. They stay in the shared memory until the phone restarts; a later run finds
 and uses them.
 
+**Step 7: the audio DSP runs** (run 204013). CX through RPMh -- the tree asks for 385, the command database's levels
+end at 384, so the highest (position 7), as Linux takes it; never given back --, "adsp: on" to the AOP, and TrustZone
+authenticates the image and lets the DSP out of reset. Its SMP2P item appears after 3 ms, "up" (0x2) after 10, "my own
+power" (0x6) after 18; it makes its items 443, 480 (its GLINK queue) and 606. At the steps' end it acknowledges the
+stop within 2 ms, TrustZone shuts it down, and the AOP hears "off"; the system goes on to the home screen. Touch's
+requests to RPMh now take the same lock as the DSP's (one command slot, TCS 0, for both), and the DSP's request sets
+the slot's completion enable as touch's does. Not yet seen: the DSP's doorbells to us (GIC 156 and 158 never pending
+here); the link polls the shared memory every millisecond all the same.
+
 **11. Then** Wi-Fi; cellular last.
 
 ## Firmware

@@ -43,6 +43,7 @@
  * this driver left is 0, anything else is somebody else's.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -850,9 +851,34 @@ rpmh_wait(uint32_t reg, uint32_t mask, uint32_t value, const char *what)
 	return false;
 }
 
+/*
+ * The command slots are the audio DSP's too (hakios.adsp.c, rails(): the same TCS 0), and both drivers
+ * ask after the same 25 s: one request at a time, under the lock of hakios.wifi.c that the DSPs'
+ * drivers take. At the run's end, where interrupts may be off (a mutex may not be touched then), it
+ * is not taken: the DSP has been stopped before by then.
+ */
+extern lck_mtx_t hakios_rsc_lock;
+
+static bool rpmh_write_held(const uint32_t *address, const uint32_t *data, unsigned count);
+
 /* Send up to three register writes to RPMh and wait until they are done. */
 static bool
 rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
+{
+	bool locked = ml_get_interrupts_enabled(), done;
+
+	if (locked) {
+		lck_mtx_lock(&hakios_rsc_lock);
+	}
+	done = rpmh_write_held(address, data, count);
+	if (locked) {
+		lck_mtx_unlock(&hakios_rsc_lock);
+	}
+	return done;
+}
+
+static bool
+rpmh_write_held(const uint32_t *address, const uint32_t *data, unsigned count)
 {
 	uint32_t irq_enable = rd(TCS(TCS_IRQ_ENABLE));
 	bool done;
