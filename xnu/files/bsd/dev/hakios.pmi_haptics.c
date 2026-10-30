@@ -22,6 +22,15 @@
  *                   moves. At the run's end the three registers are put back as they were found.
  *   pmi_haptics=3   ... and one pulse of pmi_haptics_ms=N milliseconds (100) 3 s after that: enable, play,
  *                   the status read while it plays, then play and enable off again.
+ *   pmi_haptics=4   ... configured as for 2, and instead of the pulse the motor for iOS until the run ends:
+ *                   what iOS plays on its "Actuator" (userland/src/audio_plugin.c) comes to
+ *                   /dev/hakios-haptic as samples, and is told apart as redwood's driver tells it
+ *                   (hakios.haptic.c, haptic=5): a waveform after a pause is a tap -- a pulse of
+ *                   pmi_haptics_tap_ms=N (30) -- and one that goes on past 60 ms a vibration, the motor
+ *                   held on while it lasts, HAPTIC_MAX_MS at most, then as long a rest. The strength is
+ *                   the maximum voltage (0x51): Android's 2088 mV from a third of full scale up, down to
+ *                   five eighths of it for the softest, never more. The device is there from the start
+ *                   (the plug-in opens it once); what comes before the motor is ready is not played.
  *
  * Registers (offsets in the block): 0x46 enable ([7]), 0x4e play mode ([5:4]: 0 buffer, 1 direct), 0x51 the
  * maximum voltage ([6:1] x 116 mV), 0x52 current limit ([0]: 400 or 800 mA), 0x54/0x55 the play rate (x 5 us),
@@ -32,6 +41,9 @@
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <miscfs/devfs/devfs.h>
+#include <sys/conf.h>
+#include <sys/uio.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
@@ -75,6 +87,8 @@ static uint32_t level, after_s = 25, pulse_ms = 100;
 #define REG_BRAKE               0x5c
 #define REG_PLAY                0x70
 #define REG_STATUS              0x0a            /* (read while it plays) */
+#define REG_VMAX                0x51            /* [6:1]: the maximum voltage, in 116 mV */
+#define VMAX_ANDROID            18              /* 2088 mV, the phone's device tree's vmax-mv */
 #define ENABLE_ON               0x80
 #define PLAY_ON                 0x80
 
@@ -86,6 +100,7 @@ static struct {
 	{ REG_ILIM, 0x01, 0, "current limit 800 mA" },
 	{ REG_BRAKE, 0xff, 0, "brake pattern 3 3 3 3" },
 	{ REG_PLAY_MODE, 0x10, 0, "direct play" },
+	{ REG_VMAX, 0x24, 0, "maximum voltage 2088 mV" },       /* (UEFI leaves it so; level 4 changes it) */
 };
 static unsigned configured;     /* how many of config[] were written */
 
@@ -172,6 +187,225 @@ pulse(void)
 	    stop_problem != NULL ? " -- NOT: " : "", stop_problem != NULL ? stop_problem : "");
 }
 
+
+/* ---- pmi_haptics=4: the motor for iOS (as hakios.haptic.c's haptic=5) ------------------------------- */
+
+#define HAPTIC_MAX_MS           1000
+#define ACTIVE_US               30000           /* a write that was not silence counts for this long */
+#define SILENT_BELOW            256             /* of 32768: samples no larger are silence */
+#define TAP_US                  60000           /* longer than this, and it is a vibration, not a tap */
+#define SETTLE_US               8000            /* how long iOS's waveform is listened to before a tap: its loudness */
+#define FOLLOW_US               20000           /* how often a vibration's strength follows iOS's */
+#define TOLD_EVENTS             24              /* the first so many taps and vibrations are each said */
+
+static volatile uint64_t heard_us, quiet_us, onset_us;
+static volatile uint32_t heard_peak;
+static volatile bool ready;                     /* configured: what comes from here on is played */
+static uint32_t tap_ms = 30;
+static unsigned taps, loops, capped;
+
+static uint64_t
+now_us(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / NSEC_PER_USEC;
+}
+
+/* From the audio server's I/O thread: never waits (redwood's haptic_write(), the same) */
+static int
+haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	int16_t samples[256];
+	int error = 0;
+
+	while (uio_resid(uio) >= 2) {
+		user_ssize_t bytes = uio_resid(uio);
+		uint32_t peak = 0;
+
+		if (bytes > (user_ssize_t)sizeof(samples)) {
+			bytes = sizeof(samples);
+		}
+		bytes &= ~(user_ssize_t)1;
+		if ((error = uiomove((caddr_t)samples, (int)bytes, uio)) != 0) {
+			break;
+		}
+		if (!ready) {
+			continue;
+		}
+		for (unsigned i = 0; i < bytes / 2; i++) {
+			uint32_t v = samples[i] < 0 ? (uint32_t)-(int32_t)samples[i] : (uint32_t)samples[i];
+
+			peak = v > peak ? v : peak;
+		}
+		if (peak > SILENT_BELOW) {
+			uint64_t now = now_us();
+
+			if (heard_us == 0 || quiet_us > heard_us || now - heard_us >= ACTIVE_US) {
+				onset_us = now;
+				heard_peak = 0;
+			}
+			heard_us = now;
+			if (peak > heard_peak) {
+				heard_peak = peak;
+			}
+		} else {
+			quiet_us = now_us();
+		}
+	}
+	return error;
+}
+
+static int
+haptic_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	return 0;
+}
+
+static const struct cdevsw haptic_cdevsw = {
+	.d_open = haptic_open, .d_close = haptic_open, .d_read = eno_rdwrt, .d_write = haptic_write,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+/* the maximum voltage for a waveform of iOS's of this loudness: 5/8 of Android's for the softest, Android's from a third up */
+static uint8_t
+vmax_for(uint32_t peak)
+{
+	uint32_t low = VMAX_ANDROID * 5 / 8, third = 32767 / 3;
+
+	return (uint8_t)(peak >= third ? VMAX_ANDROID : low + (VMAX_ANDROID - low) * peak / third);
+}
+
+static bool
+motor(bool on, uint8_t vmax)
+{
+	uint8_t v = (uint8_t)(vmax << 1), enable = on ? ENABLE_ON : 0, play = on ? PLAY_ON : 0;
+	const char *problem = NULL;
+
+	if (on) {
+		problem = hakios_spmi_write(HAPTICS_ID, REG_VMAX, &v, 1);
+		if (problem == NULL) {
+			problem = hakios_spmi_write(HAPTICS_ID, REG_ENABLE, &enable, 1);
+		}
+		if (problem == NULL) {
+			problem = hakios_spmi_write(HAPTICS_ID, REG_PLAY, &play, 1);
+		}
+	} else {
+		problem = hakios_spmi_write(HAPTICS_ID, REG_PLAY, &play, 1);
+		if (problem == NULL) {
+			problem = hakios_spmi_write(HAPTICS_ID, REG_ENABLE, &enable, 1);
+		}
+	}
+	if (problem != NULL) {
+		say("pmi_haptics: switching the motor %s: %s -- given up\n", on ? "on" : "off", problem);
+		if (on) {
+			uint8_t off = 0;
+
+			(void)hakios_spmi_write(HAPTICS_ID, REG_PLAY, &off, 1);
+			(void)hakios_spmi_write(HAPTICS_ID, REG_ENABLE, &off, 1);
+		}
+		return false;
+	}
+	return true;
+}
+
+static void
+serve(void)
+{
+	enum { IDLE, TAP, LOOP, REST } state = IDLE;
+	uint64_t since = 0, rest_until = 0, tap_onset = 0, followed = 0;
+	uint8_t playing = 0;
+
+	ready = true;
+	say("pmi_haptics: THE MOTOR PLAYS WHAT IOS PLAYS ON ITS ACTUATOR from here on (taps %u ms, vibrations %u ms at most)\n",
+	    tap_ms, HAPTIC_MAX_MS);
+	for (;;) {
+		uint64_t now = now_us();
+		bool active = heard_us != 0 && now - heard_us < ACTIVE_US;
+		uint32_t peak = heard_peak;
+		uint8_t vmax = vmax_for(peak);
+
+		switch (state) {
+		case IDLE:
+			/* a waveform that began after a pause, once its first milliseconds say how loud it is: a tap */
+			if (active && onset_us != tap_onset && now - onset_us >= SETTLE_US) {
+				tap_onset = onset_us;
+				if (!motor(true, vmax)) {
+					return;
+				}
+				state = TAP;
+				since = now;
+				playing = vmax;
+				taps++;
+				if (taps + loops <= TOLD_EVENTS) {
+					say("pmi_haptics: tap %u: iOS's waveform peaks at %u of 32768: %u ms at %u mV\n", taps, peak, tap_ms,
+					    vmax * 116);
+				}
+			}
+			break;
+		case TAP:
+			/* still going past TAP_US without a pause: a vibration, the motor left on */
+			if (active && quiet_us < tap_onset && now - since > TAP_US) {
+				state = LOOP;
+				followed = now;
+				loops++;
+				heard_peak = 0;
+				if (taps + loops <= TOLD_EVENTS) {
+					say("pmi_haptics: vibration %u: iOS goes on playing (peak %u): held on, %u ms at most\n", loops, peak,
+					    HAPTIC_MAX_MS);
+				}
+				break;
+			}
+			if (now - since >= tap_ms * 1000ull && !(active && quiet_us < tap_onset)) {
+				if (!motor(false, 0)) {
+					return;
+				}
+				state = IDLE;
+			}
+			break;
+		case LOOP:
+			if (active && now - followed >= FOLLOW_US) {
+				uint8_t v = (uint8_t)(vmax << 1);
+
+				followed = now;
+				heard_peak = 0;
+				if (peak != 0 && vmax != playing) {
+					if (hakios_spmi_write(HAPTICS_ID, REG_VMAX, &v, 1) != NULL) {
+						(void)motor(false, 0);
+						return;
+					}
+					playing = vmax;
+				}
+			}
+			if (!active || now - since > HAPTIC_MAX_MS * 1000ull) {
+				bool cut = now - since > HAPTIC_MAX_MS * 1000ull;
+
+				if (!motor(false, 0)) {
+					return;
+				}
+				if (cut) {
+					capped++;
+					rest_until = now + HAPTIC_MAX_MS * 1000ull;
+				}
+				state = cut ? REST : IDLE;
+				if (taps + loops <= TOLD_EVENTS + 1) {
+					say("pmi_haptics: vibration %u: %s after %llu ms\n", loops, cut ? "CUT at the limit" :
+					    "iOS stopped, and so does the motor", (now - since) / 1000);
+				}
+			}
+			break;
+		case REST:
+			if (now >= rest_until) {
+				state = IDLE;
+			}
+			break;
+		}
+		delay_for_interval(4, NSEC_PER_MSEC);
+	}
+}
+
 static void
 pmi_haptics_thread(__unused void *arg, __unused wait_result_t wr)
 {
@@ -181,7 +415,8 @@ pmi_haptics_thread(__unused void *arg, __unused wait_result_t wr)
 	int channel;
 
 	say("pmi_haptics: level %u: %s; the bus is left to the loader's core for %u s\n", level,
-	    level == 1 ? "a look, reading only" : level == 2 ? "a look, then configured (nothing moves)" : "configured, then one pulse",
+	    level == 1 ? "a look, reading only" : level == 2 ? "a look, then configured (nothing moves)" :
+	    level == 3 ? "configured, then one pulse" : "configured, then the motor for iOS",
 	    after_s);
 	delay_for_interval(after_s * 1000, NSEC_PER_MSEC);
 	channel = hakios_spmi_channel(HAPTICS_ID, &owner);
@@ -209,8 +444,12 @@ pmi_haptics_thread(__unused void *arg, __unused wait_result_t wr)
 			say("pmi_haptics: configured; enable and play left at 0 (nothing moves)\n");
 			dump(0x40, 0x5f);
 			dump(0x70, 0x77);
-			if (level >= 3) {
+			if (level == 3) {
 				pulse();
+			} else if (level >= 4) {
+				serve();
+				say("pmi_haptics: the motor is given up on (%u taps and %u vibrations played, %u cut)\n", taps, loops,
+				    capped);
 			}
 		}
 	}
@@ -227,8 +466,19 @@ hakios_pmi_haptics_init(void)
 	if (!PE_parse_boot_argn("pmi_haptics", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (level > 3) {
-		level = 3;
+	if (level > 4) {
+		level = 4;
+	}
+	PE_parse_boot_argn("pmi_haptics_tap_ms", &tap_ms, sizeof(tap_ms));
+	if (tap_ms == 0 || tap_ms > 200) {
+		tap_ms = 30;
+	}
+	if (level >= 4) {
+		int major = cdevsw_add(-1, &haptic_cdevsw);
+
+		if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-haptic") == NULL) {
+			say("pmi_haptics: /dev/hakios-haptic cannot be made\n");
+		}
 	}
 	PE_parse_boot_argn("pmi_haptics_after", &after_s, sizeof(after_s));
 	PE_parse_boot_argn("pmi_haptics_ms", &pulse_ms, sizeof(pulse_ms));
