@@ -4,10 +4,13 @@
  * (devices/oneplus-6t/README.md, step 10). Toybox's i2cget reads bytes only.
  *
  *   tfa_regs BUS ADDRESS [FIRST [COUNT]]      (numbers in hexadecimal; default all 256 registers)
+ *   tfa_regs BUS ADDRESS w REG VALUE          one register written
  *
  * One line per register: "REG VALUE". Each read is one I2C transfer (the register's number written,
  * two bytes read, the most significant first), through /dev/i2c-BUS; the kernel serialises it with the
- * chip's own driver. Only reads.
+ * chip's own driver. The one write there is (w) is for putting the chip back to its power-on state
+ * (bit 1 of the TFA9894's register 0, I2CR), so that Android's driver sets it up from the start again
+ * while the kernel's I2C trace records it.
  *
  * Built freestanding, with no C library, so that one binary runs on any arm64 Android:
  *   clang --target=aarch64-linux-gnu -O2 -ffreestanding -fno-stack-protector -nostdlib -static \
@@ -81,6 +84,21 @@ main_(int argc, char **argv)
 	}
 	bus = hex(argv[1]);
 	address = hex(argv[2]);
+	if (argc == 6 && argv[3][0] == 'w' && argv[3][1] == 0) {
+		u8 bytes[3] = { (u8)hex(argv[4]), (u8)(hex(argv[5]) >> 8), (u8)hex(argv[5]) };
+		struct i2c_msg msg = { (u16)address, 0, 3, bytes };
+		struct i2c_rdwr_ioctl_data data = { &msg, 1 };
+
+		path[9] = (char)('0' + bus % 10);
+		path[10] = 0;
+		fd = sys(SYS_openat, AT_FDCWD, (long)path, O_RDWR, 0);
+		if (fd < 0 || sys(SYS_ioctl, fd, I2C_RDWR, (long)&data, 0) < 0) {
+			put("tfa_regs: not written\n", 22);
+			return 1;
+		}
+		put("written\n", 8);
+		return 0;
+	}
 	if (argc > 3) {
 		first = hex(argv[3]);
 	}
