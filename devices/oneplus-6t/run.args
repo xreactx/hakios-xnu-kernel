@@ -10,3 +10,17 @@ battery=1       # the battery through the loader (UEFI's ChargerEx and PmicDxe's
 pmi_haptics=4   # the vibration motor for iOS's haptics (bsd/dev/hakios.pmi_haptics.c): taps and vibrations, from 25 s on
 synaptics=3     # the touch screen (bsd/dev/hakios.synaptics.c): powered, configured, touches to SpringBoard
 slider=3        # the alert slider as iOS's ring/silent switch (bsd/dev/hakios.slider.c): lower position ring, the other silent
+adsp=1          # the audio DSP up on a thread of its own, from 25 s on (bsd/dev/hakios.adsp.c; root built ADSP=1 REST=1)
+sound=4         # what iOS plays, through the speaker: QUAT MI2S and the TFA9894 (hakios.sound.c, hakios.tfa9894.c)
+soc_sound_port=0x1006   # the speaker's port: QUAT_MI2S_RX ...
+soc_sound_clock=0x106   # ... its bit clock, QUAD_MI2S_IBIT ...
+soc_sound_bits=16       # ... at 16 bits, as Android plays it (1.536 MHz)
+soc_audio_stream=0x1821 # the SMMU stream the DSP reads our memory by
+soc_smem=0x86000000     # the SDM845's numbers for the audio DSP (soc.args, and the command DB AOP points at)
+soc_cmd_db=0x85fe0000
+soc_rsc=0x179e0000
+soc_aoss=0xc300000
+soc_adsp_mem=0x8c500000
+soc_adsp_mem_size=0x1a00000
+soc_apcs_ipc=0x1799000c
+soc_adsp_cx=1
