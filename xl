@@ -6,6 +6,9 @@
 #   xl ramdisk [FILE]   upload the big system image (default userland/system.apfs) once; it stays in
 #                       the phone's RAM across kernel runs and is the root filesystem (/dev/md0)
 #                       ("xl ramdisk none" forgets it; the image sent with the kernel is then the root)
+#   xl ramdisk-flash P [FILE]  the same image, read by the loader from partition P of the phone's flash
+#                       instead of uploaded (FILE, default userland/system.apfs, is what was flashed there:
+#                       its size and CRC-32); on the OnePlus 6T, the inactive system slot
 #   xl screenshot [F]   save what is in the phone's framebuffer as a PNG (default logs/screen.png);
 #                       works during a run too (from another terminal)
 #   xl recording [F]    fetch the screen recording the last run made (rec_secs=N among XL_CMDLINE) and
@@ -248,6 +251,55 @@ ramdisk() { # ramdisk [<file>|none]
 	printf '%s\t%s\t%s\n' "$(pwd)" "$1" "$size" > $PHONE.ramdisk 2>/dev/null
 }
 
+ramdisk_flash() { # ramdisk_flash <partition> [<file>]
+	# The resident image read by the loader from a partition of the phone's flash instead of uploaded:
+	# <file> is what was flashed there (fastboot flash, from the phone's own bootloader), and the loader
+	# reads as many bytes as it has and says their CRC-32, which must be the file's.
+	enter || return 1
+	local part=$1; set -- "$1" "${2:-userland/system.apfs}"
+	[ -n "$part" ] && [ -f "$2" ] || { echo "xl: ramdisk-flash <partition> [<file>]"; return 1; }
+	local size=$(stat -c %s "$2") t0=$(date +%s) crc got
+	# (the loader's sample: the first 4 KB of every MB, then the last 4 KB -- xnuloader's flash_rd_crc())
+	crc=$(python3 -c 'import os, sys, zlib
+size, c = os.path.getsize(sys.argv[1]), 0
+with open(sys.argv[1], "rb") as f:
+    at = 0
+    while True:
+        frm = at if at < size else max(size - 4096, 0)
+        f.seek(frm)
+        c = zlib.crc32(f.read(min(4096, size - frm)), c)
+        if at >= size:
+            break
+        at += 1 << 20
+print("%x" % c)' "$2")
+	fb oem ramdisk flash "$part" "$(printf %x "$size")" | grep -q OKAY || { echo "xl: the loader refused"; return 1; }
+	got=$(fb getvar flash-ramdisk | sed -n 's/^flash-ramdisk: //p')
+	# A step at a time (256 MB): each is answered at once, then read. A question sent while the loader
+	# reads is lost by the OnePlus 6's USB driver -- it is never answered, while a new one asked after
+	# is at once -- so the answer is waited for by asking again, a few seconds each time.
+	while [ "${got%% *}" = reading ]; do
+		local s0=$(date +%s.%N) before=$got tries=0
+		fb oem ramdisk flash-next | grep -q OKAY || { echo "xl: the loader refused a step"; return 1; }
+		sleep 1
+		while :; do
+			got=$(FB_TIMEOUT=5 fb getvar flash-ramdisk | sed -n 's/^flash-ramdisk: //p')
+			[ -n "$got" ] && [ "$got" != "$before" ] && break
+			tries=$((tries + 1)); [ $tries -ge 20 ] && { echo "xl: no answer after a step (last: ${before})"; return 1; }
+			sleep 1
+		done
+		case "$got" in
+		reading*) local w=($got); echo "xl: $(( ${w[1]} / 1048576 )) of $(( ${w[2]} / 1048576 )) MB ($(printf %.1f "$(echo "$(date +%s.%N) - $s0" | bc)") s)" ;;
+		esac
+	done
+	case "$got" in
+	"done $crc "*) echo "xl: $(( size / 1048576 )) MB read from $part in ${got##* } ms; the sample's CRC-32 $crc is the file's" ;;
+	done*) echo "xl: $part read, but its CRC-32 is not the file's ($got; the file's $crc): the image is NOT used"
+		fb oem ramdisk none >/dev/null; rm -f $PHONE.ramdisk; return 1 ;;
+	*) echo "xl: reading $part: ${got:-no answer}"; return 1 ;;
+	esac
+	printf '%s\t%s\t%s\n' "$(pwd)" "$2 (from $part)" "$size" > $PHONE.ramdisk 2>/dev/null
+}
+
 screenshot() { # screenshot [file.png]
 	enter || return 1
 	local out=${1:-logs/screen.png} geom
@@ -298,6 +350,7 @@ recording) recording "$2" ;;
 camera) camera "$2" ;;
 sound) sound "$2" ;;
 ramdisk) ramdisk "$2" ;;
+ramdisk-flash) ramdisk_flash "$2" "$3" ;;
 run) run "oem run $2" "run${2:+-cp$2}" ;;
 selftest) run "oem selftest" selftest ;;
 log) enter && fb oem log >/dev/null && fetch_log logs/loader.log && cat logs/loader.log ;;

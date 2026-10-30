@@ -254,6 +254,8 @@ clean_dcache(uint64_t start, uint64_t end)
 /* ------------------------------------------------------------------------ */
 /* Log persistence: raw write to a GPT partition (phone only)               */
 
+static efi_block_io *find_partition(const char *name);
+
 static efi_block_io *
 find_log_partition(void)
 {
@@ -281,6 +283,35 @@ find_log_partition(void)
 			}
 		}
 		if (match && !EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
+			return bio;
+		}
+	}
+	return NULL;
+}
+
+/* A GPT partition by its name (ASCII; the table's names are UTF-16), as find_log_partition() finds its own. */
+static efi_block_io *
+find_partition(const char *name)
+{
+	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	efi_handle *handles;
+	uint64_t count;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+		return NULL;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_partition_info *info;
+		efi_block_io *bio;
+		unsigned k;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2) {
+			continue;
+		}
+		for (k = 0; name[k] != 0 && info->name[k] == (char16)name[k]; k++) {
+		}
+		if (name[k] == 0 && info->name[k] == 0 && !EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
 			return bio;
 		}
 	}
@@ -3584,6 +3615,143 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 static usb_device_protocol *USB;
 static int download_to_ramdisk;     /* set by "oem ramdisk" for the one download that follows */
+/*
+ * "oem ramdisk flash NAME SIZE" (SIZE in hexadecimal): the resident image read from partition NAME instead
+ * of downloaded -- the first SIZE bytes of it, through UEFI's ReadBlocks, straight into the resident area.
+ * Only reads. The command is answered at once (the OnePlus 6's USB driver never sends a reply queued after
+ * long work); "getvar flash-ramdisk", which is read when the work is over, says how it went: "done CRC MS"
+ * (zlib's CRC-32 of a sample -- the first 4 KB of every MB of the SIZE bytes, and their last 4 KB -- and
+ * the milliseconds the reading took), or what went wrong. A sample, because the resident area is slow
+ * to this core's loads: a CRC of all 2.4 GB of the 6T's image took 10 minutes, its reading 4.6 s. (That
+ * full CRC, once, was the file's: d1cc46d9.) The sample tells a wrong or older image from the file all the
+ * same; xl computes the same one.
+ */
+static char flash_rd_result[64] = "none";
+#define FLASH_RD_EVERY          (1ULL << 20)
+#define FLASH_RD_SAMPLE         4096ULL
+
+static void
+flash_rd_say(const char *what, uint64_t a, uint64_t b)
+{
+	uint32_t saved = log_len, start = log_len, n;
+
+	print(what, a, b);
+	n = log_len - start;
+	if (n > sizeof(flash_rd_result) - 1) {
+		n = sizeof(flash_rd_result) - 1;
+	}
+	memcpy(flash_rd_result, log_buf + start, n);
+	flash_rd_result[n] = 0;
+	log_len = saved;
+}
+
+/*
+ * Stepped, so that the host sees each step end: "oem ramdisk flash NAME SIZE" finds the partition and
+ * starts, and each "oem ramdisk flash-next" reads the next FLASH_RD_STEP bytes (answered first, then
+ * read); "getvar flash-ramdisk" says "reading DONE SIZE MS" after each step, "done CRC MS" after the last
+ * (the sample's CRC taken then), or what went wrong. A step that never ends shows where it stuck.
+ */
+#define FLASH_RD_STEP           (256ULL << 20)
+
+static struct {
+	efi_block_io *bio;
+	uint8_t *dest;
+	uint64_t size, done, ms;
+	char name[37];
+} flash_rd;
+
+static uint32_t
+flash_rd_crc(const uint8_t *dest, uint64_t size)
+{
+	static uint32_t crc_table[256];
+	uint32_t crc = 0xffffffffu;
+
+	if (crc_table[1] == 0) {
+		for (uint32_t n = 0; n < 256; n++) {
+			uint32_t c = n;
+
+			for (int k = 0; k < 8; k++) {
+				c = (c & 1) ? 0xedb88320u ^ (c >> 1) : c >> 1;
+			}
+			crc_table[n] = c;
+		}
+	}
+	for (uint64_t at = 0;; at += FLASH_RD_EVERY) {
+		uint64_t from = at < size ? at : (size > FLASH_RD_SAMPLE ? size - FLASH_RD_SAMPLE : 0);
+		uint64_t to = from + FLASH_RD_SAMPLE < size ? from + FLASH_RD_SAMPLE : size;
+
+		for (uint64_t i = from; i < to; i++) {
+			crc = crc_table[(crc ^ dest[i]) & 0xff] ^ (crc >> 8);
+		}
+		if (at >= size) {
+			break;
+		}
+	}
+	return crc ^ 0xffffffffu;
+}
+
+static void
+flash_rd_start(const char *name, uint64_t size, uint8_t *dest)
+{
+	unsigned k;
+
+	flash_rd.bio = find_partition(name);
+	if (flash_rd.bio == NULL) {
+		flash_rd_say("failed: no partition by that name", 0, 0);
+		return;
+	}
+	if (flash_rd.bio->media->block_size == 0 ||
+	    size > (flash_rd.bio->media->last_block + 1) * flash_rd.bio->media->block_size) {
+		flash_rd.bio = NULL;
+		flash_rd_say("failed: the partition is %d bytes", 0, 0);
+		return;
+	}
+	for (k = 0; name[k] != 0 && k < sizeof(flash_rd.name) - 1; k++) {
+		flash_rd.name[k] = name[k];
+	}
+	flash_rd.name[k] = 0;
+	flash_rd.dest = dest;
+	flash_rd.size = size;
+	flash_rd.done = flash_rd.ms = 0;
+	print("ramdisk: %d bytes of %s into the resident area, %d a step\n", size, flash_rd.name, FLASH_RD_STEP);
+	flash_rd_say("reading 0 %d 0", size, 0);
+}
+
+static void
+flash_rd_next(void)
+{
+	efi_block_io *bio = flash_rd.bio;
+	uint64_t bs, end, t0;
+	efi_status s;
+
+	if (bio == NULL || flash_rd.done >= flash_rd.size) {
+		flash_rd_say("failed: nothing being read", 0, 0);
+		return;
+	}
+	bs = bio->media->block_size;
+	end = flash_rd.done + FLASH_RD_STEP < flash_rd.size ? flash_rd.done + FLASH_RD_STEP : flash_rd.size;
+	t0 = READ_SYSREG(CNTVCT_EL0);
+	while (flash_rd.done < end) {
+		uint64_t want = end - flash_rd.done < (4u << 20) ? (end - flash_rd.done + bs - 1) / bs * bs : (4u << 20) / bs * bs;
+
+		s = bio->read_blocks(bio, bio->media->media_id, flash_rd.done / bs, want, flash_rd.dest + flash_rd.done);
+		if (EFI_ERROR(s)) {
+			flash_rd.bio = NULL;
+			flash_rd_say("failed: ReadBlocks %x at byte %d", s, flash_rd.done);
+			return;
+		}
+		flash_rd.done += want;
+	}
+	flash_rd.ms += (READ_SYSREG(CNTVCT_EL0) - t0) * 1000 / READ_SYSREG(CNTFRQ_EL0);
+	if (flash_rd.done < flash_rd.size) {
+		flash_rd_say("reading %d %d", flash_rd.done, flash_rd.size);
+		return;
+	}
+	resident_rd_size = flash_rd.size;
+	flash_rd.bio = NULL;
+	flash_rd_say("done %x %d", flash_rd_crc(flash_rd.dest, flash_rd.size), flash_rd.ms);
+	print("ramdisk: %s read in %d ms: the resident image\n", flash_rd.name, flash_rd.ms);
+}
 static uint8_t *usb_rx_buf, *usb_tx_buf;
 static int usb_connected;
 
@@ -3859,6 +4027,8 @@ fb_command(char *cmd)
 				fb_reply("OKAY", download_to_ramdisk ? "0xffffffff" : "0x03f00000");
 			} else if (str_eq(var, "result")) {
 				fb_reply("OKAY", last_result);
+			} else if (str_eq(var, "flash-ramdisk")) {
+				fb_reply("OKAY", flash_rd_result);
 			} else if (str_eq(var, "screen") && SCREEN.base != 0) {
 				/* width height bytes-per-row */
 				uint32_t mark = log_len;
@@ -3876,6 +4046,37 @@ fb_command(char *cmd)
 			if (starts_with(cmd, "oem ramdisk none")) {
 				resident_rd_size = 0;
 				fb_reply("OKAY", "");
+				return;
+			}
+			if (starts_with(cmd, "oem ramdisk flash ")) {
+				char name[37];
+				const char *c = cmd + 18;
+				unsigned k = 0;
+				uint64_t size;
+
+				while (*c != 0 && *c != ' ' && k < sizeof(name) - 1) {
+					name[k++] = *c++;
+				}
+				name[k] = 0;
+				while (*c == ' ') {
+					c++;
+				}
+				size = parse_number(c, 16);
+				parse_payload(&pi, 0);
+				log_len = 0;
+				if (k == 0 || size == 0 || !choose_window(&pi) || win_size <= RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE ||
+				    size > win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE) {
+					fb_reply("FAIL", "no name, no size, or no memory window for it");
+					return;
+				}
+				resident_rd_size = 0;
+				flash_rd_start(name, size, (uint8_t *)(win_base + RESIDENT_RD_OFFSET));
+				fb_reply("OKAY", "");
+				return;
+			}
+			if (starts_with(cmd, "oem ramdisk flash-next")) {
+				fb_reply("OKAY", "");
+				flash_rd_next();
 				return;
 			}
 			parse_payload(&pi, 0);
