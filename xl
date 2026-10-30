@@ -9,6 +9,8 @@
 #   xl ramdisk-flash P [FILE]  the same image, read by the loader from partition P of the phone's flash
 #                       instead of uploaded (FILE, default userland/system.apfs, is what was flashed there:
 #                       its size and CRC-32); on the OnePlus 6T, the inactive system slot
+#   xl flash-read P OFF SIZE F  SIZE bytes of partition P from OFF (hexadecimal, whole blocks) into file F, read
+#                       by the loader in pieces of 32 MB; only reads (the phone's own firmware, e.g. modem_a)
 #   xl screenshot [F]   save what is in the phone's framebuffer as a PNG (default logs/screen.png);
 #                       works during a run too (from another terminal)
 #   xl recording [F]    fetch the screen recording the last run made (rec_secs=N among XL_CMDLINE) and
@@ -251,6 +253,24 @@ ramdisk() { # ramdisk [<file>|none]
 	printf '%s\t%s\t%s\n' "$(pwd)" "$1" "$size" > $PHONE.ramdisk 2>/dev/null
 }
 
+flash_read() { # flash_read <partition> <offset> <size> <file>   (offset and size in hexadecimal)
+	enter || return 1
+	local part=$1 at=$((16#$2)) end=$((16#$2 + 16#$3)) out=$4 piece n
+	[ -n "$part" ] && [ -n "$out" ] && [ $end -gt $at ] || { echo "xl: flash-read <partition> <offset> <size> <file>"; return 1; }
+	: > "$out"
+	while [ $at -lt $end ]; do
+		piece=$(( end - at < 33554432 ? end - at : 33554432 ))
+		fb oem flash-read "$part" "$(printf %x $at)" "$(printf %x $piece)" | grep -q OKAY || { echo "xl: the loader refused"; return 1; }
+		sleep 1
+		FB_TIMEOUT=60 fb get_staged "$out.piece" >/dev/null
+		n=$(stat -c %s "$out.piece" 2>/dev/null || echo 0)
+		[ "$n" = "$piece" ] || { echo "xl: $part at $(printf %x $at): got $n bytes of $piece (see xl log)"; rm -f "$out.piece"; return 1; }
+		cat "$out.piece" >> "$out"; rm -f "$out.piece"
+		at=$((at + piece))
+	done
+	echo "xl: $(( (end - 16#$2) / 1048576 )) MB of $part (from $2) in $out"
+}
+
 ramdisk_flash() { # ramdisk_flash <partition> [<file>]
 	# The resident image read by the loader from a partition of the phone's flash instead of uploaded:
 	# <file> is what was flashed there (fastboot flash, from the phone's own bootloader), and the loader
@@ -351,6 +371,7 @@ camera) camera "$2" ;;
 sound) sound "$2" ;;
 ramdisk) ramdisk "$2" ;;
 ramdisk-flash) ramdisk_flash "$2" "$3" ;;
+flash-read) flash_read "$2" "$3" "$4" "$5" ;;
 run) run "oem run $2" "run${2:+-cp$2}" ;;
 selftest) run "oem selftest" selftest ;;
 log) enter && fb oem log >/dev/null && fetch_log logs/loader.log && cat logs/loader.log ;;
