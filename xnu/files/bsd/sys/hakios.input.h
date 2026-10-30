@@ -60,6 +60,8 @@ const char *hakios_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t 
 const char *hakios_spmi_write(uint16_t id, uint8_t reg, const uint8_t *bytes, uint32_t count);
 void hakios_pmi_haptics_quiesce(void);  /* at a run's end: the haptics block stopped and as it was found */
 void hakios_pmi_haptics_init(void);    /* boot-arg pmi_haptics=N: the OnePlus 6T's vibration motor (PMI8998) */
+void hakios_slider_init(void);         /* boot-arg slider=N: the OnePlus 6T's alert slider */
+void hakios_slider_quiesce(void);      /* at a run's end: its pins' pulls as they were found */
 /*
  * How the battery is, as the audio DSP's battery manager says (bsd/dev/hakios.adsp.c, with adsp=1):
  * handed to bsd/dev/hakios.battery.c, which keeps it for the sysctls kern.hakios.battery_* and
