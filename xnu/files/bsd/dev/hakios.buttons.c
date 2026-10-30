@@ -164,7 +164,45 @@ static struct peripheral pin2 = { .name = "GPIO5 of the PM8998" };              
 /* How the reads have gone: said once a minute. */
 static struct {
 	uint64_t reads, failed, total_ns, longest_ns, last_ns;
+	uint64_t dropped_early, dropped_late;   /* "dropped": in the first DROP_EARLY_S of watching, and after */
+	uint64_t retried;                       /* reads asked again after a drop */
 } bus;
+#define DROP_EARLY_S            20
+static uint64_t watch_started;
+
+/*
+ * "Dropped": the arbiter had another transfer at that moment. On the OnePlus 6T about one read in 20,000
+ * is, all run long, with the loader's core quiet (no battery=1, its interrupts off) -- something else on
+ * the bus, probably another of the SoC's processors. Asked again at once, the read goes through. Counted
+ * in the first DROP_EARLY_S of watching and after, for the minute's line.
+ */
+static void
+spmi_count_drop(uint64_t now)
+{
+	uint64_t since;
+
+	if (watch_started == 0) {
+		return;
+	}
+	absolutetime_to_nanoseconds(now - watch_started, &since);
+	if (since < DROP_EARLY_S * NSEC_PER_SEC) {
+		bus.dropped_early++;
+	} else {
+		bus.dropped_late++;
+	}
+}
+
+/*
+ * The arbiter knows the loader's core as the same system as ours (0), and two transfers of one system at
+ * once make it drop one. For the first 24 s of a run (xnuloader's NOTE_SECONDS) that core still takes
+ * interrupts, and UEFI's PMIC drivers do their own transfers from timer events. One of ours dropped is
+ * one look missed (and asked again); one of theirs dropped may not be survivable: on the OnePlus 6T, a
+ * test reading every 1 ms from the start left the loader's core answering nothing (the kernel ran on, its
+ * run's end never answered), and the same test waiting 25 s first ran out its 120 s and returned. So
+ * the bus is not touched until boot-arg buttons_after=S seconds after this driver starts: 25 by default
+ * with the 6T's layout (past the 24 s, however late the kernel got here), 0 with redwood's as before.
+ */
+static uint32_t buttons_after;
 
 /*
  * Read `count` (1 to 8) registers of a peripheral, from register `reg` on. Returns NULL, or what
@@ -180,11 +218,22 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 
 	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
 	hakios_spmi_lock();
-	wr(channel + OBSERVER_COMMAND, COMMAND_READ | (uint32_t)reg << 4 | (count - 1));
-	do {
-		status = rd(channel + OBSERVER_STATUS);
-		now = mach_absolute_time();
-	} while (!(status & STATUS_DONE) && now - start < interval);
+	/* a dropped read is asked once more at once (see "dropped" below) */
+	for (int attempt = 0; attempt < 2; attempt++) {
+		if (attempt > 0) {
+			bus.retried++;
+			start = mach_absolute_time();
+		}
+		wr(channel + OBSERVER_COMMAND, COMMAND_READ | (uint32_t)reg << 4 | (count - 1));
+		do {
+			status = rd(channel + OBSERVER_STATUS);
+			now = mach_absolute_time();
+		} while (!(status & STATUS_DONE) && now - start < interval);
+		if (!(status & STATUS_DONE) || !(status & STATUS_DROPPED) || (status & (STATUS_DENIED | STATUS_FAILURE))) {
+			break;
+		}
+		spmi_count_drop(now);
+	}
 	data[0] = rd(channel + OBSERVER_DATA0);
 	data[1] = count > 4 ? rd(channel + OBSERVER_DATA1) : 0;
 	hakios_spmi_unlock();
@@ -196,7 +245,7 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 	} else if (status & STATUS_FAILURE) {
 		problem = "the transfer failed (nobody at that address?)";
 	} else if (status & STATUS_DROPPED) {
-		problem = "the transfer was dropped";
+		problem = "the transfer was dropped, twice";
 	} else {
 		for (uint32_t i = 0; i < count; i++) {
 			bytes[i] = (uint8_t)(data[i / 4] >> (8 * (i % 4)));
@@ -276,8 +325,8 @@ static uint8_t pon_kpdpwr = 0x80, pon_resin = 0x40, pon_subtype_from = PON_SUBTY
 #define GPIO_REG_PULL           0x42            /* [2:0]: 0 to 3 up (30, 1.5, 31.5 uA, 1.5 with a boost), 4 down, 5 none */
 #define GPIO_REG_ENABLE         0x46            /* [7] */
 
-#define POLL_MS                 16
-#define MINUTE_TICKS            (60 * 1000 / POLL_MS)
+#define POLL_MS                 16              /* boot-arg buttons_poll_ms=N: another period (1 to 1000) */
+static uint32_t poll_ms = POLL_MS;
 
 static struct button {
 	const char *    name;
@@ -473,11 +522,14 @@ static void
 say_summary(void)
 {
 	printf("buttons: so far %u presses of power, %u of volume up, %u of volume down; now%s%s%s%s; %llu reads of the bus, "
-	    "%llu us each (the longest %llu), %llu failed\n", power.presses, volume_up.presses,
+	    "%llu us each (the longest %llu), %llu failed (dropped: %llu in the first %u s of watching, %llu after; %llu asked "
+	    "again)\n",
+	    power.presses, volume_up.presses,
 	    volume_down.presses + volume_down2.presses, power.down ? " power" : "", volume_up.down ? " volume-up" : "",
 	    (volume_down.down || volume_down2.down) ? " volume-down" : "",
 	    (power.down || volume_up.down || volume_down.down || volume_down2.down) ? " held" : " none held", bus.reads,
-	    bus.reads ? bus.total_ns / bus.reads / 1000 : 0, bus.longest_ns / 1000, bus.failed);
+	    bus.reads ? bus.total_ns / bus.reads / 1000 : 0, bus.longest_ns / 1000, bus.failed, bus.dropped_early, DROP_EARLY_S,
+	    bus.dropped_late, bus.retried);
 }
 
 static void
@@ -487,6 +539,10 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	bool pon_known, pin_known, pin2_known = false;
 	uint8_t pin_subtype, pin2_subtype = 0;
 
+	if (buttons_after != 0) {
+		printf("buttons: the bus is left to the loader's core for %u s (buttons_after)\n", buttons_after);
+		delay_for_interval(buttons_after * 1000, NSEC_PER_MSEC);
+	}
 	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
 	    ARB_OBSERVER_PHYS);
 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
@@ -557,18 +613,19 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	}
 
 	printf("buttons: step 5: watching%s%s%s, every %u ms: power is the side button\n", power.usable ? " power" : "",
-	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "", POLL_MS);
+	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "", poll_ms);
+	watch_started = mach_absolute_time();
 	for (unsigned tick = 1;; tick++) {
 		buttons_poll();
 		/* once early on as well: a short run is to say what the reads cost too */
-		if (tick % MINUTE_TICKS == 0 || tick == 10 * 1000 / POLL_MS) {
+		if (tick % (60 * 1000 / poll_ms) == 0 || tick == 10 * 1000 / poll_ms) {
 			say_summary();
 		}
 		if (bus.failed >= 1000 && bus.failed * 2 > bus.reads) {
 			printf("buttons: more than half of %llu reads have failed: giving up\n", bus.reads);
 			break;
 		}
-		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
+		delay_for_interval(poll_ms, NSEC_PER_MSEC);
 	}
 out:
 	if (steps < 5) {
@@ -604,6 +661,7 @@ hakios_buttons_init(void)
 		pon_resin = 0x02;
 		pon_subtype_from = PON_SUBTYPE_OLD_FROM;
 		pon_subtype_to = PON_SUBTYPE_OLD_TO;
+		buttons_after = 25;
 		/* volume down is GPIO5 here; RESIN_N, which nothing was seen to press, only logged */
 		volume_down.name = "RESIN_N";
 		volume_down.record = 0;
@@ -611,6 +669,11 @@ hakios_buttons_init(void)
 		volume_down2.record = HAKIOS_BUTTON_VOLUME_DOWN;
 	}
 	PE_parse_boot_argn("buttons_steps", &steps, sizeof(steps));
+	PE_parse_boot_argn("buttons_poll_ms", &poll_ms, sizeof(poll_ms));
+	PE_parse_boot_argn("buttons_after", &buttons_after, sizeof(buttons_after));
+	if (poll_ms == 0 || poll_ms > 1000) {
+		poll_ms = POLL_MS;
+	}
 	if (steps == 0) {
 		return;
 	}
