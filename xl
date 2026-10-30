@@ -32,6 +32,9 @@
 #               the small one the firmware starts on (the loader then watches from the first core, and a
 #               kernel that hangs still gets its log out); cpufreq=1 sets that core to its top speed;
 #               touchscreen=1 turns the touch screen on.
+#   DEVICE      the phone (a directory under devices/; default poco-x5-pro, as for mkxnuimg.py): its
+#               run.args, if it has one, are added to every run's boot-args -- those XL_CMDLINE does not
+#               already give (XL_CMDLINE="synaptics=0" leaves the 6T's touch screen off)
 #   XL_RAMDISK  the image sent with the kernel: the small one that is mounted on /redwood
 #               (default userland/root.apfs; "none" sends none). Without a system image in the
 #               phone's RAM it is the root itself (e.g. XL_RAMDISK=userland/hello).
@@ -142,6 +145,17 @@ run() { # run <oem command> <label>
 		case " $args " in
 		*" wifi="*|*" wifi_step="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
 		esac
+		# The phone's own boot-args (devices/$DEVICE/run.args: words, # to the line's end a comment),
+		# each one unless XL_CMDLINE already has it by name
+		local device_args=devices/${DEVICE:-poco-x5-pro}/run.args a
+		if [ -f "$device_args" ]; then
+			for a in $(sed 's/#.*//' "$device_args"); do
+				case " $args " in
+				*" ${a%%=*}="*|*" $a "*) ;;
+				*) args="$args $a" ;;
+				esac
+			done
+		fi
 		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
 		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
 	fi
