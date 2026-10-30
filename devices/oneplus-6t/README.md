@@ -9,6 +9,7 @@ phone is here; the kernel, loader and user space are the common ones. `device.co
 | UEFI for the phone | `uefi/`: `fajitaPkg`, Mu-Silicium's `enchiladaPkg` (OnePlus 6, the same board) with the 6T's name, model and 1080x2340 panel. Its vendor drivers are Mu-Silicium's own `Binaries/enchilada`: nothing to extract from the phone |
 | The phone's device tree | `uefi/files/Resources/DTBs/fajita.dtb`: the phone's own, with `/chosen` emptied (the raw `fdt` pulled over adb carries the serial number and is git-ignored) |
 | SoC boot-args | `soc.args`, from `pull-soc.sh` / `tools/soc-args.py` (13 of the 16; see below) |
+| Run boot-args | `run.args`: added by `xl run` to every run on this phone (`DEVICE=oneplus-6t`), unless `XL_CMDLINE` gives the same name |
 | The phone's firmware | **not in the repository**: `pull-firmware.sh` pulls it over adb into `fw-*/` at the top |
 
 ## How it differs from redwood
@@ -19,11 +20,14 @@ phone is here; the kernel, loader and user space are the common ones. `device.co
 | UEFI framebuffer | `0x9D400000` (cont_splash_region) | `0xE1000000` | how the loader tells the two apart |
 | UEFI load address | `0x9FC00000`, 3 MB | `0x9FD00000`, 2 MB | `mkxnuimg.py`'s table |
 | Storage | UFS 2.1 at `0x1d84000` | UFS 3.1 | the same Qualcomm host controller; check `hakios.ufshc.c`'s addresses |
-| Touch | Synaptics S3320-family, I2C (QUP `i2c@a90000`, address `0x20`, IRQ GPIO 125, reset GPIO 99, 1.8 V GPIO 88) | Goodix on SPI | a new driver (Linux: `rmi4` / OnePlus's `synaptics_driver_s3320.c`) |
+| Touch | Synaptics S3706B (RMI4), I2C on GPIO 49/50 (address `0x20`, IRQ GPIO 125, reset GPIO 99, 1.8 V GPIO 88, 3.0 V LDO28) | Goodix on SPI | `hakios.synaptics.c` (`synaptics=3`): I2C done by hand, the 3.0 V through RPMh |
+| Buttons | all on the PM8998: power its PON's KPDPWR (`0x800`), volume up GPIO6, volume down **GPIO5** | PMK8350 PON and a PM7325 GPIO | `hakios.buttons.c`'s second layout (`buttons=2`); the same PMIC arbiter (v5, same addresses) |
+| CPU clocks | the older OSM (`0x17d43000` small, `0x17d45800` big): big cores left at 825 MHz | EPSS | `hakios.cpufreq.c`'s `cpufreq_osm=2` |
+| Temperatures | tsens v2, 21 sensors (TM `0xc263000`, `0xc265000`) | | `hakios.thermal.c` (`thermal=1`), reading only |
 | GPU | Adreno 630 (chipid `0x6030001`) | Adreno 642L | `hakios.adreno.c`'s steps hold; registers, GMU firmware and RPMh levels are a630's (Linux `a6xx_gmu.c`, the a630 paths) |
 | Wi-Fi | WCN3990, `icnss` | WCN6750 | Linux's ath10k_snoc, not ath11k: a new back end |
 | Audio | ADSP, Q6 APR, WCD934x "tavil" | ADSP | rework of `hakios.adsp.c` / `hakios.sound.c` |
-| Battery, charging | PMI8998 (fuel gauge, SMB2) | through the ADSP | a PMIC driver instead |
+| Battery, charging | PMI8998 (fuel gauge, SMB2) | through the ADSP | through the loader from UEFI, as redwood's first way was, but with other protocols (step 7) |
 | Haptics | PMI8998 haptics, SPMI `0xc000` | Awinic AW86927 | a small new driver |
 | Cellular | IPA 3.5.1; no IPCC; the modem loaded through the MBA (`qcom,pil-q6v55-mss`) | IPA 4.11; IPCC; TrustZone PAS | the largest piece, last |
 
@@ -36,7 +40,7 @@ defaults, which are redwood's and wrong here, so **do not pass `modem=1` on this
 - `soc_ipcc`: the SDM845 has no IPCC; GLINK to the modem goes through the APCS mailbox (`0x17990000`). The kernel's modem path
   needs that first.
 - `soc_cmd_db`: the tree only points at where AOP leaves its address at run time (`qcom,cmd-db` reg `0xc3f000c`).
-  Mainline Linux puts it at `0x85fe0000`; read the pointer on the phone to confirm before using it.
+  Read on the phone (the touch driver does, for the 3.0 V): `0x85fe0000`, 3520 bytes, as mainline Linux has it.
 - `soc_pas_mpss`: the modem is not a TrustZone PAS image here; it is started through the MBA.
 
 ## Bring-up, in order
@@ -101,18 +105,76 @@ intid 19, not the architecture's 27, and without it the kernel gets one tick and
 `lo0`, on any other core sooner). Two loader and image fixes came with it: uploads are received 16 KB at a time
 (this driver sends no reply after a receive of 29696 bytes or more), and `userland/build.sh` sets `umask 022`
 (launchd refuses SpringBoard's plist when its group may write it).
-`cpus=8 bootcpu=7 soc_vtimer=19` and the touch screen's `synaptics=3` are now in `run.args`, which `xl run`
-adds to every run on this phone, so `DEVICE=oneplus-6t ./xl run` is enough (`XL_CMDLINE="-v cpus=1"` and the
-like still win over them).
+These and everything after are now in `run.args` -- `cpus=8 bootcpu=7 soc_vtimer=19 cpufreq_osm=2 thermal=1
+buttons=2 battery=1 synaptics=3` -- so `DEVICE=oneplus-6t ./xl run` is enough (`XL_CMDLINE="-v cpus=1"`,
+`synaptics=0` and the like still win over them).
+
+The home screen takes a while, and runs shorter than about 2 minutes end before it: the screen shows the Apple
+logo with the boot's text over it until SpringBoard checks in. That wait is SpringBoard's Control Center
+waiting on LaunchServices, which rebuilds its database at every boot (`/private/var` is a fresh memory
+filesystem; `userland/build.sh`). It took 67-72 s from the logo at the boot loader's clocks and takes about
+30 s at 2.4 GHz (step 7). The slower cores still join 28 s after the others (`small_cores_after`): on this
+phone starting them at once made no measurable difference (three runs each: 39.1 and 38.9 s from launchd to
+the home screen).
 
 **5. Storage** (`ufs=2`), so the system image is read from the phone instead of RAM.
 
-**6. Touch and buttons** — the first new driver, and the one that makes it usable. A `hakios.synaptics.c` beside
-`hakios.goodix.c`, on the QUP I2C engine at `0xa90000`.
+**6. Touch and buttons.**
 
-**7. GPU** (`gpu=1`): run `adreno=N` step by step with a630 values, as `hakios.adreno.c` describes.
+Done on 30 October 2026. The touch screen (`hakios.synaptics.c`, `synaptics=3`) is a Synaptics S3706B speaking RMI4:
+the driver drives I2C by hand on GPIO 49/50 (the QUP engine is not used), switches the chip's 3.0 V (LDO28) on
+through RPMh, and maps each pin's 4 KB page of the TLMM alone (one 12 MB mapping panicked at boot). It tells F01
+the chip is configured, reads F12's register descriptors for where the fingers are (10, 8 bytes each), watches the
+interrupt pin every 5 ms -- and looks at what is pending every 50 ms as well, as the chip had a report waiting with
+the pin high about 10 times in 2 minutes -- and posts each finger to `/dev/hakios-touch`. The chip reports the
+screen's own pixels (corners seen: 63..1048, 25..2330). Taps, swipes, the edge swipes and two fingers work in
+SpringBoard. Each run's end says how many touches there were.
 
-**8. Then** haptics, battery, Wi-Fi, audio; cellular last.
+The buttons are `hakios.buttons.c` with `buttons=2`: the SDM845 has redwood's PMIC arbiter (version 5, the same
+addresses), and all three keys are on the PM8998. Power is its power-on block's KPDPWR (`0x800`, the older kind:
+bit 0), volume up GPIO6 (`0xc500`), and volume down **GPIO5** (`0xc400`) -- not RESIN, which mainline Linux and
+the device tree's `pon_2` give: a hand pressing the key moved GPIO5 alone. Nothing is written to the PMIC. All three
+were pressed by hand: volume up shows the volume indicator, and power turns the screen off and wakes it to the
+lock screen. In most runs
+one read is "dropped" in the first seconds of watching (something else on the bus then); the next one works.
+
+**7. Clocks, temperatures, battery.**
+
+Done on 30 October 2026.
+
+*Clocks* (`cpufreq_osm=2`, in `hakios.cpufreq.c`). The SDM845's cores are clocked by the OSM (Linux
+`qcom-cpufreq-hw`'s first variant: a table at `0x110` every 32 bytes, the wanted row at `0x920`), not redwood's
+EPSS. The boot loader leaves the big cores -- the kernel's own among them -- at the bottom of their table, 825 MHz
+of 2803, and the small ones at 1612 of 1766. Each group is asked for its highest row at or under
+`cpufreq_osm_mhz` (default 2400; measured: core 7 824 MHz before, 2399 after), and put back to the row it was
+found at when the run ends (the OSM keeps what it was last told). `cpufreq_osm=1` only looks. Allowing the top
+row got 2649 MHz (the OSM holds the boost rows back), no measurable gain and a warmer idle phone, so 2400 stays.
+
+*Temperatures* (`thermal=1`, `hakios.thermal.c`): the 21 tsens sensors, named as the device tree's thermal zones,
+read only -- all at the start, the cores every 10 s, the most each reached at the end. A boot at 2.4 GHz goes from
+about 33 C to 68-70 C at most (a big core) and settles at about 39 C. Nothing acts on them yet; the SoC's own
+limits hardware (LMh) throttles by itself.
+
+*Battery* (`battery=1`). As on redwood the loader asks UEFI's charger drivers and shares a read-only cache with
+the kernel (`hakios.battery.c`), but the protocols differ and **were checked by disassembly before anything was
+called**:
+
+- `ChargerEx` (revision `0x10003`) has `xnuloader/efi.h`'s layout: battery and charger presence, voltage.
+- `QcomCharger` (revision `0x10007`) is another release than redwood's: its fourth entry, the one redwood's loader
+  calls to read the status, takes a 32-bit value and hands it to the PMIC's charger protocol -- a setter. **It is
+  never called on this phone**, its `initialize()` included.
+- The charge, current and temperature come from PmicDxe's fuel gauge (GUID `9aed0312-724a-4209-8620-f93de0bbd8fb`,
+  revision `0x10016`, no header published): its third entry is `GetBatteryStatus(pmic, &info)`, and the 13
+  functions under it reach the PMIC only through the SPMI protocol's `ReadLong`. The UEFI carries
+  `PmicDxeWp.efi` -- `PmicDxeLa.inf` packages that one, not the `PmicDxeLa.efi` beside it -- and the loader calls it
+  only when the revision and the entry's first instructions are the ones disassembled; the gauge is on PMIC 1.
+
+"Charging" follows the current's sign (negative: into the battery). A computer's USB port does not keep up with the
+phone at work: plugged in, it drew 716-735 mA from the battery while booting at 2.4 GHz.
+
+**8. GPU** (`gpu=1`): run `adreno=N` step by step with a630 values, as `hakios.adreno.c` describes.
+
+**9. Then** the alert slider, haptics, Wi-Fi, audio; cellular last.
 
 ## Firmware
 
