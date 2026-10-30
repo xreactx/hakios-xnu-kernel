@@ -339,7 +339,27 @@ What `hakios.sound.c` needs instead of redwood's numbers (its first TDM, a group
 
 The format: Android's `/vendor/etc/audio_platform_info.xml` gives the speaker `bit_width="24"`, which its audio HAL
 applies to the speaker's back end -- so 24 bits in 32-bit slots, and the I2S parameter's bit width 24, rather than the
-back end's default of 16 (1.536 MHz). Not yet seen on the running phone: `/proc/asound` needs root (the Magisk image). The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
+back end's default of 16 (1.536 MHz). Not yet seen on the running phone: `/proc/asound` needs root (the Magisk image).
+
+**The speaker's path up to the amplifier works** (30 October 2026). `hakios.sound.c` takes the port by boot-args
+(`soc_sound_port=0x1006 soc_sound_clock=0x106 soc_sound_bits=24 soc_audio_stream=0x1821`): a port in `0x1000`-`0x10ff`
+is MI2S, no group, configured by AFE's I2S parameter, and its pins are the quaternary MI2S's, a page each; there only
+`sound=1` and `sound=2` (levels 3 and 4 are redwood's amplifiers). With `adsp=1` (the DSP on its own thread, kept up;
+the step limit no longer turns that into `adsp_step`):
+
+- `sound=1` (run 225530): the bit clock at 3.072 MHz, the port's I2S parameter and its start all done; at the pins the
+  frame sync changes 1552 times in 16.2 ms -- 48 kHz -- and the bit clock too fast to follow; the pins put back as UEFI
+  left them (`0x1`, pulled down).
+- `sound=2` (run 230051): the SDM845's SMMU is half redwood's size (2 x 64 pages of 4 KB, 512 KB; now accepted); stream
+  `0x1821` had nothing set up, match register 8 and context 3 were free and took our tables; the DSP maps our periods,
+  the device path (COPP 0), the stream and its routing are done, and a 1 kHz tone plays for 3 s: 159 periods written
+  and given back, no error, no underflow, 48443 frames a second, the SMMU refusing nothing. Everything is put back.
+
+    XL_SECS=120 XL_CMDLINE="-v adsp=1 sound=2 soc_sound_port=0x1006 soc_sound_clock=0x106 soc_sound_bits=24
+      soc_audio_stream=0x1821 soc_smem=0x86000000 soc_cmd_db=0x85fe0000 soc_rsc=0x179e0000 soc_aoss=0xc300000
+      soc_adsp_mem=0x8c500000 soc_adsp_mem_size=0x1a00000 soc_apcs_ipc=0x1799000c soc_adsp_cx=1" ./xl run
+
+Nothing is heard: the amplifier (TFA9894) is next. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
 
 **11. Then** Wi-Fi; cellular last.
 
