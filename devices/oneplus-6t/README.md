@@ -28,7 +28,7 @@ phone is here; the kernel, loader and user space are the common ones. `device.co
 | Wi-Fi | WCN3990, `icnss` | WCN6750 | Linux's ath10k_snoc, not ath11k: a new back end |
 | Audio | ADSP, Q6 APR, WCD934x "tavil" | ADSP | rework of `hakios.adsp.c` / `hakios.sound.c` |
 | Battery, charging | PMI8998 (fuel gauge, SMB2) | through the ADSP | through the loader from UEFI, as redwood's first way was, but with other protocols (step 7) |
-| Haptics | PMI8998 haptics, SPMI `0xc000` | Awinic AW86927 | a small new driver |
+| Haptics | PMI8998 haptics block (slave 3, peripheral `0xc0`), an LRA | Awinic AW86927 on I2C | `hakios.pmi_haptics.c` (`pmi_haptics=4`), through the PMIC arbiter; iOS's side is redwood's (`/dev/hakios-haptic`) |
 | Cellular | IPA 3.5.1; no IPCC; the modem loaded through the MBA (`qcom,pil-q6v55-mss`) | IPA 4.11; IPCC; TrustZone PAS | the largest piece, last |
 
 ## soc.args
@@ -110,7 +110,7 @@ intid 19, not the architecture's 27, and without it the kernel gets one tick and
 (this driver sends no reply after a receive of 29696 bytes or more), and `userland/build.sh` sets `umask 022`
 (launchd refuses SpringBoard's plist when its group may write it).
 These and everything after are now in `run.args` -- `cpus=8 bootcpu=7 soc_vtimer=19 cpufreq_osm=2 thermal=1
-buttons=2 battery=1 synaptics=3` -- so `DEVICE=oneplus-6t ./xl run` is enough (`XL_CMDLINE="-v cpus=1"`,
+buttons=2 battery=1 pmi_haptics=4 synaptics=3` -- so `DEVICE=oneplus-6t ./xl run` is enough (`XL_CMDLINE="-v cpus=1"`,
 `synaptics=0` and the like still win over them).
 
 The home screen takes a while, and runs shorter than about 2 minutes end before it: the screen shows the Apple
@@ -159,6 +159,7 @@ and the phone had to be reset with its power key. So, on this phone:
 - with `battery=1` the loader sets `bus_busy` in the shared battery block, waits 5 ms, reads the fuel gauge and clears
   it; the buttons look at it before each transfer, with interrupts off, and wait while it is set (a transfer of
   theirs ends within its 2 ms timeout). Reading every 1 ms with `battery=1`: 180,009 reads, 0 failed, 14 waited;
+- the haptics block's writes (step 8) keep the same rules;
 - apart from all that, about one read in 20,000 is dropped all run long with the loader's core quiet: something else
   on the bus, probably another of the SoC's processors. It is asked again at once (at 1 ms: 9 dropped, 9 asked again,
   0 failed).
@@ -200,9 +201,29 @@ called**:
 "Charging" follows the current's sign (negative: into the battery). A computer's USB port does not keep up with the
 phone at work: plugged in, it drew 716-735 mA from the battery while booting at 2.4 GHz.
 
-**8. GPU** (`gpu=1`): run `adreno=N` step by step with a630 values, as `hakios.adreno.c` describes.
+**8. Vibration.**
 
-**9. Then** the alert slider, haptics, Wi-Fi, audio; cellular last.
+Done on 30 October 2026. The motor is a linear resonant actuator on the PMI8998's haptics block (slave 3, peripheral
+`0xc0`; type `0x15`, subtype `0x9`), `hakios.pmi_haptics.c`, in steps as the other drivers: `pmi_haptics=1` reads it
+(arbiter channel 250, ours to write through; UEFI leaves Android's 2088 mV and 4255 us play rate in it), `=2` configures
+it (800 mA, Android's brake pattern, direct play; each write read back, the registers put back at the run's end), `=3`
+plays one pulse (`pmi_haptics_ms`, 100), and `=4` -- in `run.args` -- plays what iOS plays. iOS's side is redwood's: it
+plays its haptics as waveforms on the audio plug-in's "Actuator" (`userland/src/audio_plugin.c`), which writes them to
+`/dev/hakios-haptic`. The driver tells taps from vibrations as `hakios.haptic.c` does: a waveform after a pause is a tap,
+a pulse of `pmi_haptics_tap_ms` (30); one going on past 60 ms holds the motor on while it lasts, 1 s at most, then as long
+a rest. The strength is the block's maximum voltage, from five eighths of Android's 2088 mV for iOS's softest up to
+2088 mV. `/dev/hakios-haptic` is made at start-up -- the plug-in opens it once, at iOS's first haptic -- but nothing is
+played before the motor is configured at 25 s. Long-pressing icons and flipping switches in Settings, it was felt.
+
+These are the only writes to a PMIC in this kernel. `hakios_spmi_write()` (`hakios.buttons.c`) refuses every
+peripheral not in its `spmi_writable[]` list -- the haptics block alone -- and every channel this system does not
+own; it keeps the bus rules above. A first version of the driver wrote to the console at the run's end, where
+interrupts are off: that is a panic, and the panic's way out ran the run's end again, in a loop, until the loader gave
+up (the motor had been stopped the first time). Whatever a driver says at the run's end goes to the loader's log only.
+
+**9. GPU** (`gpu=1`): run `adreno=N` step by step with a630 values, as `hakios.adreno.c` describes.
+
+**10. Then** the alert slider, Wi-Fi, audio; cellular last.
 
 ## Firmware
 
