@@ -3409,12 +3409,13 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
  * are that register's bits, above) and soc_adsp_cx=1 (the DSP's rail is CX, see rails()).
  *
  * On such a SoC only the steps that have been seen to work there are done: PORTED_APCS, until each
- * of the others has been looked at for it (the OnePlus 6T, devices/oneplus-6t/README.md step 10).
+ * of the others has been looked at for it (the OnePlus 6T, devices/oneplus-6t/README.md step 10: all
+ * eleven, since run 204424).
  * And from step 3 on -- the always-on processor's mailbox, RPMh, TrustZone -- not before adsp_after
  * seconds (25) from this driver's start: the loader's core runs UEFI's own work for a run's first 24 s
  * (xnuloader's NOTE_SECONDS), as hakios.synaptics.c waits for too.
  */
-#define PORTED_APCS             7
+#define PORTED_APCS             11
 
 static void
 soc_override(void)
