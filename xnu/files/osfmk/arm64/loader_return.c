@@ -58,6 +58,7 @@ extern void hakios_osm_quiesce(void);
 extern void hakios_thermal_quiesce(void);
 extern void hakios_pmi_haptics_quiesce(void);
 extern void hakios_slider_quiesce(void);
+extern void hakios_tfa9894_quiesce(void);
 extern void hakios_haptic_quiesce(void);
 extern void hakios_synaptics_quiesce(void);
 extern void hakios_torch_quiesce(void);
@@ -387,6 +388,7 @@ loader_return(void)
 	hakios_haptic_quiesce();       /* the vibration motor's chip back into reset, if it was let out */
 	hakios_pmi_haptics_quiesce();  /* (the 6T's: stopped, and its registers as they were found) */
 	hakios_slider_quiesce();       /* the alert slider's pins' pulls as they were found */
+	hakios_tfa9894_quiesce();      /* the 6T's speaker amplifier powered down, its reset pin as found */
 	hakios_synaptics_quiesce();    /* the touch chip's power and reset pins as they were found */
 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
 	hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
