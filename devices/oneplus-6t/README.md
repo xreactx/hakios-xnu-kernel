@@ -89,6 +89,10 @@ other command); it can leave a send unreported; and it never starts a reply queu
 (`oem log`, which composes 2 MB first, now replies before composing). **Any other command that replies late will hang the
 same way** — `getvar result` (which waits for the kernel) and the end of a download are the ones to watch in step 4.
 
+`oem log` with no kernel running used to compose the loader's own log alone, and so lost the log of a kernel that had
+just returned if the host asked before fetching it (`XL_FOLLOW` does, and `xl log` always). It now stages that log
+again until the next run starts: `XL_FOLLOW` and `xl log` after a run are safe.
+
 **4. XNU, one core, no drivers.**
 
 ```sh
@@ -128,15 +132,39 @@ the chip is configured, reads F12's register descriptors for where the fingers a
 interrupt pin every 5 ms -- and looks at what is pending every 50 ms as well, as the chip had a report waiting with
 the pin high about 10 times in 2 minutes -- and posts each finger to `/dev/hakios-touch`. The chip reports the
 screen's own pixels (corners seen: 63..1048, 25..2330). Taps, swipes, the edge swipes and two fingers work in
-SpringBoard. Each run's end says how many touches there were.
+SpringBoard. Each run's end says how many touches there were. The driver does nothing for its first
+`synaptics_after` seconds (25), for the reason given under "Sharing the PMIC bus and RPMh" below.
 
 The buttons are `hakios.buttons.c` with `buttons=2`: the SDM845 has redwood's PMIC arbiter (version 5, the same
 addresses), and all three keys are on the PM8998. Power is its power-on block's KPDPWR (`0x800`, the older kind:
 bit 0), volume up GPIO6 (`0xc500`), and volume down **GPIO5** (`0xc400`) -- not RESIN, which mainline Linux and
 the device tree's `pon_2` give: a hand pressing the key moved GPIO5 alone. Nothing is written to the PMIC. All three
 were pressed by hand: volume up shows the volume indicator, and power turns the screen off and wakes it to the
-lock screen. In most runs
-one read is "dropped" in the first seconds of watching (something else on the bus then); the next one works.
+lock screen. The keys answer from about 25 s into a run (`buttons_after`, below); `buttons_poll_ms=N` changes how
+often they are read (16 ms).
+
+*Sharing the PMIC bus and RPMh.* The loader's core is not idle while the kernel runs, and to the PMIC arbiter it is
+the same system as the kernel (0): two transfers of one system at once make the arbiter drop one. For a run's first
+24 s that core still takes interrupts (`NOTE_SECONDS` in `xnuloader/loader.c`), in which UEFI's PMIC and RPMh drivers
+do their own work; with `battery=1` it reads the fuel gauge through UEFI every 5 s for the whole run. A dropped
+transfer of the kernel's is one look missed; one of UEFI's may not be survivable. Reading the keys every 1 ms from the
+start left the loader's core answering nothing: the kernel ran on at the home screen, its run's end was never answered,
+and the phone had to be reset with its power key. So, on this phone:
+
+- the buttons leave the bus alone for their first `buttons_after` seconds (25), and the touch driver does nothing for
+  its first `synaptics_after` (25): it switches the chip's 3.0 V through the first command slot of the application
+  processor's RPMh controller, the very slot UEFI's RPMh driver uses (found set after every cold start). Two writers
+  in one slot's registers could send the always-on processor a mixed command. At the run's end the touch driver says
+  the slot's state before it uses it: 0 is its own, anything else somebody else's;
+- with `battery=1` the loader sets `bus_busy` in the shared battery block, waits 5 ms, reads the fuel gauge and clears
+  it; the buttons look at it before each transfer, with interrupts off, and wait while it is set (a transfer of
+  theirs ends within its 2 ms timeout). Reading every 1 ms with `battery=1`: 180,009 reads, 0 failed, 14 waited;
+- apart from all that, about one read in 20,000 is dropped all run long with the loader's core quiet: something else
+  on the bus, probably another of the SoC's processors. It is asked again at once (at 1 ms: 9 dropped, 9 asked again,
+  0 failed).
+
+**Any new driver here that uses the PMIC bus or RPMh must do the same**: stay off them for the first 25 s, and check
+`hakios_battery_loader_bus_busy()` before each PMIC transfer.
 
 **7. Clocks, temperatures, battery.**
 
