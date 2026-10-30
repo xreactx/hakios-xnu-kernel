@@ -113,6 +113,14 @@ static char last_write[96] = "nothing written";
 static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
 
 /*
+ * The OnePlus 6T's GPU (soc_gpu=630): an Adreno 630 of the SDM845, whose clock controllers keep most
+ * of their registers where redwood's do (gcc-sdm845.c, gpucc-sdm845.c), not all, and whose GMU is the
+ * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
+ */
+static bool a630;
+#define PORTED_A630             3
+
+/*
  * The kernel's log reaches the loader when a run is over, and a run that ends in a reset
  * without a word leaves none. The loader also reads a log of the kernel's from another core
  * while it runs (loader_return.c; xl keeps it with XL_FOLLOW): every line said here goes there
@@ -289,11 +297,15 @@ static struct block gcc = { "gcc", 0x00100000, 0x80000 };
 #define GCC_GPU_MEMNOC_GFX_CBCR 0x7100c
 #define GCC_GPU_SNOC_DVM_GFX_CBCR 0x71018
 #define GCC_DDRSS_GPU_AXI_CBCR  0x71154
+/* the SDM845's (gcc-sdm845.c): the PLL vote and the memory's clock elsewhere (its gpu_iref, 0x8c010, is past this mapping) */
+#define GCC_PLL_VOTE_SDM845     0x52004
+#define GCC_DDRSS_GPU_AXI_CBCR_SDM845 0x44038
 #define CBCR_ENABLE             (1u << 0)       /* a clock's control register: on */
 #define CBCR_OFF                (1u << 31)      /* ... and whether it is in fact off */
 
 /* dt: reserved-memory cmd_db@80860000: the boot loader's list of what RPMh can switch (cmd-db.c) */
 #define CMD_DB_PHYS             0x80860000UL
+static unsigned long cmd_db_phys = CMD_DB_PHYS;         /* soc_cmd_db: the 6T's is 0x85fe0000 */
 #define CMD_DB_SIZE             0x20000UL
 
 struct cmd_db_slave {
@@ -329,7 +341,7 @@ rpmh_resource(const char *name, uint16_t *levels, unsigned *level_count)
 		*level_count = 0;
 	}
 	if (db == NULL) {
-		db = cmd_db = (const struct cmd_db_header *)ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);  /* memory, not registers */
+		db = cmd_db = (const struct cmd_db_header *)ml_io_map_wcomb(cmd_db_phys, CMD_DB_SIZE);  /* memory, not registers */
 	}
 	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
 		return 0;
@@ -389,13 +401,19 @@ static bool
 step_outside(void)
 {
 	announce("read the GPU's clocks in the global clock controller (registers the touch screen driver uses too)");
-	get(&gcc, "pll votes", GCC_PLL_VOTE);
+	get(&gcc, "pll votes", a630 ? GCC_PLL_VOTE_SDM845 : GCC_PLL_VOTE);
 	get(&gcc, "gpu_cfg_ahb", GCC_GPU_CFG_AHB_CBCR);
 	get(&gcc, "gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CBCR);
 	get(&gcc, "gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_GFX_CBCR);
-	get(&gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR);
+	get(&gcc, "ddrss_gpu_axi", a630 ? GCC_DDRSS_GPU_AXI_CBCR_SDM845 : GCC_DDRSS_GPU_AXI_CBCR);
 
-	announce("look up the GPU's supply rails in the boot loader's list of RPMh resources (memory at 0x80860000)");
+	{
+		char what[120];
+
+		snprintf(what, sizeof(what), "look up the GPU's supply rails in the boot loader's list of RPMh resources (memory at %#lx)",
+		    cmd_db_phys);
+		announce(what);
+	}
 	show_rpmh_resource("gfx.lvl");          /* the 3D core's own rail (dt: VDD_GFX_LEVEL, PM8350C S7) */
 	show_rpmh_resource("cx.lvl");           /* the rail of the CX half, shared with most of the SoC */
 	show_rpmh_resource("mx.lvl");           /* memories */
@@ -435,6 +453,10 @@ step_fuses(void)
 {
 	uint32_t bin, gaming;
 
+	if (a630) {
+		printf("adreno: %u: the Adreno 630 has no speed bin that Linux reads (a6xx_gpu.c): no fuse is read\n", step);
+		return true;
+	}
 	announce("read the GPU's fuses in the error-corrected copy (0x784000), which Linux reads");
 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
@@ -478,6 +500,7 @@ static struct block gpucc = { "gpucc", 0x03d90000, 0x9000 };
 #define GPUCC_CX_HW_CTRL        0x1540          /* dt: gpu_cx_hw_ctrl: bit 31 is where the vendor's driver sees CX come on */
 #define GPUCC_GX_DOMAIN_MISC    0x158c          /* dt: gpu_gx_domain_addr */
 #define GPUCC_SMMU_VOTE_CBCR    0x5000          /* gpu_cc_hlos1_vote_gpu_smmu_clk: our vote for the SMMU's clock */
+#define GPUCC_GX_CLAMP_IO_SDM845 0x1508         /* (gpucc-sdm845.c: gpu_gx_gdsc's clamp_io_ctrl) */
 
 #define GDSC_SW_COLLAPSE        (1u << 0)       /* a power switch's control register (gdsc.c): off, by software */
 #define GDSC_HW_CONTROL         (1u << 1)       /* something else than software operates it */
@@ -494,6 +517,21 @@ step_gpucc(void)
 		return false;
 	}
 
+	if (a630) {
+		/* only the registers gpucc-sdm845.c knows: the rest of redwood's list (its pll0, hub, cb ...) is not the SDM845's */
+		announce("read the GPU's clock controller (0x5090000) as it is: the first access to the GPU's part of the SoC");
+		get(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR);
+		get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
+		get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
+		get(&gpucc, "gx_clamp_io", GPUCC_GX_CLAMP_IO_SDM845);
+		get(&gpucc, "pll1 mode", GPUCC_PLL1_MODE);
+		get(&gpucc, "pll1 multiplier", GPUCC_PLL1_MODE + 4);
+		get(&gpucc, "gmu_clk_src command", GPUCC_GMU_RCGR);
+		get(&gpucc, "gmu_clk_src source", GPUCC_GMU_RCGR + 4);
+		get(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR);
+		get(&gpucc, "cxo", GPUCC_CXO_CBCR);
+		return true;
+	}
 	announce("read the GPU's clock controller (0x3d90000) as it is: the first access to the GPU's part of the SoC");
 	get(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR);
 	get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
@@ -3759,6 +3797,15 @@ hakios_adreno_init(void)
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
 	}
+	only = 0;
+	if (PE_parse_boot_argn("soc_gpu", &only, sizeof(only)) && only == 630) {
+		a630 = true;
+		gpucc.phys = 0x05090000;        /* dt: qcom,gpucc@5090000 */
+		PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
+		printf("adreno: the OnePlus 6T's Adreno 630 (soc_gpu=630): its clock controller at %#x, the command DB at %#lx; steps "
+		    "1 to %u only, so far\n", gpucc.phys, cmd_db_phys, PORTED_A630);
+	}
+	only = 0;
 	if (!PE_parse_boot_argn("adreno", &last_step, sizeof(last_step))) {
 		if (!(PE_parse_boot_argn("gpu", &only, sizeof(only)) && only) || !start_by_itself()) {
 			return;
@@ -3782,6 +3829,15 @@ hakios_adreno_init(void)
 	}
 	if (last_step > STEPS) {
 		last_step = STEPS;
+	}
+	if (a630 && (by_itself || last_step > PORTED_A630)) {
+		if (by_itself) {
+			printf("adreno: gpu=1 is not for the Adreno 630 yet: the system draws with its software renderer\n");
+			return;
+		}
+		printf("adreno: adreno=%u: on the Adreno 630 only steps 1 to %u have been ported; those are done\n", last_step,
+		    PORTED_A630);
+		last_step = PORTED_A630;
 	}
 	PE_parse_boot_argn("adreno_watch", &watch_seconds, sizeof(watch_seconds));
 	for (newest_step = last_step; newest_step > 0 && (skip_steps & 1u << newest_step); newest_step--) {

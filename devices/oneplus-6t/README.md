@@ -262,6 +262,14 @@ The real difference is the GMU: the a630's is the older one (`qcom,gpu-quirk-hfi
 (reads, the CX power switch, clocks, the SMMU, TrustZone's zap check) want new numbers; steps 13 to 17 (the GMU's
 firmware, start, HFI, the 3D core's power) a630 code, from `a6xx_gmu.c`'s legacy branches.
 
+`soc_gpu=630` (with `soc_cmd_db=0x85fe0000`) has `hakios.adreno.c` use the SDM845's numbers and stop after the steps
+ported so far (`PORTED_A630`). Steps 1 to 3 work (run 235420): the GPU's clocks in the global clock controller where
+`gcc-sdm845.c` has them (the PLL vote at `0x52004` with the GPU's bits set, the memory's clock at `0x44038`, off);
+RPMh's `gfx.lvl` (levels up to 416), `cx.lvl`, `mx.lvl`; no fuse (Linux reads no speed bin for the a630); and the GPU's
+clock controller as UEFI leaves it -- both power switches off (`0x222001`), the GX clamp on, the GMU's clocks off: the
+GPU entirely down, nothing in the way of step 4. (A first try also read `gpu_iref` at `0x8c010`, past the 512 KB the
+driver maps of the clock controller: a panic of our own making. That run's log came back only through `logdump`.)
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the
