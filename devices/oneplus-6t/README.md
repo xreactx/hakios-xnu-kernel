@@ -277,7 +277,10 @@ Steps 1 and 2 work (30 October 2026, run 201813): the partition of the applicati
 shared memory (`0x861af000`, 192 KB) but empty -- the DSP has not run since power-on, its doorbells are quiet -- and the
 image is whole, 13 segments filling the 26 MB exactly. Unlike redwood's, the partition has **no GLINK items (478,
 479)**: on this phone our side must allocate them (as Linux's `qcom_glink_smem` does), which step 6 has to learn.
-Steps 3 (the AOP's mailbox) and 7 (RPMh, TrustZone) touch what UEFI uses in the first 24 s, and must wait as touch does.
+Step 3 works too (run 202214): from step 3 on nothing is done before `adsp_after` (25) seconds from the driver's start,
+as touch waits out UEFI; then the AOP's message RAM at `0xc300000` reads "MAIL", version 1, our mailbox at `0x128`
+(`0x2d8` bytes), and link and channel open with every acknowledgement, the doorbell being the APCS's bit 0. The system
+starts on to the home screen as before. Step 7 (RPMh, TrustZone) waits the same way.
 
 **11. Then** Wi-Fi; cellular last.
 
