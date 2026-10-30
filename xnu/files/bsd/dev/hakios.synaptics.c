@@ -24,9 +24,10 @@
  *                 RMI4 page description tables read, and F01's identity and status. The chip's
  *                 registers are only read: the one write is the page select (0xff), which RMI4 needs
  *                 to read past page 0.
- *   synaptics=3   ... and then touches read and logged until the run's end: F01 told the chip is
- *                 configured (so it reports), F12's register descriptors read for where the fingers
- *                 are, and the interrupt pin (low = something to say) watched every 5 ms.
+ *   synaptics=3   ... and then touches read until the run's end, logged and handed to /dev/hakios-touch:
+ *                 F01 told the chip is configured (so it reports), F12's register descriptors read for
+ *                 where the fingers are, and the interrupt pin (low = something to say) watched every
+ *                 5 ms. The chip reports the screen's own pixels (corners seen: 63..1048, 25..2330).
  *
  * At the run's end (and on a panic's way out) the two pins this changes are put back as they were and
  * the 3.0 V is switched off again.
@@ -453,6 +454,9 @@ read_identity(void)
 #define F12_CTRL_SENSOR_TUNING  8
 #define F12_DATA_FINGERS        1
 #define TOUCH_LINES_MOST        2000    /* lines of touches logged at most */
+#define SCREEN_WIDTH            1080    /* the panel's pixels, which are F12's units */
+#define SCREEN_HEIGHT           2340
+#define QUIET_CHECK_MS          50      /* with the pin high, a look at what is pending anyway this often */
 
 /*
  * A register descriptor: which registers a function has (a presence bitmap), and each one's size.
@@ -665,12 +669,13 @@ touch_watch(void)
 {
 	uint8_t data[256], kind[16] = { 0 };
 	uint16_t last_x[16] = { 0 }, last_y[16] = { 0 };
+	uint32_t posted_x[16] = { 0 }, posted_y[16] = { 0 };
 	unsigned idle_lows = 0, slots = finger_slots < 16 ? finger_slots : 16;
 	uint64_t now, next_quiet_check;
 	uint32_t f12_bits = ((1u << f12.irqs) - 1) << f12.first_irq;
 
 	watch_started = mach_absolute_time();
-	nanoseconds_to_absolutetime(NSEC_PER_SEC, &next_quiet_check);
+	nanoseconds_to_absolutetime(QUIET_CHECK_MS * NSEC_PER_MSEC, &next_quiet_check);
 	next_quiet_check += watch_started;
 	say("synaptics: watching for touches -- touch the screen\n");
 	while (!leaving) {
@@ -683,8 +688,8 @@ touch_watch(void)
 			continue;
 		}
 		if (!low) {
-			/* once a second with the pin high: is anything pending anyway (a pin that does not say)? */
-			nanoseconds_to_absolutetime(NSEC_PER_SEC, &next_quiet_check);
+			/* now and then with the pin high: is anything pending anyway (it was, 10 times in 2 minutes)? */
+			nanoseconds_to_absolutetime(QUIET_CHECK_MS * NSEC_PER_MSEC, &next_quiet_check);
 			next_quiet_check += now;
 		}
 		if (leaving || !regs_read((uint8_t)(f01.data + F01_DATA_IRQ_STATUS), &pending, 1)) {
@@ -718,7 +723,20 @@ touch_watch(void)
 			const uint8_t *o = data + fingers_at + f * F12_OBJECT_BYTES;
 			uint16_t x = (uint16_t)(o[1] | o[2] << 8), y = (uint16_t)(o[3] | o[4] << 8);
 			int dx = x - last_x[f], dy = y - last_y[f];
+			uint32_t sx = x >= SCREEN_WIDTH - 1 ? 65535 : x * 65535u / (SCREEN_WIDTH - 1);
+			uint32_t sy = y >= SCREEN_HEIGHT - 1 ? 65535 : y * 65535u / (SCREEN_HEIGHT - 1);
 
+			if (o[0] != 0 && kind[f] == 0) {
+				hakios_touch_post(HAKIOS_TOUCH_DOWN, f, sx, sy);
+			} else if (o[0] != 0 && (sx != posted_x[f] || sy != posted_y[f])) {
+				hakios_touch_post(HAKIOS_TOUCH_MOVE, f, sx, sy);
+			} else if (o[0] == 0 && kind[f] != 0) {
+				hakios_touch_post(HAKIOS_TOUCH_UP, f, posted_x[f], posted_y[f]);
+			}
+			if (o[0] != 0) {
+				posted_x[f] = sx;
+				posted_y[f] = sy;
+			}
 			if (o[0] != kind[f]) {
 				if (o[0] == 0) {
 					touch_log("synaptics: finger %u up at %u,%u\n", f, last_x[f], last_y[f]);
@@ -954,7 +972,7 @@ synaptics_thread(__unused void *arg, __unused wait_result_t wr)
 {
 	map_pins();
 	say("synaptics: level %u: %s\n", level,
-	    level == 1 ? "a look" : level == 2 ? "powered and probed, the chip only read" : "powered, configured, touches read");
+	    level == 1 ? "a look" : level == 2 ? "powered and probed, the chip only read" : "powered, configured, touches read and posted");
 	show_pins("as found");
 	if (!chip_answers() && level >= 2) {
 		power_up();
