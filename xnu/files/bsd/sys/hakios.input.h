@@ -53,6 +53,13 @@ bool hakios_battery_loader_bus_busy(void); /* the loader's core is about to use 
 /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/hakios.buttons.c) */
 void hakios_spmi_lock(void);
 void hakios_spmi_unlock(void);
+/* ... and reads by peripheral id (slave << 8 | peripheral) for other drivers: not in a run's first 24 s */
+int hakios_spmi_channel(uint16_t id, uint32_t *owner);
+const char *hakios_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count);
+/* ... and writes, to the few peripherals hakios.buttons.c's spmi_writable[] lists, and only those */
+const char *hakios_spmi_write(uint16_t id, uint8_t reg, const uint8_t *bytes, uint32_t count);
+void hakios_pmi_haptics_quiesce(void);  /* at a run's end: the haptics block stopped and as it was found */
+void hakios_pmi_haptics_init(void);    /* boot-arg pmi_haptics=N: the OnePlus 6T's vibration motor (PMI8998) */
 /*
  * How the battery is, as the audio DSP's battery manager says (bsd/dev/hakios.adsp.c, with adsp=1):
  * handed to bsd/dev/hakios.battery.c, which keeps it for the sysctls kern.hakios.battery_* and

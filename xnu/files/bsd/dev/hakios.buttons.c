@@ -178,6 +178,22 @@ static uint64_t watch_started;
  * the bus, probably another of the SoC's processors. Asked again at once, the read goes through. Counted
  * in the first DROP_EARLY_S of watching and after, for the minute's line.
  */
+/* a millisecond's wait: asleep if the caller may sleep, spinning if it came with interrupts off (a run's end) */
+static void
+spmi_pause_1ms(boolean_t interrupts)
+{
+	uint64_t until;
+
+	if (interrupts) {
+		delay_for_interval(1, NSEC_PER_MSEC);
+		return;
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_MSEC, &until);
+	until += mach_absolute_time();
+	while (mach_absolute_time() < until) {
+	}
+}
+
 static void
 spmi_count_drop(uint64_t now)
 {
@@ -238,7 +254,7 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 		if (waited >= 200) {
 			return "the loader's core keeps the bus";
 		}
-		delay_for_interval(1, NSEC_PER_MSEC);
+		spmi_pause_1ms(interrupts);
 	}
 	start = mach_absolute_time();
 	/* a dropped read is asked once more at once (see "dropped" below) */
@@ -312,6 +328,170 @@ find_channel(struct peripheral *p, uint32_t channels)
 	if (!p->found) {
 		printf("buttons: no channel of the arbiter is %s (slave %u, peripheral %#x)\n", p->name, p->id >> 8, p->id & 0xff);
 	}
+}
+
+/*
+ * For other drivers (hakios.pmi_haptics.c): reads by a peripheral's id (slave << 8 | peripheral), through
+ * this system's observer channels, with everything spmi_read() does -- the lock, the loader's bus_busy,
+ * one more try after a drop. The arbiter is mapped and its channels counted on first use. Whoever calls
+ * this keeps to the rule spmi_read() keeps: not in the run's first 24 s (see buttons_after).
+ */
+static uint32_t arb_channels;
+
+static bool
+spmi_map(void)
+{
+	uint32_t version;
+
+	if (arb_core == 0) {
+		arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+		arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
+		arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+	}
+	version = rd(arb_core + ARB_VERSION);
+	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) {
+		return false;
+	}
+	arb_channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
+	if (arb_channels == 0 || arb_channels > ARB_MAX_CHANNELS) {
+		arb_channels = ARB_MAX_CHANNELS;
+	}
+	return true;
+}
+
+/* the channel find_channel() would choose, quietly; -1 if none. *owner: the system that may write through it */
+int
+hakios_spmi_channel(uint16_t id, uint32_t *owner)
+{
+	int found = -1;
+
+	if (!spmi_map()) {
+		return -1;
+	}
+	for (uint32_t n = 0; n < arb_channels; n++) {
+		uint32_t map = rd(arb_core + ARB_CHANNEL(n)), who;
+
+		if (map == 0 || ((map >> 8) & 0xfff) != id) {
+			continue;
+		}
+		who = rd(arb_cnfg + ARB_OWNER(n)) & 7;
+		if (found < 0 || who == ARB_SYSTEM) {
+			found = (int)n;
+			*owner = who;
+		}
+	}
+	return found;
+}
+
+/* `count' (1 to 8) registers from `reg' on; NULL, or what went wrong */
+const char *
+hakios_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count)
+{
+	struct peripheral p = { .name = "", .id = id };
+	uint32_t owner;
+	int channel = hakios_spmi_channel(id, &owner);
+
+	if (channel < 0) {
+		return "no channel of the arbiter is that peripheral";
+	}
+	p.channel = (uint16_t)channel;
+	p.found = true;
+	return spmi_read(&p, reg, bytes, count);
+}
+
+/*
+ * WRITES. The only ones to a PMIC in this kernel, and only to the peripherals listed here: the PMICs make
+ * the phone's supplies, and a write to the wrong register can switch one off. A write goes through the
+ * peripheral's own channel in the "chnls" region (0x10000 a channel), which only its owner may use; the
+ * data first, then the command (Linux spmi-pmic-arb.c, version 5, pmic_arb_write_cmd()).
+ */
+#define ARB_CHNLS_PHYS          0x0c600000UL    /* the phone's device tree: qcom,spmi@c440000's second "reg" */
+#define CHNL_WDATA0             0x10
+#define CHNL_WDATA1             0x14
+#define COMMAND_WRITE           (0u << 27)      /* "extended register write long"; [11:4] register, [2:0] bytes - 1 */
+
+static const uint16_t spmi_writable[] = {
+	0x3c0,          /* the PMI8998's haptics block (hakios.pmi_haptics.c) */
+};
+
+const char *
+hakios_spmi_write(uint16_t id, uint8_t reg, const uint8_t *bytes, uint32_t count)
+{
+	static vm_offset_t chnl_page[sizeof(spmi_writable) / sizeof(spmi_writable[0])];
+	uint64_t start, now, interval;
+	uint32_t owner = 0, status = 0, data[2] = { 0, 0 };
+	boolean_t interrupts;
+	vm_offset_t chnl = 0;
+	unsigned which;
+	int channel;
+
+	for (which = 0; which < sizeof(spmi_writable) / sizeof(spmi_writable[0]); which++) {
+		if (spmi_writable[which] == id) {
+			break;
+		}
+	}
+	if (which == sizeof(spmi_writable) / sizeof(spmi_writable[0])) {
+		return "not a peripheral this kernel writes to";
+	}
+	if (count == 0 || count > 8) {
+		return "1 to 8 bytes";
+	}
+	channel = hakios_spmi_channel(id, &owner);
+	if (channel < 0) {
+		return "no channel of the arbiter is that peripheral";
+	}
+	if (owner != ARB_SYSTEM) {
+		return "its channel is another system's to write through";
+	}
+	if (chnl_page[which] == 0) {
+		chnl_page[which] = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * (uint32_t)channel, 0x1000);
+	}
+	chnl = chnl_page[which];
+	for (uint32_t i = 0; i < count; i++) {
+		data[i / 4] |= (uint32_t)bytes[i] << (8 * (i % 4));
+	}
+	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	for (unsigned waited = 0;; waited++) {
+		interrupts = ml_set_interrupts_enabled(FALSE);
+		hakios_spmi_lock();
+		if (!hakios_battery_loader_bus_busy()) {
+			break;
+		}
+		hakios_spmi_unlock();
+		ml_set_interrupts_enabled(interrupts);
+		if (waited >= 200) {
+			return "the loader's core keeps the bus";
+		}
+		spmi_pause_1ms(interrupts);
+	}
+	for (int attempt = 0; attempt < 2; attempt++) {
+		wr(chnl + CHNL_WDATA0, data[0]);
+		if (count > 4) {
+			wr(chnl + CHNL_WDATA1, data[1]);
+		}
+		wr(chnl + OBSERVER_COMMAND, COMMAND_WRITE | (uint32_t)reg << 4 | (count - 1));
+		start = mach_absolute_time();
+		do {
+			status = rd(chnl + OBSERVER_STATUS);
+			now = mach_absolute_time();
+		} while (!(status & STATUS_DONE) && now - start < interval);
+		if (!(status & STATUS_DONE) || !(status & STATUS_DROPPED) || (status & (STATUS_DENIED | STATUS_FAILURE))) {
+			break;
+		}
+		bus.retried++;
+	}
+	hakios_spmi_unlock();
+	ml_set_interrupts_enabled(interrupts);
+	if (!(status & STATUS_DONE)) {
+		return "no answer from the arbiter";
+	} else if (status & STATUS_DENIED) {
+		return "the arbiter refuses";
+	} else if (status & STATUS_FAILURE) {
+		return "the transfer failed";
+	} else if (status & STATUS_DROPPED) {
+		return "the transfer was dropped, twice";
+	}
+	return NULL;
 }
 
 /* ---- the two peripherals ------------------------------------------------------------------------- */
