@@ -369,7 +369,28 @@ start sends the "cold boot patch". `tools/tfa_regs.c` reads its 16-bit registers
 dumps idle and while a tone plays through QUAT_MI2S (`tinyplay`, MultiMedia1) are in `fw-audio/tfa-dumps/`. Playing
 changes only the control register `0x00` (`0xa275` to `0xa27c`: out of power-down, amplifier and boost on), `0x04`
 (`0x40` to 0) and status registers: everything else was set up at boot. HakiOS starts the phone cold, so it must send
-that whole set-up itself -- next: record it with the kernel's I2C trace while Android's driver does it. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
+that whole set-up itself.
+
+**The set-up, recorded.** The phone is rooted on flash (`boot_b` is that Magisk image, byte for byte). Android's init
+switches tracing off at 4.6 s, and the amplifier's set-up comes at 7 s; a soft reset of the chip (register 0, bit 1)
+does not make the driver do it again (it fails to start, ten times, until the phone restarts), and unbinding and
+binding its driver brought the phone down 26 s later. What worked: for one boot, a Magisk script in
+`/data/adb/post-fs-data.d/` switched the I2C trace (bus 2) back on at 6.0 s, and removed straight after. From the
+soft reset (`00=0002`) to the amplifier on (`00=a27c`), 0.19 s: about 25 register writes; the patch, seven blocks of
+up to 250 bytes into register `0x91` (with `0x90` choosing the chip's DSP memory); twelve parameter messages to the
+chip's DSP, each a block into `0x92`, the trigger `90=0112`, `0x93` read back as `0x0300`, the answer from `0x92`
+(`000000`); then `e1`/`e0` and `00=a27c`. Each later start is `04=0000 00=a274 01=15d6 e0=1 e1=1 00=a27c`, each stop
+`04=0040 00=a27d 00=a275`.
+
+`tools/tfa-trace2replay.py` turns the trace into a file of those writes and the reads with what Android got back
+(`fw-audio/tfa9894-coldboot.replay`: 139 writes, 121 reads; the vendor's, not committed). The trace prints 64 bytes of
+a transfer at most: the twelve longer ones (the patch's blocks, five messages) are taken whole from `tfa98xx.cnt`,
+where they lie as sent -- one message is there twice, differently, and the copy that follows the one before it is
+taken, as the driver reads a profile's items in order.
+
+For the kernel's driver: the amplifier's bus is the serial engine at `0x890000` on GPIO 89 and 90 (function `qup4`,
+2 mA, no pull; Linux's `pinctrl-sdm845.c`: south tile), done by hand as the touch screen's; its reset GPIO 69 (east
+tile); and the port at 16 bits, the format Android plays. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
 
 **11. Then** Wi-Fi; cellular last.
 
