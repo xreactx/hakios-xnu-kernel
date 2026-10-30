@@ -13,4 +13,6 @@ soc_ipa_stream=0x480
 soc_ipa_stream_uc=0x482
 soc_pas_mpss=0x4
 soc_pas_ipa=0xf
+soc_adsp_mem=0x86700000
+soc_adsp_mem_size=0x4000000
 soc_ipa_fw=yupik_ipa_fws
