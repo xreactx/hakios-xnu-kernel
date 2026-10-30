@@ -294,6 +294,10 @@ Step 4 works as it is (run 202443): TrustZone takes the header of image 1 (`0x42
 the place, 26 MB at `0x8c500000` (`0x42000202`), both answering 0. The mailbox, opened by the run before, is found
 open.
 
+Step 5 works (run 203147, with the regions reserved): the 13 segments into `0x8c500000`, 11.1 MB of the image and
+16.1 MB of zeroes, read back with no word different. One change: the 6T's segment 9 is 84 bytes, so a segment's last
+word of eight may now run past its end (into the gap before the next one, which starts at a page).
+
 **11. Then** Wi-Fi; cellular last.
 
 ## Firmware
