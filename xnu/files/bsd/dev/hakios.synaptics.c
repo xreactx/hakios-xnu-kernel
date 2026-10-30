@@ -24,6 +24,9 @@
  *                 RMI4 page description tables read, and F01's identity and status. The chip's
  *                 registers are only read: the one write is the page select (0xff), which RMI4 needs
  *                 to read past page 0.
+ *   synaptics=3   ... and then touches read and logged until the run's end: F01 told the chip is
+ *                 configured (so it reports), F12's register descriptors read for where the fingers
+ *                 are, and the interrupt pin (low = something to say) watched every 5 ms.
  *
  * At the run's end (and on a panic's way out) the two pins this changes are put back as they were and
  * the 3.0 V is switched off again.
@@ -43,7 +46,8 @@ extern void loader_log_putc(char c);
 
 static vm_offset_t tlmm;
 static uint32_t level;
-static bool powered, leaving;
+static bool powered;
+static volatile bool leaving;
 
 /* every line to the loader's log as well (and to the console when that may be written) */
 static int say(const char *format, ...) __printflike(1, 2);
@@ -343,9 +347,11 @@ reg_write(uint8_t reg, uint8_t value)
 
 struct pdt_entry {
 	uint8_t page, query, command, control, data, irqs, version, function;
+	uint8_t first_irq;      /* its interrupt sources' first bit: they are numbered in the tables' order */
 };
 
-static struct pdt_entry f01;
+static struct pdt_entry f01, f12;
+static unsigned irq_count;
 
 static bool
 chip_answers(void)
@@ -384,11 +390,14 @@ read_pdt(void)
 				break;          /* the end of this page's table */
 			}
 			e = (struct pdt_entry){ page, entry[0], entry[1], entry[2], entry[3], (uint8_t)(entry[4] & 7),
-				                (uint8_t)((entry[4] >> 5) & 3), entry[5] };
+				                (uint8_t)((entry[4] >> 5) & 3), entry[5], (uint8_t)irq_count };
+			irq_count += e.irqs;
 			say("synaptics: page %u: F%02x version %u, query 0x%02x, command 0x%02x, control 0x%02x, data 0x%02x, "
 			    "%u interrupt sources\n", page, e.function, e.version, e.query, e.command, e.control, e.data, e.irqs);
 			if (e.function == 0x01) {
 				f01 = e;
+			} else if (e.function == 0x12) {
+				f12 = e;
 			}
 			found = true;
 			functions++;
@@ -398,7 +407,7 @@ read_pdt(void)
 		}
 	}
 	(void)reg_write(RMI_PAGE_SELECT, 0);
-	say("synaptics: %u functions in all\n", functions);
+	say("synaptics: %u functions in all, %u interrupt sources\n", functions, irq_count);
 }
 
 static void
@@ -429,6 +438,306 @@ read_identity(void)
 	/* (Linux rmi_f01.c: bit 7 unconfigured -- so it is after every reset, until a driver configures it -- bit 6 the boot loader) */
 	say("synaptics: F01: status 0x%02x: code %u%s%s\n", status, status & 15, status & 0x80 ? ", unconfigured" : "",
 	    status & 0x40 ? ", in the boot loader (flash programming)" : "");
+}
+
+/* ---- touches (Linux rmi_f01.c, rmi_f12.c and rmi_read_register_desc()) --------------------------- */
+
+#define F01_CTRL0_SLEEP_MASK    0x03
+#define F01_CTRL0_NOSLEEP       (1u << 2)
+#define F01_CTRL0_CONFIGURED    (1u << 7)
+#define F01_CTRL_IRQ_ENABLE     1       /* from F01's control base: one bit per interrupt source */
+#define F01_DATA_IRQ_STATUS     1       /* from F01's data base: the same bits, cleared by reading them */
+
+#define DESC_REGS               64      /* registers kept track of; the ones read here are all far below */
+#define F12_OBJECT_BYTES        8       /* type, x (2), y (2), z, width x, width y */
+#define F12_CTRL_SENSOR_TUNING  8
+#define F12_DATA_FINGERS        1
+#define TOUCH_LINES_MOST        2000    /* lines of touches logged at most */
+
+/*
+ * A register descriptor: which registers a function has (a presence bitmap), and each one's size.
+ * The registers follow one another in that order from the function's base, so where register n is
+ * is the sum of the sizes of the present ones before it.
+ */
+struct reg_desc {
+	uint32_t size[DESC_REGS];
+	uint8_t subpackets[DESC_REGS];
+	bool present[DESC_REGS];
+};
+
+static struct reg_desc f12_control, f12_data;
+
+/* the descriptor whose three registers start at `at' (in page 0): its presence size, presence, structure */
+static bool
+read_reg_desc(uint8_t at, struct reg_desc *desc, const char *what)
+{
+	uint8_t presence_size, presence[32] = { 0 }, structure[256];
+	unsigned first, struct_size, reg = 0, offset = 0;
+
+	bzero(desc, sizeof(*desc));
+	if (!regs_read(at, &presence_size, 1) || presence_size == 0 || presence_size > sizeof(presence) ||
+	    !regs_read((uint8_t)(at + 1), presence, presence_size)) {
+		say("synaptics: F12 %s descriptor: does not read (presence size %u)\n", what, presence_size);
+		return false;
+	}
+	if (presence[0] == 0) {
+		struct_size = presence[1] | presence[2] << 8;
+		first = 3;
+	} else {
+		struct_size = presence[0];
+		first = 1;
+	}
+	if (struct_size > sizeof(structure) || !regs_read((uint8_t)(at + 2), structure, struct_size)) {
+		say("synaptics: F12 %s descriptor: a structure of %u bytes, not read\n", what, struct_size);
+		return false;
+	}
+	for (unsigned i = first * 8; i < presence_size * 8u; i++) {
+		uint32_t size;
+		uint8_t subpackets = 0;
+
+		if (!(presence[i / 8] & (1u << (i % 8)))) {
+			continue;
+		}
+		reg = i - first * 8;
+		if (offset >= struct_size) {
+			say("synaptics: F12 %s descriptor: the structure ends before register %u\n", what, reg);
+			return false;
+		}
+		size = structure[offset++];
+		if (size == 0) {
+			size = structure[offset] | structure[offset + 1] << 8;
+			offset += 2;
+		}
+		if (size == 0) {
+			size = structure[offset] | structure[offset + 1] << 8 | structure[offset + 2] << 16 |
+			    (uint32_t)structure[offset + 3] << 24;
+			offset += 4;
+		}
+		/* the subpackets: 7 bits a byte, bit 7 = more bytes follow */
+		do {
+			for (unsigned b = 0; b < 7; b++) {
+				subpackets += (structure[offset] >> b) & 1;
+			}
+		} while (offset < struct_size && (structure[offset++] & 0x80));
+		if (reg < DESC_REGS) {
+			desc->present[reg] = true;
+			desc->size[reg] = size;
+			desc->subpackets[reg] = subpackets;
+		}
+	}
+	return true;
+}
+
+/* where register `reg' is from the function's base; -1 = the function has no such register */
+static int
+reg_offset(const struct reg_desc *desc, unsigned reg)
+{
+	unsigned offset = 0;
+
+	if (!desc->present[reg]) {
+		return -1;
+	}
+	for (unsigned r = 0; r < reg; r++) {
+		offset += desc->present[r] ? desc->size[r] : 0;
+	}
+	return (int)offset;
+}
+
+static void
+show_reg_desc(const struct reg_desc *desc, const char *what)
+{
+	char line[200];
+	size_t used = 0;
+
+	line[0] = 0;
+	for (unsigned r = 0; r < DESC_REGS && used < sizeof(line) - 20; r++) {
+		if (desc->present[r]) {
+			used += snprintf(line + used, sizeof(line) - used, " %u:%u", r, desc->size[r]);
+		}
+	}
+	say("synaptics: F12 %s registers (number:bytes):%s\n", what, line);
+}
+
+static int fingers_at = -1;
+static unsigned finger_slots, irq_bytes;
+
+/* F12's layout, F01 told it is configured, the interrupts of F12 (and F01's own) enabled */
+static bool
+touch_setup(void)
+{
+	uint8_t ctrl0, mask[1] = { 0 }, status;
+	int tuning;
+
+	if (f01.function != 0x01 || f12.function != 0x12 || f01.page != 0 || f12.page != 0) {
+		say("synaptics: touches: F01 and F12 are not both on page 0: not read\n");
+		return false;
+	}
+	irq_bytes = (irq_count + 7) / 8;
+	if (irq_bytes != 1) {
+		say("synaptics: touches: %u interrupt sources: more than one byte of them is not handled yet\n", irq_count);
+		return false;
+	}
+	if (!reg_write(RMI_PAGE_SELECT, 0)) {
+		return false;
+	}
+	if (!read_reg_desc((uint8_t)(f12.query + 1), &f12_control, "control") ||
+	    !read_reg_desc((uint8_t)(f12.query + 7), &f12_data, "data")) {
+		return false;
+	}
+	show_reg_desc(&f12_control, "control");
+	show_reg_desc(&f12_data, "data");
+	fingers_at = reg_offset(&f12_data, F12_DATA_FINGERS);
+	if (fingers_at < 0 || f12_data.size[F12_DATA_FINGERS] < F12_OBJECT_BYTES) {
+		say("synaptics: touches: F12 has no finger data (data register %u)\n", F12_DATA_FINGERS);
+		return false;
+	}
+	finger_slots = f12_data.size[F12_DATA_FINGERS] / F12_OBJECT_BYTES;
+	if (fingers_at + finger_slots * F12_OBJECT_BYTES > 255) {
+		say("synaptics: touches: the fingers end past 255 bytes from F12's data: not read\n");
+		return false;
+	}
+	say("synaptics: F12: %u fingers at data +%d (%u subpackets)\n", finger_slots, fingers_at,
+	    f12_data.subpackets[F12_DATA_FINGERS]);
+	tuning = reg_offset(&f12_control, F12_CTRL_SENSOR_TUNING);
+	if (tuning >= 0 && f12_control.size[F12_CTRL_SENSOR_TUNING] >= 4 && tuning + 4 <= 255) {
+		uint8_t t[4];
+
+		/* (the sensor's largest x and y when its subpacket 0 is there; this one's firmware reads 0s) */
+		if (regs_read((uint8_t)(f12.control + tuning), t, sizeof(t))) {
+			say("synaptics: F12: control %u reads %02x %02x %02x %02x\n", F12_CTRL_SENSOR_TUNING, t[0], t[1], t[2], t[3]);
+		}
+	}
+
+	if (!regs_read(f01.control, &ctrl0, 1) || !regs_read((uint8_t)(f01.control + F01_CTRL_IRQ_ENABLE), mask, irq_bytes)) {
+		say("synaptics: touches: F01's controls do not read\n");
+		return false;
+	}
+	say("synaptics: F01: control 0x%02x, interrupts enabled 0x%02x as found; F01's are bits %u.., F12's %u..%u\n",
+	    ctrl0, mask[0], f01.first_irq, f12.first_irq, f12.first_irq + f12.irqs - 1);
+	for (unsigned i = 0; i < f01.irqs; i++) {
+		mask[(f01.first_irq + i) / 8] |= (uint8_t)(1u << ((f01.first_irq + i) % 8));
+	}
+	for (unsigned i = 0; i < f12.irqs; i++) {
+		mask[(f12.first_irq + i) / 8] |= (uint8_t)(1u << ((f12.first_irq + i) % 8));
+	}
+	if (!reg_write((uint8_t)(f01.control + F01_CTRL_IRQ_ENABLE), mask[0])) {
+		return false;
+	}
+	ctrl0 = (uint8_t)((ctrl0 & ~F01_CTRL0_SLEEP_MASK) | F01_CTRL0_NOSLEEP | F01_CTRL0_CONFIGURED);
+	if (!reg_write(f01.control, ctrl0)) {
+		return false;
+	}
+	(void)regs_read((uint8_t)(f01.data + F01_DATA_IRQ_STATUS), mask, irq_bytes);   /* what was pending: cleared */
+	if (!regs_read(f01.data, &status, 1)) {
+		return false;
+	}
+	say("synaptics: F01: configured (control 0x%02x), status now 0x%02x; the interrupt pin reads %u\n", ctrl0, status,
+	    level_of(PIN_INT));
+	return true;
+}
+
+static unsigned touch_lines, touch_lines_dropped, interrupts, reports;
+static uint64_t watch_started;
+
+static void
+touch_log(const char *format, ...) __printflike(1, 2);
+
+static void
+touch_log(const char *format, ...)
+{
+	char line[200];
+	va_list list;
+
+	if (touch_lines >= TOUCH_LINES_MOST) {
+		touch_lines_dropped++;
+		return;
+	}
+	touch_lines++;
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	say("%s", line);
+}
+
+/* until the run's end: each time the pin goes low, what is pending, and the fingers if F12 has news */
+static void
+touch_watch(void)
+{
+	uint8_t data[256], kind[16] = { 0 };
+	uint16_t last_x[16] = { 0 }, last_y[16] = { 0 };
+	unsigned idle_lows = 0, slots = finger_slots < 16 ? finger_slots : 16;
+	uint64_t now, next_quiet_check;
+	uint32_t f12_bits = ((1u << f12.irqs) - 1) << f12.first_irq;
+
+	watch_started = mach_absolute_time();
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &next_quiet_check);
+	next_quiet_check += watch_started;
+	say("synaptics: watching for touches -- touch the screen\n");
+	while (!leaving) {
+		uint8_t pending = 0;
+		bool low = !level_of(PIN_INT);
+
+		now = mach_absolute_time();
+		if (!low && now < next_quiet_check) {
+			wait_ms(5);
+			continue;
+		}
+		if (!low) {
+			/* once a second with the pin high: is anything pending anyway (a pin that does not say)? */
+			nanoseconds_to_absolutetime(NSEC_PER_SEC, &next_quiet_check);
+			next_quiet_check += now;
+		}
+		if (leaving || !regs_read((uint8_t)(f01.data + F01_DATA_IRQ_STATUS), &pending, 1)) {
+			break;
+		}
+		if (pending == 0) {
+			if (low && ++idle_lows == 20) {
+				say("synaptics: the interrupt pin is low with nothing pending (20 times)\n");
+			}
+			wait_ms(5);
+			continue;
+		}
+		interrupts++;
+		if (!low) {
+			touch_log("synaptics: 0x%02x pending with the interrupt pin high\n", pending);
+		}
+		if (pending & ~f12_bits) {
+			uint8_t status = 0;
+
+			(void)regs_read(f01.data, &status, 1);
+			touch_log("synaptics: interrupt 0x%02x, F01 status 0x%02x\n", pending, status);
+		}
+		if (!(pending & f12_bits)) {
+			continue;
+		}
+		if (leaving || !regs_read(f12.data, data, (unsigned)fingers_at + slots * F12_OBJECT_BYTES)) {
+			break;
+		}
+		reports++;
+		for (unsigned f = 0; f < slots; f++) {
+			const uint8_t *o = data + fingers_at + f * F12_OBJECT_BYTES;
+			uint16_t x = (uint16_t)(o[1] | o[2] << 8), y = (uint16_t)(o[3] | o[4] << 8);
+			int dx = x - last_x[f], dy = y - last_y[f];
+
+			if (o[0] != kind[f]) {
+				if (o[0] == 0) {
+					touch_log("synaptics: finger %u up at %u,%u\n", f, last_x[f], last_y[f]);
+				} else {
+					touch_log("synaptics: finger %u down (type %u) at %u,%u, z %u, width %u x %u\n", f, o[0], x, y,
+					    o[5], o[6], o[7]);
+				}
+			} else if (o[0] != 0 && (dx * dx + dy * dy >= 40 * 40)) {
+				touch_log("synaptics: finger %u at %u,%u, z %u\n", f, x, y, o[5]);
+			} else {
+				continue;
+			}
+			kind[f] = o[0];
+			if (o[0] != 0) {
+				last_x[f] = x;
+				last_y[f] = y;
+			}
+		}
+	}
 }
 
 /* ---- the 3.0 V (RPMh, as in hakios.goodix.c) ------------------------------------------------------ */
@@ -644,7 +953,8 @@ static void
 synaptics_thread(__unused void *arg, __unused wait_result_t wr)
 {
 	map_pins();
-	say("synaptics: level %u: %s\n", level, level == 1 ? "a look" : "powered and probed, the chip only read");
+	say("synaptics: level %u: %s\n", level,
+	    level == 1 ? "a look" : level == 2 ? "powered and probed, the chip only read" : "powered, configured, touches read");
 	show_pins("as found");
 	if (!chip_answers() && level >= 2) {
 		power_up();
@@ -658,6 +968,9 @@ synaptics_thread(__unused void *arg, __unused wait_result_t wr)
 		read_pdt();
 		read_identity();
 		say("synaptics: the interrupt pin reads %u\n", level_of(PIN_INT));
+		if (level >= 3 && touch_setup()) {
+			touch_watch();
+		}
 	}
 	say("synaptics: done\n");
 	thread_terminate(current_thread());
@@ -671,8 +984,8 @@ hakios_synaptics_init(void)
 	if (!PE_parse_boot_argn("synaptics", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (level > 2) {
-		level = 2;
+	if (level > 3) {
+		level = 3;
 	}
 	if (kernel_thread_start(synaptics_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
@@ -689,6 +1002,14 @@ hakios_synaptics_quiesce(void)
 		wr(GPIO_CFG(PIN_RESET), found_cfg[1]);
 		wr(GPIO_IO(PIN_1V8), found_io[0] & 2);
 		wr(GPIO_CFG(PIN_1V8), found_cfg[0]);
+		if (watch_started != 0) {
+			uint64_t ns;
+
+			/* (the watching thread does not get to say it: the run ends under it) */
+			absolutetime_to_nanoseconds(mach_absolute_time() - watch_started, &ns);
+			say("synaptics: %llu s watched: %u interrupts, %u finger reports, %u lines logged, %u not\n",
+			    ns / NSEC_PER_SEC, interrupts, reports, touch_lines, touch_lines_dropped);
+		}
 		say("synaptics: at the run's end: gpio%u and gpio%u as they were found\n", PIN_RESET, PIN_1V8);
 		if (avdd != 0) {
 			uint32_t address = avdd + VRM_ENABLE, off = 0;
