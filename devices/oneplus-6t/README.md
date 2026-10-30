@@ -282,6 +282,10 @@ as touch waits out UEFI; then the AOP's message RAM at `0xc300000` reads "MAIL",
 (`0x2d8` bytes), and link and channel open with every acknowledgement, the doorbell being the APCS's bit 0. The system
 starts on to the home screen as before. Step 7 (RPMh, TrustZone) waits the same way.
 
+Step 4 works as it is (run 202443): TrustZone takes the header of image 1 (`0x42000201`, the signature checked) and
+the place, 26 MB at `0x8c500000` (`0x42000202`), both answering 0. The mailbox, opened by the run before, is found
+open.
+
 **11. Then** Wi-Fi; cellular last.
 
 ## Firmware
