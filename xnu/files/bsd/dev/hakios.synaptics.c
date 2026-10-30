@@ -24,10 +24,11 @@
  *                 RMI4 page description tables read, and F01's identity and status. The chip's
  *                 registers are only read: the one write is the page select (0xff), which RMI4 needs
  *                 to read past page 0.
- *   synaptics=3   ... and then touches read until the run's end, logged and handed to /dev/hakios-touch:
+ *   synaptics=3   ... and then touches read until the run's end and handed to /dev/hakios-touch:
  *                 F01 told the chip is configured (so it reports), F12's register descriptors read for
  *                 where the fingers are, and the interrupt pin (low = something to say) watched every
  *                 5 ms. The chip reports the screen's own pixels (corners seen: 63..1048, 25..2330).
+ *                 The touches themselves are not logged; how many there were is, at the run's end.
  *
  * At the run's end (and on a panic's way out) the two pins this changes are put back as they were and
  * the 3.0 V is switched off again.
@@ -453,7 +454,7 @@ read_identity(void)
 #define F12_OBJECT_BYTES        8       /* type, x (2), y (2), z, width x, width y */
 #define F12_CTRL_SENSOR_TUNING  8
 #define F12_DATA_FINGERS        1
-#define TOUCH_LINES_MOST        2000    /* lines of touches logged at most */
+#define OTHER_IRQS_SHOWN        10      /* interrupts of functions other than F12 logged at most */
 #define SCREEN_WIDTH            1080    /* the panel's pixels, which are F12's units */
 #define SCREEN_HEIGHT           2340
 #define QUIET_CHECK_MS          50      /* with the pin high, a look at what is pending anyway this often */
@@ -640,35 +641,14 @@ touch_setup(void)
 	return true;
 }
 
-static unsigned touch_lines, touch_lines_dropped, interrupts, reports;
+static unsigned interrupts, reports, touches, pin_high, other_irqs;
 static uint64_t watch_started;
-
-static void
-touch_log(const char *format, ...) __printflike(1, 2);
-
-static void
-touch_log(const char *format, ...)
-{
-	char line[200];
-	va_list list;
-
-	if (touch_lines >= TOUCH_LINES_MOST) {
-		touch_lines_dropped++;
-		return;
-	}
-	touch_lines++;
-	va_start(list, format);
-	vsnprintf(line, sizeof(line), format, list);
-	va_end(list);
-	say("%s", line);
-}
 
 /* until the run's end: each time the pin goes low, what is pending, and the fingers if F12 has news */
 static void
 touch_watch(void)
 {
 	uint8_t data[256], kind[16] = { 0 };
-	uint16_t last_x[16] = { 0 }, last_y[16] = { 0 };
 	uint32_t posted_x[16] = { 0 }, posted_y[16] = { 0 };
 	unsigned idle_lows = 0, slots = finger_slots < 16 ? finger_slots : 16;
 	uint64_t now, next_quiet_check;
@@ -704,13 +684,13 @@ touch_watch(void)
 		}
 		interrupts++;
 		if (!low) {
-			touch_log("synaptics: 0x%02x pending with the interrupt pin high\n", pending);
+			pin_high++;
 		}
-		if (pending & ~f12_bits) {
+		if ((pending & ~f12_bits) && other_irqs++ < OTHER_IRQS_SHOWN) {
 			uint8_t status = 0;
 
 			(void)regs_read(f01.data, &status, 1);
-			touch_log("synaptics: interrupt 0x%02x, F01 status 0x%02x\n", pending, status);
+			say("synaptics: interrupt 0x%02x, F01 status 0x%02x\n", pending, status);
 		}
 		if (!(pending & f12_bits)) {
 			continue;
@@ -722,12 +702,12 @@ touch_watch(void)
 		for (unsigned f = 0; f < slots; f++) {
 			const uint8_t *o = data + fingers_at + f * F12_OBJECT_BYTES;
 			uint16_t x = (uint16_t)(o[1] | o[2] << 8), y = (uint16_t)(o[3] | o[4] << 8);
-			int dx = x - last_x[f], dy = y - last_y[f];
 			uint32_t sx = x >= SCREEN_WIDTH - 1 ? 65535 : x * 65535u / (SCREEN_WIDTH - 1);
 			uint32_t sy = y >= SCREEN_HEIGHT - 1 ? 65535 : y * 65535u / (SCREEN_HEIGHT - 1);
 
 			if (o[0] != 0 && kind[f] == 0) {
 				hakios_touch_post(HAKIOS_TOUCH_DOWN, f, sx, sy);
+				touches++;
 			} else if (o[0] != 0 && (sx != posted_x[f] || sy != posted_y[f])) {
 				hakios_touch_post(HAKIOS_TOUCH_MOVE, f, sx, sy);
 			} else if (o[0] == 0 && kind[f] != 0) {
@@ -737,23 +717,7 @@ touch_watch(void)
 				posted_x[f] = sx;
 				posted_y[f] = sy;
 			}
-			if (o[0] != kind[f]) {
-				if (o[0] == 0) {
-					touch_log("synaptics: finger %u up at %u,%u\n", f, last_x[f], last_y[f]);
-				} else {
-					touch_log("synaptics: finger %u down (type %u) at %u,%u, z %u, width %u x %u\n", f, o[0], x, y,
-					    o[5], o[6], o[7]);
-				}
-			} else if (o[0] != 0 && (dx * dx + dy * dy >= 40 * 40)) {
-				touch_log("synaptics: finger %u at %u,%u, z %u\n", f, x, y, o[5]);
-			} else {
-				continue;
-			}
 			kind[f] = o[0];
-			if (o[0] != 0) {
-				last_x[f] = x;
-				last_y[f] = y;
-			}
 		}
 	}
 }
@@ -1025,8 +989,8 @@ hakios_synaptics_quiesce(void)
 
 			/* (the watching thread does not get to say it: the run ends under it) */
 			absolutetime_to_nanoseconds(mach_absolute_time() - watch_started, &ns);
-			say("synaptics: %llu s watched: %u interrupts, %u finger reports, %u lines logged, %u not\n",
-			    ns / NSEC_PER_SEC, interrupts, reports, touch_lines, touch_lines_dropped);
+			say("synaptics: %llu s watched: %u touches, %u finger reports, %u interrupts (%u found with the pin high, "
+			    "%u of other functions)\n", ns / NSEC_PER_SEC, touches, reports, interrupts, pin_high, other_irqs);
 		}
 		say("synaptics: at the run's end: gpio%u and gpio%u as they were found\n", PIN_RESET, PIN_1V8);
 		if (avdd != 0) {
