@@ -298,6 +298,13 @@ static char out_buf[2 * 1024 * 1024];
 static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
 static const char *staged_data = out_buf;   /* what "upload" sends: normally the log in out_buf */
 static uint64_t staged_len;
+/*
+ * Not 0: out_buf holds the log of a kernel that has returned, after the loader's, and is that long. An
+ * "oem log" between the return and the next run stages it again instead of composing the loader's log
+ * alone, which lost the kernel's (XL_FOLLOW asks "oem log" while it waits). Its memory is not read again:
+ * the next upload may have overwritten it.
+ */
+static uint64_t returned_log_len;
 
 static void
 compose_logs(const char *klog, uint64_t klog_len)
@@ -320,6 +327,7 @@ compose_logs(const char *klog, uint64_t klog_len)
 		n += sizeof(end) - 1;
 	}
 	staged_len = n;
+	returned_log_len = klog != NULL ? n : 0;
 }
 
 static int hc_list_is_uefis(void);
@@ -3966,6 +3974,7 @@ fb_command(char *cmd)
 			set_result("running", cp, 0);
 			fb_reply("OKAY", "");
 			log_len = 0;
+			returned_log_len = 0;
 			print("== XNULOADER run (usb) ==\n");
 			if (!run_kernel(have_cp, cp)) {
 				set_result("not-started", 0, 0);
@@ -3990,6 +3999,9 @@ fb_command(char *cmd)
 			}
 			if (busy) {
 				compose_live_log(running_live, running_slide);
+			} else if (returned_log_len != 0) {
+				staged_data = out_buf;
+				staged_len = returned_log_len;
 			} else {
 				compose_logs(NULL, 0);
 			}
