@@ -331,6 +331,9 @@ struct smem_item {
 #define ITEM_SMP2P_OURS         429
 #define ITEM_SMP2P_THEIRS       443
 #define ITEM_CRASH_REASON       423
+#define ITEM_GLINK_DESCRIPTOR   478
+#define ITEM_GLINK_OUR_QUEUE    479
+#define ITEM_GLINK_THEIR_QUEUE  480
 
 static const volatile uint8_t *smem;
 static unsigned long smem_phys = SMEM_PHYS_DEFAULT;     /* soc_smem */
@@ -1631,20 +1634,23 @@ static struct block smem_lock = { "shared memory's lock", 0x01f43000, 0x1000 };
 #define LOCK_OWNER              0x000
 #define LOCK_US                 1u
 
-/* Our item made in the partition, as Linux's qcom_smem_alloc_private() makes one (hakios.wifi.c: our_item_make()). */
+/*
+ * An item of that many bytes made in the partition, as Linux's qcom_smem_alloc_private() makes one
+ * (hakios.wifi.c: our_item_make()), under the shared memory's hardware lock.
+ */
 static bool
-our_item_make(uint32_t partition)
+item_make(uint32_t partition, uint32_t item, uint32_t bytes)
 {
 	struct smem_partition header;
 	struct smem_entry entry;
-	const uint32_t item_size = (sizeof(struct smp2p) + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
+	const uint32_t item_size = (bytes + 7) & ~7u, need_bytes = sizeof(entry) + item_size;
 	uint32_t owner = ~0u, at;
 	bool made = false;
 
 	lck_mtx_lock(&hakios_smem_alloc_lock);         /* (the Wi-Fi's start allocates under the same hardware lock) */
 	need(&smem_lock);
 	printf("adsp: %u: about to take the lock (%#x), write an entry for item %u with %u bytes behind it at the partition's mark, "
-	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, ITEM_SMP2P_OURS, item_size, need_bytes);
+	    "move the mark by %u, and release the lock\n", step, smem_lock.phys + LOCK_OWNER, item, item_size, need_bytes);
 	snprintf(last_write, sizeof(last_write), "step %u took the shared memory's lock", step);
 	for (uint32_t ms = 0; ms <= 1000; ms++) {
 		wr(smem_lock.base + LOCK_OWNER, LOCK_US);
@@ -1665,7 +1671,7 @@ our_item_make(uint32_t partition)
 		goto out;
 	}
 	for (at = sizeof(header); at < header.free_uncached;) {
-		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == ITEM_SMP2P_OURS ||
+		if (!smem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != SMEM_CANARY || entry.item == item ||
 		    entry.size > header.size) {
 			break;
 		}
@@ -1680,9 +1686,9 @@ our_item_make(uint32_t partition)
 		printf("adsp: %u: no room: %u bytes wanted, %u free: nothing is written\n", step, need_bytes, header.free_cached - at);
 		goto out;
 	}
-	smem_poke(partition + at, SMEM_CANARY | ITEM_SMP2P_OURS << 16);
+	smem_poke(partition + at, SMEM_CANARY | item << 16);
 	smem_poke(partition + at + 4, item_size);
-	smem_poke(partition + at + 8, item_size - (uint32_t)sizeof(struct smp2p));
+	smem_poke(partition + at + 8, item_size - bytes);
 	smem_poke(partition + at + 12, 0);
 	settle();
 	smem_poke(partition + __offsetof(struct smem_partition, free_uncached), at + need_bytes);
@@ -1696,6 +1702,46 @@ out:
 }
 
 static void glink_reset(void);
+
+/*
+ * GLINK's descriptor (478: the four marks of the two queues) and our queue (479), which we write and
+ * the DSP reads. On redwood the boot loader has made them before the kernel starts; on the OnePlus 6T
+ * the partition is empty, and they are made here before the DSP starts, as Linux's
+ * qcom_glink_smem_register() makes them: 32 bytes and 16 KB, zeroed. (The DSP's own queue, 480, the
+ * DSP makes.)
+ */
+#define GLINK_DESCRIPTOR_SIZE   32
+#define GLINK_OUR_QUEUE_SIZE    0x4000
+
+static bool
+glink_items_make(uint32_t partition)
+{
+	static const struct { uint32_t item, bytes; } items[2] = {
+		{ ITEM_GLINK_DESCRIPTOR, GLINK_DESCRIPTOR_SIZE }, { ITEM_GLINK_OUR_QUEUE, GLINK_OUR_QUEUE_SIZE },
+	};
+
+	for (unsigned i = 0; i < 2; i++) {
+		uint32_t size = 0, at = smem_item(items[i].item, &size);
+
+		if (at != 0) {
+			continue;
+		}
+		if (!item_make(partition, items[i].item, items[i].bytes)) {
+			return false;
+		}
+		at = smem_item(items[i].item, &size);
+		if (at == 0 || size != items[i].bytes) {
+			printf("adsp: %u: GLINK'S ITEM %u IS NOT FOUND as it was just made (%#x, %u bytes)\n", step, items[i].item, at, size);
+			return false;
+		}
+		for (uint32_t word = 0; word < size; word += 4) {
+			smem_poke(at + word, 0);
+		}
+		settle();
+		printf("adsp: %u: GLINK's item %u made, %u bytes at %#lx, zeroed\n", step, items[i].item, size, smem_phys + at);
+	}
+	return true;
+}
 
 static bool
 step_our_item(void)
@@ -1715,7 +1761,7 @@ step_our_item(void)
 		printf("adsp: %u: item %u is there, at %#lx: a kernel before this one made it, and it is used again\n", step,
 		    ITEM_SMP2P_OURS, smem_phys + our_item);
 	} else {
-		if (!our_item_make(partition)) {
+		if (!item_make(partition, ITEM_SMP2P_OURS, sizeof(struct smp2p))) {
 			return false;
 		}
 		our_item = our_item_find();
@@ -1749,6 +1795,9 @@ step_our_item(void)
 		return false;
 	}
 	show_words("our item reads back", &ours);
+	if (!glink_items_make(partition)) {
+		return false;
+	}
 	glink_reset();
 	return true;
 }
@@ -1896,9 +1945,6 @@ step_start(void)
 
 /* ---- GLINK (hakios.wifi.c; items 478 to 480 of our partition with the audio DSP) ------------------- */
 
-#define ITEM_GLINK_DESCRIPTOR   478
-#define ITEM_GLINK_OUR_QUEUE    479
-#define ITEM_GLINK_THEIR_QUEUE  480
 #define GLINK_OUR_TAIL          0
 #define GLINK_OUR_HEAD          4
 #define GLINK_THEIR_TAIL        8
@@ -3347,7 +3393,7 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
  * seconds (25) from this driver's start: the loader's core runs UEFI's own work for a run's first 24 s
  * (xnuloader's NOTE_SECONDS), as hakios.synaptics.c waits for too.
  */
-#define PORTED_APCS             5
+#define PORTED_APCS             6
 
 static void
 soc_override(void)
