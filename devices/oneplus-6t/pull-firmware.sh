@@ -8,6 +8,13 @@
 # the PMI8998's own haptics block and needs no firmware; the cameras are not ported yet. Each set is
 # listed on the phone (adb shell ls) rather than counted here, because the number of .bNN segments
 # differs between firmware versions.
+#
+# Without root, OxygenOS does not let adb read /vendor/firmware_mnt ("Permission denied"). The loader
+# reads the same files off the flash instead: the modem partition of the active slot (b on the 6T here)
+# is a FAT16 file system of 120 MB, whose image/ directory is /vendor/firmware_mnt/image:
+#   ./xl flash-read modem_b 0 7800000 modem_b.img && 7z x -omodem_b modem_b.img
+# then adsp.* to fw-audio/, wlanmdsp.mbn to fw-wifi/, mba.mbn and modem.* to fw-modem/ and image/ whole to
+# fw-modem/image/. The speaker amplifier's container is readable as it is: /vendor/etc/firmware/tfa98xx.cnt.
 set -e
 cd "$(dirname "$0")/../.."
 pull() { # DIR PATTERN...  (patterns are expanded on the phone; nothing found is told, not fatal)

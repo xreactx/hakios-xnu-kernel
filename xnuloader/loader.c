@@ -4135,6 +4135,54 @@ fb_command(char *cmd)
 			if (PLAT->usb_old_driver) {
 				print("download: %x of %x\n", got, total);
 			}
+		} else if (starts_with(cmd, "oem flash-read ")) {
+			/*
+			 * "oem flash-read NAME OFFSET SIZE" (hexadecimal; both whole blocks): SIZE bytes of partition
+			 * NAME from OFFSET, read into the payload's area (which the next run's download overwrites)
+			 * and staged for "upload" (fastboot get_staged). Only reads: the phone's own firmware off its
+			 * flash, which its Android does not let us read without root. Answered first, then read (the
+			 * OnePlus 6's USB driver drops a reply sent after long work); a missing partition, a range
+			 * outside it or a failed read leaves nothing staged, and "upload" then sends 0 bytes.
+			 */
+			char name[37];
+			const char *c = cmd + 15;
+			unsigned k = 0;
+			uint64_t offset, size, bs;
+			efi_block_io *bio;
+			efi_status s;
+
+			while (*c != 0 && *c != ' ' && k < sizeof(name) - 1) {
+				name[k++] = *c++;
+			}
+			name[k] = 0;
+			while (*c == ' ') {
+				c++;
+			}
+			offset = parse_number(c, 16);
+			while (*c != 0 && *c != ' ') {
+				c++;
+			}
+			while (*c == ' ') {
+				c++;
+			}
+			size = parse_number(c, 16);
+			staged_data = (const char *)PAYLOAD_BASE;
+			staged_len = 0;
+			fb_reply("OKAY", "");
+			bio = k == 0 ? NULL : find_partition(name);
+			bs = bio == NULL ? 0 : bio->media->block_size;
+			if (bs == 0 || size == 0 || size > PAYLOAD_MAX_SIZE || offset % bs != 0 || size % bs != 0 ||
+			    offset + size > (bio->media->last_block + 1) * bs) {
+				print("flash-read: %s: no such partition, or the range is not whole blocks inside it\n", name);
+				return;
+			}
+			s = bio->read_blocks(bio, bio->media->media_id, offset / bs, size, (void *)PAYLOAD_BASE);
+			if (EFI_ERROR(s)) {
+				print("flash-read: ReadBlocks %x at %x\n", s, offset);
+				return;
+			}
+			staged_len = size;
+			print("flash-read: %x bytes from %x\n", size, offset);
 		} else if (starts_with(cmd, "upload")) {
 			uint64_t sent = 0;
 			fb_reply_data(staged_len);
