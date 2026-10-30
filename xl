@@ -193,6 +193,29 @@ run() { # run <oem command> <label>
 		return 2
 	fi
 	fetch_log "$log"
+	# The OnePlus 6's USB driver may drop a long upload part-way ("usb: no completion for a send in 1 s:
+	# aborted" in the loader's log), and what came then is the beginning: the loader's lines without the
+	# kernel's. A log the kernel returned ends with "== END OF LOG ==": without it, asked for again (the
+	# loader stages it anew), twice; then read from the log partition, where the loader has written it.
+	case "$result" in
+	*returned*)
+		local tries=0 bytes
+		while ! grep -q "== END OF LOG ==" "$log" 2>/dev/null && [ $tries -lt 2 ]; do
+			tries=$((tries + 1))
+			echo "xl: the log came back short ($(stat -c %s "$log" 2>/dev/null || echo 0) bytes, no end): asking again"
+			sleep 1
+			fb oem log >/dev/null && fetch_log "$log"
+		done
+		if ! grep -q "== END OF LOG ==" "$log" 2>/dev/null; then
+			bytes=$(sed -n 's/^log: \([0-9]*\) bytes written to logdump.*/\1/p' "$log" 2>/dev/null | sort -n | tail -1)
+			if [ -n "$bytes" ] && [ "$bytes" -gt 0 ] && flash_read logdump 0 "$(printf %x "$bytes")" "$log.dump" >/dev/null; then
+				tr -d '\0' < "$log.dump" > "$log" && rm -f "$log.dump"
+				echo "xl: the log read from the log partition instead ($bytes bytes)$(grep -q '== END OF LOG ==' "$log" || echo ', AND IT HAS NO END EITHER')"
+			else
+				echo "xl: THE LOG IS SHORT, and the log partition could not be read either"
+			fi
+		fi ;;
+	esac
 	ln -sf "$(basename "$log")" logs/last.log
 	echo "$result  [$log]"
 	case "$result" in
