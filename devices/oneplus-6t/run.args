@@ -3,4 +3,5 @@
 cpus=8          # all eight cores: small 0-3 (Kryo 385 Silver), big 4-7 (Kryo 385 Gold)
 bootcpu=7       # the kernel on the biggest core; the loader watches from core 0, so a kernel that hangs still gets its log out
 soc_vtimer=19   # the SDM845's virtual timer interrupt (PPI 3, intid 19); without it the kernel waits for a timer that never comes
+cpufreq_osm=2   # the cores' clocks raised (bsd/dev/hakios.cpufreq.c): big 825 -> 2400 MHz, small 1612 -> 1766; the home screen in 32 s, not 70
 synaptics=3     # the touch screen (bsd/dev/hakios.synaptics.c): powered, configured, touches to SpringBoard
