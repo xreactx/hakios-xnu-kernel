@@ -1,7 +1,8 @@
 /*
  * The buttons of the POCO X5 Pro (redwood) -- power, volume up, volume down -- as a source of
  * button records for /dev/hakios-touch (sys/hakios.input.h). Only with boot-arg buttons=1:
- * every address below belongs to this phone.
+ * every address below belongs to this phone. buttons=2 is the OnePlus 6T's (fajita) instead; the
+ * differences are said at "the phones" below.
  *
  * None of the three is a pin of the SoC. They are inputs of two of the power management chips:
  *   power        KPDPWR_N of the power-on block ("PON") of the PMK8350
@@ -37,6 +38,13 @@
  *   3  ask each peripheral what it is                   (the first transfers on the bus)
  *   4  read how the keys' inputs are set up, and what they say now
  *   5  watch them                                       (the default)
+ *
+ * The OnePlus 6T (buttons=2): the SoC (SDM845) has the same arbiter at the same addresses, and all
+ * three keys are on one PMIC, the PM8998 (slave 0): power KPDPWR_N and volume down RESIN_N of its
+ * power-on block (an older kind, 0x800, the keys in bits 0 and 1), volume up its GPIO6 (0xc500),
+ * pulled up. Volume down is the PM8998's GPIO5 (0xc400), pulled up as well: the phone's device tree
+ * names both it and RESIN_N, and a hand pressing the key moved GPIO5 alone. RESIN_N is still read
+ * (with power, in the same register) and logged, not reported.
  *
  * Register layouts: Linux drivers/spmi/spmi-pmic-arb.c (arbiter version 5),
  * drivers/input/misc/pm8941-pwrkey.c (the "pmk8350" kind), drivers/pinctrl/qcom/pinctrl-spmi-gpio.c,
@@ -151,6 +159,7 @@ struct peripheral {
 };
 static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
 static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
+static struct peripheral pin2 = { .name = "GPIO5 of the PM8998" };                               /* the 6T's other volume down */
 
 /* How the reads have gone: said once a minute. */
 static struct {
@@ -248,13 +257,19 @@ find_channel(struct peripheral *p, uint32_t channels)
 /* the power-on block, of the kind that is split in two ("generation 3"): this is its half for the operating system */
 #define PON_TYPE                0x01
 #define PON_SUBTYPE_HLOS        0x09
-#define PON_KPDPWR              0x80            /* in the status and in the interrupt registers */
-#define PON_RESIN               0x40
+/* ... and the older kinds (1 to 5: primary, secondary, one register, generation 2), the PM8998's */
+#define PON_SUBTYPE_OLD_FROM    0x01
+#define PON_SUBTYPE_OLD_TO      0x05
+/* the keys in the status and in the interrupt registers (set from the phone's layout) */
+static uint8_t pon_kpdpwr = 0x80, pon_resin = 0x40, pon_subtype_from = PON_SUBTYPE_HLOS, pon_subtype_to = PON_SUBTYPE_HLOS;
 
 /* a GPIO of the low or medium voltage kind */
 #define GPIO_TYPE               0x10
 #define GPIO_SUBTYPE_LV         0x10
 #define GPIO_SUBTYPE_MV_VIN3    0x13            /* 0x10 to 0x13: one layout */
+/* ... or of the older kinds (4 or 8 channels, 0x01 to 0x0d: the PM8998's), where the mode is [6:4] */
+#define GPIO_SUBTYPE_OLD_FROM   0x01
+#define GPIO_SUBTYPE_OLD_TO     0x0d
 #define GPIO_LEVEL              0x01            /* in the status */
 #define GPIO_REG_MODE           0x40            /* [1:0]: 0 input, 1 output, 2 both, 3 analog */
 #define GPIO_REG_SUPPLY         0x41
@@ -275,7 +290,8 @@ static struct button {
 	uint32_t        presses;
 } power = { .name = "power", .record = HAKIOS_BUTTON_LOCK },
     volume_up = { .name = "volume up", .record = HAKIOS_BUTTON_VOLUME_UP },
-    volume_down = { .name = "volume down", .record = HAKIOS_BUTTON_VOLUME_DOWN };
+    volume_down = { .name = "volume down", .record = HAKIOS_BUTTON_VOLUME_DOWN },
+    volume_down2 = { .name = "volume down (GPIO5)", .record = 0 };      /* the 6T's (record 0: logged, not reported) */
 
 /* "12.345 s (08:13:05.918 UTC)": since boot as in the log's own stamps, and as the daemons' lines have it */
 static void
@@ -322,7 +338,9 @@ button_look(struct button *b, bool pressed)
 		absolutetime_to_nanoseconds(now - b->since, &held);
 		printf("buttons: %s released at %s, after %llu ms\n", b->name, when, held / NSEC_PER_MSEC);
 	}
-	hakios_touch_post(pressed ? HAKIOS_BUTTON_DOWN : HAKIOS_BUTTON_UP, b->record, 0, 0);
+	if (b->record != 0) {
+		hakios_touch_post(pressed ? HAKIOS_BUTTON_DOWN : HAKIOS_BUTTON_UP, b->record, 0, 0);
+	}
 }
 
 /* One look at both peripherals. */
@@ -336,8 +354,8 @@ buttons_poll(void)
 	if (power.usable || volume_down.usable) {
 		problem = spmi_read(&pon, REG_RT_STATUS, &status, 1);
 		if (problem == NULL) {
-			button_look(&power, status & PON_KPDPWR);
-			button_look(&volume_down, status & PON_RESIN);
+			button_look(&power, status & pon_kpdpwr);
+			button_look(&volume_down, status & pon_resin);
 		} else if (said < 8) {
 			said++;
 			printf("buttons: reading %s: %s\n", pon.name, problem);
@@ -352,9 +370,20 @@ buttons_poll(void)
 			printf("buttons: reading %s: %s\n", pin.name, problem);
 		}
 	}
+	if (volume_down2.usable) {
+		problem = spmi_read(&pin2, REG_RT_STATUS, &status, 1);
+		if (problem == NULL) {
+			button_look(&volume_down2, !(status & GPIO_LEVEL));
+		} else if (said < 8) {
+			said++;
+			printf("buttons: reading %s: %s\n", pin2.name, problem);
+		}
+	}
 }
 
 /* Step 3: is each peripheral what the registers above are those of? */
+static uint8_t identified_subtype;
+
 static bool
 identify(const struct peripheral *p, uint8_t type, uint8_t subtype_from, uint8_t subtype_to)
 {
@@ -371,6 +400,7 @@ identify(const struct peripheral *p, uint8_t type, uint8_t subtype_from, uint8_t
 		return false;
 	}
 	printf("buttons: %s says type %#x, subtype %#x (the read took %llu us)\n", p->name, is[0], is[1], bus.last_ns / 1000);
+	identified_subtype = is[1];
 	if (is[0] != type || is[1] < subtype_from || is[1] > subtype_to) {
 		printf("buttons: ... which is not what this driver knows (type %#x, subtype %#x to %#x): left alone\n", type,
 		    subtype_from, subtype_to);
@@ -386,7 +416,8 @@ pon_inputs(void)
 	const char *problem;
 	uint8_t r[8], more[2];
 
-	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x1310 to 0x1319)\n", pon.name);
+	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x%02x10 to 0x%02x19)\n", pon.name,
+	    pon.id & 0xff, pon.id & 0xff);
 	problem = spmi_read(&pon, REG_RT_STATUS, r, 8);
 	if (problem == NULL) {
 		problem = spmi_read(&pon, REG_INT_LATCHED, more, 2);
@@ -396,54 +427,56 @@ pon_inputs(void)
 		return;
 	}
 	printf("buttons: power-on block: status %#x (power %s, volume down %s); interrupts: edge %#x, high %#x, low %#x, "
-	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released",
-	    (r[0] & PON_RESIN) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
+	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & pon_kpdpwr) ? "HELD" : "released",
+	    (r[0] & pon_resin) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
 	    r[REG_INT_POLARITY_LOW - REG_RT_STATUS], r[REG_INT_ENABLED - REG_RT_STATUS], more[0], more[1]);
 	power.usable = volume_down.usable = true;
-	power.last = r[0] & PON_KPDPWR;
-	volume_down.last = r[0] & PON_RESIN;
+	power.last = r[0] & pon_kpdpwr;
+	volume_down.last = r[0] & pon_resin;
 }
 
-/* Step 4 for the pin: it is volume up only if it is an input with a pull-up, and switched on. */
+/* Step 4 for a pin: it is a key only if it is an input with a pull-up, and switched on. */
 static void
-pin_input(void)
+pin_input(const struct peripheral *p, uint8_t subtype, struct button *b)
 {
 	const char *problem;
 	uint8_t c[8], status = 0;
 	unsigned mode, pull;
 
-	printf("buttons: next: read the setup and the level of %s (registers 0x8d40 to 0x8d47, 0x8d10)\n", pin.name);
-	problem = spmi_read(&pin, GPIO_REG_MODE, c, 8);
+	printf("buttons: next: read the setup and the level of %s (registers 0x%02x40 to 0x%02x47, 0x%02x10)\n", p->name,
+	    p->id & 0xff, p->id & 0xff, p->id & 0xff);
+	problem = spmi_read(p, GPIO_REG_MODE, c, 8);
 	if (problem == NULL) {
-		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
+		problem = spmi_read(p, REG_RT_STATUS, &status, 1);
 	}
 	if (problem != NULL) {
-		printf("buttons: %s: %s\n", pin.name, problem);
+		printf("buttons: %s: %s\n", p->name, problem);
 		return;
 	}
-	mode = c[0] & 3;
+	mode = subtype < GPIO_SUBTYPE_LV ? (c[0] >> 4) & 7 : c[0] & 3;
 	pull = c[GPIO_REG_PULL - GPIO_REG_MODE] & 7;
-	printf("buttons: volume up's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
-	    "%02x %02x; level %s\n", mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
+	printf("buttons: %s's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
+	    "%02x %02x; level %s\n", b->name, mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
 	    c[GPIO_REG_SUPPLY - GPIO_REG_MODE] & 7, pull, pull < 4 ? "up" : pull == 4 ? "down" : "none",
 	    (c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80) ? "enabled" : "DISABLED", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
 	    (status & GPIO_LEVEL) ? "high (released)" : "LOW (held)");
 	if (mode != 0 || pull >= 4 || !(c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80)) {
-		printf("buttons: volume up's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
-		    "which this driver does not do: volume up is left alone\n");
+		printf("buttons: %s's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
+		    "which this driver does not do: %s is left alone\n", b->name, b->name);
 		return;
 	}
-	volume_up.usable = true;
-	volume_up.last = !(status & GPIO_LEVEL);
+	b->usable = true;
+	b->last = !(status & GPIO_LEVEL);
 }
 
 static void
 say_summary(void)
 {
 	printf("buttons: so far %u presses of power, %u of volume up, %u of volume down; now%s%s%s%s; %llu reads of the bus, "
-	    "%llu us each (the longest %llu), %llu failed\n", power.presses, volume_up.presses, volume_down.presses,
-	    power.down ? " power" : "", volume_up.down ? " volume-up" : "", volume_down.down ? " volume-down" : "",
-	    (power.down || volume_up.down || volume_down.down) ? " held" : " none held", bus.reads,
+	    "%llu us each (the longest %llu), %llu failed\n", power.presses, volume_up.presses,
+	    volume_down.presses + volume_down2.presses, power.down ? " power" : "", volume_up.down ? " volume-up" : "",
+	    (volume_down.down || volume_down2.down) ? " volume-down" : "",
+	    (power.down || volume_up.down || volume_down.down || volume_down2.down) ? " held" : " none held", bus.reads,
 	    bus.reads ? bus.total_ns / bus.reads / 1000 : 0, bus.longest_ns / 1000, bus.failed);
 }
 
@@ -451,7 +484,8 @@ static void
 buttons_thread(void *parameter, __unused wait_result_t result)
 {
 	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, channels;
-	bool pon_known, pin_known;
+	bool pon_known, pin_known, pin2_known = false;
+	uint8_t pin_subtype, pin2_subtype = 0;
 
 	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
 	    ARB_OBSERVER_PHYS);
@@ -475,13 +509,21 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	printf("buttons: step 2: look through the arbiter's table for the channels of the two peripherals\n");
 	find_channel(&pon, channels);
 	find_channel(&pin, channels);
+	if (pin2.id != 0) {
+		find_channel(&pin2, channels);
+	}
 	if (steps < 3) {
 		goto out;
 	}
 
 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
-	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
-	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
+	pon_known = identify(&pon, PON_TYPE, pon_subtype_from, pon_subtype_to);
+	pin_known = identify(&pin, GPIO_TYPE, pin2.id != 0 ? GPIO_SUBTYPE_OLD_FROM : GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
+	pin_subtype = identified_subtype;
+	if (pin2.id != 0) {
+		pin2_known = identify(&pin2, GPIO_TYPE, GPIO_SUBTYPE_OLD_FROM, GPIO_SUBTYPE_MV_VIN3);
+		pin2_subtype = identified_subtype;
+	}
 	if (steps < 4) {
 		goto out;
 	}
@@ -491,7 +533,10 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 		pon_inputs();
 	}
 	if (pin_known) {
-		pin_input();
+		pin_input(&pin, pin_subtype, &volume_up);
+	}
+	if (pin2_known) {
+		pin_input(&pin2, pin2_subtype, &volume_down2);
 	}
 	if (!power.usable && !volume_up.usable) {
 		printf("buttons: nothing that can be read: no buttons\n");
@@ -506,6 +551,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	power.live = power.usable && !power.last;
 	volume_down.live = volume_down.usable && !volume_down.last;
 	volume_up.live = volume_up.usable && !volume_up.last;
+	volume_down2.live = volume_down2.usable && !volume_down2.last;
 	if (steps < 5) {
 		goto out;
 	}
@@ -548,6 +594,21 @@ hakios_buttons_init(void)
 	}
 	if (!enabled) {
 		return;
+	}
+	/* the phones: 1 redwood (as above), 2 the OnePlus 6T */
+	if (enabled == 2) {
+		pon = (struct peripheral){ .name = "the PM8998's power-on block", .id = 0x008 };     /* registers 0x800 of slave 0 */
+		pin = (struct peripheral){ .name = "GPIO6 of the PM8998", .id = 0x0c5 };             /* registers 0xc500 */
+		pin2 = (struct peripheral){ .name = "GPIO5 of the PM8998", .id = 0x0c4 };            /* registers 0xc400 */
+		pon_kpdpwr = 0x01;
+		pon_resin = 0x02;
+		pon_subtype_from = PON_SUBTYPE_OLD_FROM;
+		pon_subtype_to = PON_SUBTYPE_OLD_TO;
+		/* volume down is GPIO5 here; RESIN_N, which nothing was seen to press, only logged */
+		volume_down.name = "RESIN_N";
+		volume_down.record = 0;
+		volume_down2.name = "volume down";
+		volume_down2.record = HAKIOS_BUTTON_VOLUME_DOWN;
 	}
 	PE_parse_boot_argn("buttons_steps", &steps, sizeof(steps));
 	if (steps == 0) {
