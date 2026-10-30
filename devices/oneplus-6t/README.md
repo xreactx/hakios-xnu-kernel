@@ -333,12 +333,13 @@ What `hakios.sound.c` needs instead of redwood's numbers (its first TDM, a group
 |---|---|---|
 | interface, port | quaternary MI2S, AFE port `0x1006` (QUAT_MI2S_RX), no group; configured by AFE's I2S parameter (`0x1020d`) | primary TDM, port `0x9000` in group `0x9100` |
 | lines | playback on SD1 (`qcom,msm-mi2s-rx-lines = 2`), the amplifier's feedback on SD0 (`tx-lines = 1`) | |
-| bit clock | QUAD_MI2S_IBIT (`0x106`), 48 kHz x 16 bits x 2 = 1.536 MHz (the SDM845 back end's default, as Linux's `sdm845.c` sets it) | PRI_TDM_IBIT (`0x200`), 3.072 MHz |
+| bit clock | QUAD_MI2S_IBIT (`0x106`), 48 kHz x 32-bit slots x 2 = 3.072 MHz for 24 bits (below) | PRI_TDM_IBIT (`0x200`), 3.072 MHz |
 | pins | GPIO 58 bit clock, 59 frame sync (output high), 60 SD0, 61 SD1: function 1 (`qua_mi2s`), 8 mA, no pull; north tile (`0x3400000 + 0x500000`, a page each) | GPIO 97-100, function 1 |
 | the DSP's view of our memory | SMMU stream `0x1821` (mask `0xf`: bit 32 of its addresses, as redwood's `0x1801`) | `0x1801` |
 
-The format (16 bits) is the back end's default; Android's `audio_platform_info*.xml` may say otherwise, to be read on the
-phone. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
+The format: Android's `/vendor/etc/audio_platform_info.xml` gives the speaker `bit_width="24"`, which its audio HAL
+applies to the speaker's back end -- so 24 bits in 32-bit slots, and the I2S parameter's bit width 24, rather than the
+back end's default of 16 (1.536 MHz). Not yet seen on the running phone: `/proc/asound` needs root (the Magisk image). The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
 
 **11. Then** Wi-Fi; cellular last.
 
