@@ -62,6 +62,12 @@
  *     (topology 0x10312), two channels, 24 bits, 48 kHz; the stream: ASM session 1, stream 1,
  *     opened for writing linear PCM of 16 bits, no processing (0x10c68), routed to that path
  *
+ * Another phone's speaker port is given by boot-args over these (soc_sound_port, soc_sound_clock,
+ * soc_sound_bits, soc_audio_stream): the OnePlus 6T's is its quaternary MI2S, QUAT_MI2S_RX 0x1006, no
+ * group, the AFE's I2S parameter instead (SD1, stereo, 24 bits, our clocks), clock 0x106 at 3.072 MHz,
+ * GPIO 58 to 61, stream 0x1821 (devices/oneplus-6t/README.md, step 10). Its amplifier is not redwood's:
+ * there, sound=1 and sound=2 only.
+ *
  * What is started is stopped, and what is written is put back, when the time is over -- or, if
  * the DSP is to be shut down earlier (the run's end), before that (hakios_sound_dsp_down()).
  * The amplifiers are powered down on a panic's way out (hakios_sound_quiesce()).
@@ -200,40 +206,87 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 	wr(b->base + offset, value);
 }
 
-/* ---- the TDM pins ------------------------------------------------------------------------------------- */
+/* ---- the interface's pins ------------------------------------------------------------------------- */
 
-static struct block tlmm = { "pin controller", 0x0f100000, 0x100000 };
-#define GPIO_CFG(n)             (0x1000u * (n))         /* [1:0] pull, [5:2] function, [8:6] drive (mA / 2 - 1), [9] output */
-#define GPIO_IO(n)              (0x1000u * (n) + 4)     /* bit 0 in, bit 1 out */
-#define CFG_MI2S0               (1u << 2)
+/*
+ * Each pin's two registers are its own 4 KB page of the pin controller (TLMM), mapped one at a time:
+ * the SDM845's controller is three tiles over 12 MB, which may not be mapped whole (hakios.synaptics.c).
+ */
+#define REDWOOD_TLMM            0x0f100000u
+#define SDM845_TLMM_NORTH       (0x03400000u + 0x500000u)       /* Linux pinctrl-sdm845.c: GPIO 58 to 61 are the north tile's */
+#define GPIO_CFG_AT             0                       /* [1:0] pull, [5:2] function, [8:6] drive (mA / 2 - 1), [9] output */
+#define GPIO_IO_AT              4                       /* bit 0 in, bit 1 out */
+#define CFG_FUNCTION_1          (1u << 2)               /* mi2s0 on redwood, qua_mi2s on the SDM845 */
 #define CFG_8MA                 (3u << 6)
 #define CFG_OUTPUT              (1u << 9)
 
-static const struct {
+struct pin {
 	unsigned pin;
+	uint32_t page;
 	const char *name;
 	uint32_t cfg, io;               /* Android's active state */
-} tdm_pins[] = {
-	{ 97, "gpio97 (bit clock)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
-	{ 100, "gpio100 (frame sync)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
-	{ 98, "gpio98 (data in)", CFG_MI2S0 | CFG_8MA, 0 },
-	{ 99, "gpio99 (data out)", CFG_MI2S0 | CFG_8MA, 0 },
 };
-#define TDM_PINS                (sizeof(tdm_pins) / sizeof(tdm_pins[0]))
-static uint32_t found_cfg[TDM_PINS], found_io[TDM_PINS];
+
+static const struct pin redwood_pins[] = {
+	{ 97, REDWOOD_TLMM + 0x1000u * 97, "gpio97 (bit clock)", CFG_FUNCTION_1 | CFG_8MA | CFG_OUTPUT, 2 },
+	{ 100, REDWOOD_TLMM + 0x1000u * 100, "gpio100 (frame sync)", CFG_FUNCTION_1 | CFG_8MA | CFG_OUTPUT, 2 },
+	{ 98, REDWOOD_TLMM + 0x1000u * 98, "gpio98 (data in)", CFG_FUNCTION_1 | CFG_8MA, 0 },
+	{ 99, REDWOOD_TLMM + 0x1000u * 99, "gpio99 (data out)", CFG_FUNCTION_1 | CFG_8MA, 0 },
+};
+
+/*
+ * The OnePlus 6T's quaternary MI2S (soc_sound_port=0x1006): its tree's quat_mi2s_active (58 and 59,
+ * output high), quat_mi2s_sd0_active and quat_mi2s_sd1_active, all function qua_mi2s, 8 mA, no pull.
+ * SD1 carries the playback to the amplifier (qcom,msm-mi2s-rx-lines = 2), SD0 its feedback (tx-lines = 1).
+ */
+static const struct pin quat_mi2s_pins[] = {
+	{ 58, SDM845_TLMM_NORTH + 0x1000u * 58, "gpio58 (bit clock)", CFG_FUNCTION_1 | CFG_8MA | CFG_OUTPUT, 2 },
+	{ 59, SDM845_TLMM_NORTH + 0x1000u * 59, "gpio59 (frame sync)", CFG_FUNCTION_1 | CFG_8MA | CFG_OUTPUT, 2 },
+	{ 60, SDM845_TLMM_NORTH + 0x1000u * 60, "gpio60 (SD0, the amplifier's feedback)", CFG_FUNCTION_1 | CFG_8MA, 0 },
+	{ 61, SDM845_TLMM_NORTH + 0x1000u * 61, "gpio61 (SD1, to the amplifier)", CFG_FUNCTION_1 | CFG_8MA, 0 },
+};
+#define PINS                    4
+static const struct pin *pins = redwood_pins;
+static vm_offset_t pin_page[PINS];
+static uint32_t found_cfg[PINS], found_io[PINS];
 static bool pins_taken;
+
+static uint32_t
+pin_get(unsigned i, uint32_t at)
+{
+	uint32_t value;
+
+	if (pin_page[i] == 0) {
+		pin_page[i] = ml_io_map(pins[i].page, 0x1000);
+	}
+	value = rd(pin_page[i] + at);
+	printf("sound: %s %s (%#x) = %#x\n", pins[i].name, at == GPIO_CFG_AT ? "configuration" : "level", pins[i].page + at, value);
+	return value;
+}
+
+static void
+pin_put(unsigned i, uint32_t at, uint32_t value)
+{
+	if (pin_page[i] == 0) {
+		pin_page[i] = ml_io_map(pins[i].page, 0x1000);
+	}
+	printf("sound: about to write %s %s at %#x: %#x\n", pins[i].name, at == GPIO_CFG_AT ? "configuration" : "level",
+	    pins[i].page + at, value);
+	snprintf(last_write, sizeof(last_write), "wrote %#x to %s at %#x", value, pins[i].name, pins[i].page + at);
+	wr(pin_page[i] + at, value);
+}
 
 static void
 pins_on(void)
 {
-	for (unsigned i = 0; i < TDM_PINS; i++) {
-		found_cfg[i] = get(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin));
-		found_io[i] = get(&tlmm, tdm_pins[i].name, GPIO_IO(tdm_pins[i].pin));
+	for (unsigned i = 0; i < PINS; i++) {
+		found_cfg[i] = pin_get(i, GPIO_CFG_AT);
+		found_io[i] = pin_get(i, GPIO_IO_AT);
 	}
 	pins_taken = true;
-	for (unsigned i = 0; i < TDM_PINS; i++) {
-		put(&tlmm, tdm_pins[i].name, GPIO_IO(tdm_pins[i].pin), tdm_pins[i].io);
-		put(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin), tdm_pins[i].cfg);
+	for (unsigned i = 0; i < PINS; i++) {
+		pin_put(i, GPIO_IO_AT, pins[i].io);
+		pin_put(i, GPIO_CFG_AT, pins[i].cfg);
 	}
 }
 
@@ -243,30 +296,30 @@ pins_off(void)
 	if (!pins_taken) {
 		return;
 	}
-	for (unsigned i = 0; i < TDM_PINS; i++) {
-		put(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin), found_cfg[i]);
-		put(&tlmm, tdm_pins[i].name, GPIO_IO(tdm_pins[i].pin), found_io[i] & 2);
-		get(&tlmm, tdm_pins[i].name, GPIO_CFG(tdm_pins[i].pin));
+	for (unsigned i = 0; i < PINS; i++) {
+		pin_put(i, GPIO_CFG_AT, found_cfg[i]);
+		pin_put(i, GPIO_IO_AT, found_io[i] & 2);
+		pin_get(i, GPIO_CFG_AT);
 	}
 	pins_taken = false;
 }
 
 /* Whether a pin toggles: read many times as fast as it goes. */
 static void
-pin_activity(unsigned pin, const char *name, uint32_t *changes, uint32_t *ones)
+pin_activity(unsigned i, uint32_t *changes, uint32_t *ones)
 {
-	uint32_t last = rd(tlmm.base + GPIO_IO(pin)) & 1, reads = 20000;
+	uint32_t last = rd(pin_page[i] + GPIO_IO_AT) & 1, reads = 20000;
 	uint64_t began = now_us();
 
 	*changes = *ones = 0;
-	for (uint32_t i = 0; i < reads; i++) {
-		uint32_t now = rd(tlmm.base + GPIO_IO(pin)) & 1;
+	for (uint32_t r = 0; r < reads; r++) {
+		uint32_t now = rd(pin_page[i] + GPIO_IO_AT) & 1;
 
 		*changes += now != last;
 		*ones += now;
 		last = now;
 	}
-	say("sound: %s: %u changes and %u ones in %u reads (%llu us)\n", name, *changes, *ones, reads, now_us() - began);
+	say("sound: %s: %u changes and %u ones in %u reads (%llu us)\n", pins[i].name, *changes, *ones, reads, now_us() - began);
 }
 
 /* ---- APR ------------------------------------------------------------------------------------------- */
@@ -337,6 +390,11 @@ command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const
 
 #define PORT                    0x9000          /* PRI_TDM_RX_0 */
 #define GROUP                   0x9100          /* PRI_TDM_RX */
+#define AFE_PARAM_ID_I2S_CONFIG 0x0001020du
+#define I2S_SD1                 2               /* (AFE_PORT_I2S_SD0 is 1) */
+#define I2S_STEREO              1
+#define I2S_WS_INTERNAL         1               /* we drive the bit clock and the frame sync (qcom,msm-mi2s-master) */
+#define CLOCK_COUPLE_NO         1
 #define GROUP_OTHER_PORT        0x9002
 #define PORT_INVALID            0xffff
 #define CLOCK_PRI_TDM_IBIT      0x200
@@ -345,6 +403,22 @@ command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const
 #define SLOTS                   2
 #define SLOT_BITS               32
 #define PORT_BITS               32              /* the mixer path's S32_LE */
+
+/*
+ * Another phone's port (soc_sound_port, soc_sound_clock, soc_sound_bits): one in 0x1000 to 0x10ff is an
+ * MI2S port, which is no TDM group's: it is told its lines and its width (AFE's I2S parameter) and
+ * started. The OnePlus 6T plays its speaker through QUAT_MI2S_RX, 0x1006, clock QUAD_MI2S_IBIT (0x106),
+ * 24 bits (Android's audio_platform_info.xml) in slots of 32: 48 kHz x 32 x 2 = 3.072 MHz.
+ */
+static uint32_t port = PORT, clock_id = CLOCK_PRI_TDM_IBIT, port_bits = PORT_BITS;
+static bool mi2s;
+
+struct afe_i2s {
+	uint32_t version;
+	uint16_t bits, lines, stereo, ws_source;
+	uint32_t rate;
+	uint16_t data_format, reserved;
+} __attribute__((packed));
 
 struct afe_param {
 	uint32_t module, param;
@@ -408,7 +482,7 @@ afe_port_param(const char *what, uint32_t module, uint32_t param, const void *da
 	struct afe_param *p = (struct afe_param *)(packet + 16);
 
 	bzero(packet, sizeof(packet));
-	*(uint16_t *)packet = PORT;
+	*(uint16_t *)packet = (uint16_t)port;
 	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
 	p->module = module;
 	p->param = param;
@@ -422,10 +496,12 @@ static bool clock_on, group_on, port_on;
 static bool
 afe_clock(bool on)
 {
-	struct afe_clock_set clock = { 1, CLOCK_PRI_TDM_IBIT, RATE * SLOT_BITS * SLOTS, CLOCK_INVERT_COUPLE_NO, 0, on };
+	uint32_t slot_bits = mi2s ? (port_bits > 16 ? 32 : 16) : SLOT_BITS;
+	struct afe_clock_set clock = { 1, clock_id, RATE * slot_bits * 2, mi2s ? CLOCK_COUPLE_NO : CLOCK_INVERT_COUPLE_NO, 0, on };
+	char what[80];
 
-	return afe_service_param(on ? "the TDM bit clock (0x200) at 3.072 MHz, on" : "the TDM bit clock, off", AFE_MODULE_CLOCK_SET,
-	           AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
+	snprintf(what, sizeof(what), on ? "the bit clock (%#x) at %u Hz, on" : "the bit clock (%#x), off", clock_id, clock.hz);
+	return afe_service_param(what, AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
 }
 
 static bool
@@ -443,8 +519,25 @@ afe_on(void)
 	};
 	struct afe_slot_mapping mapping = { .version = 1, .channels = 2, .bits = PORT_BITS, .align = 0,
 		                            .offsets = { 0, 4, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
-	uint16_t start[2] = { PORT, 0 };
+	uint16_t start[2] = { (uint16_t)port, 0 };
 
+	if (mi2s) {
+		struct afe_i2s i2s = { .version = 1, .bits = (uint16_t)port_bits, .lines = I2S_SD1, .stereo = I2S_STEREO,
+			               .ws_source = I2S_WS_INTERNAL, .rate = RATE, .data_format = 0 };
+		char what[120];
+
+		announce("the DSP is asked for the MI2S interface's bit clock, the port's lines and width, and its start (AFE)");
+		clock_on = afe_clock(true);
+		if (!clock_on) {
+			return false;
+		}
+		snprintf(what, sizeof(what), "the port %#x: I2S on SD1, stereo, %u bits at 48 kHz, our clocks", port, port_bits);
+		if (!afe_port_param(what, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_I2S_CONFIG, &i2s, sizeof(i2s))) {
+			return false;
+		}
+		port_on = command("the port, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+		return port_on;
+	}
 	announce("the DSP is asked for the TDM interface's bit clock, the group, the port and its start (AFE)");
 	clock_on = afe_clock(true);
 	if (!clock_on) {
@@ -470,11 +563,11 @@ afe_on(void)
 static void
 afe_off(void)
 {
-	uint16_t stop[2] = { PORT, 0 };
+	uint16_t stop[2] = { (uint16_t)port, 0 };
 	struct afe_group_enable disable = { GROUP, 0 };
 
 	if (port_on) {
-		command("the port 0x9000, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
+		command("the port, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
 		port_on = false;
 	}
 	if (group_on) {
@@ -525,9 +618,11 @@ static struct block apps_smmu_context = { "apps smmu, the audio context", 0, 0x1
 #define PTE_ADDRESS             0x0000fffffffff000ull
 #define AUDIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)       /* as hakios.wifi.c's */
 
-#define AUDIO_STREAM            0x1801
+#define AUDIO_STREAM_DEFAULT    0x1801          /* soc_audio_stream: the OnePlus 6T's is 0x1821 */
+static uint32_t audio_stream = AUDIO_STREAM_DEFAULT;
+#define AUDIO_STREAM            audio_stream
 #define AUDIO_ADDRESSES         0x10000000ull   /* dt: qcom,iommu-dma-addr-pool of qcom,msm-audio-ion */
-#define AUDIO_STREAM_BITS       (1ull << 32)    /* the stream's low bits (0x1801 & 0xf), where the DSP takes them from */
+#define AUDIO_STREAM_BITS       ((uint64_t)(audio_stream & 0xf) << 32)  /* the stream's low bits, where the DSP takes them from */
 
 #define PERIODS                 8
 #define PERIOD_FRAMES           960             /* 20 ms */
@@ -557,9 +652,10 @@ space_find(void)
 	}
 	space.page = idr1 >> 31 ? 0x10000 : 0x1000;
 	space.pages = 2u << (idr1 >> 28 & 7);
-	if (2 * space.pages * space.page != 0x100000) {
-		say("sound: the SMMU says it has 2 x %u pages of %#x bytes, not a megabyte: its contexts are not looked for\n",
-		    space.pages, space.page);
+	/* (redwood's: 2 x 128 pages of 4 KB, a megabyte; the SDM845's: 2 x 64, 512 KB -- the contexts follow the global half) */
+	if (2 * space.pages * space.page != 0x100000 && 2 * space.pages * space.page != 0x80000) {
+		say("sound: the SMMU says it has 2 x %u pages of %#x bytes, neither a megabyte nor 512 KB: its contexts are not looked "
+		    "for\n", space.pages, space.page);
 		return false;
 	}
 	space.match = ~0u;
@@ -858,7 +954,7 @@ stream_on(void)
 		uint16_t channels, bits;
 		uint32_t rate;
 		uint8_t map[8];
-	} __attribute__((packed)) open = { 0, ADM_PATH_PLAYBACK, PORT, 0xffff, ADM_TOPOLOGY_NONE, 2, ADM_BITS, RATE,
+	} __attribute__((packed)) open = { 0, ADM_PATH_PLAYBACK, (uint16_t)port, 0xffff, ADM_TOPOLOGY_NONE, 2, ADM_BITS, RATE,
 		                           { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
 	struct {
 		uint32_t matrix, sessions;
@@ -888,7 +984,7 @@ stream_on(void)
 	mapped = true;
 	map_handle = answer.words[0];
 	say("sound: our %u KB at %#llx are the DSP's handle %#x\n", BUFFER_BYTES / 1024, buffer_address, map_handle);
-	if (!command("a device path to the port: playback, no processing, 2 channels of 24 bits at 48 kHz", APR_SVC_ADM, PORT,
+	if (!command("a device path to the port: playback, no processing, 2 channels of 24 bits at 48 kHz", APR_SVC_ADM, (uint16_t)port,
 	    ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &answer)) {
 		return false;
 	}
@@ -1372,7 +1468,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	if (level == 4) {
 		say("sound: level 4: what iOS plays, through the port, a stream and the amplifiers, until the run ends\n");
 	} else {
-		say("sound: level %u: %s, for %u s\n", level, level == 1 ? "the speakers' TDM port" : level == 2 ?
+		say("sound: level %u: %s, for %u s\n", level, level == 1 ? "the speakers' port" : level == 2 ?
 		    "the port and a stream with a test tone, the amplifiers off" :
 		    "the port, a stream with a test tone, and the amplifiers", seconds);
 	}
@@ -1394,16 +1490,16 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		ok = false;
 		hakios_adsp_apr_events(events);
 	}
-	announce("the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
+	announce("the interface's pins to it, as Android's active state has them");
 	pins_on();
 	if (!afe_on()) {
 		goto out;
 	}
 	sleep_ms(20);
-	pin_activity(97, "the bit clock (gpio97)", &changes, &ones);
-	pin_activity(100, "the frame sync (gpio100)", &sync_changes, &sync_ones);
-	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE TDM CLOCK AND FRAME SYNC RUN at the pins" :
-	    "THE PINS DO NOT SHOW A RUNNING TDM CLOCK");
+	pin_activity(0, &changes, &ones);
+	pin_activity(1, &sync_changes, &sync_ones);
+	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE BIT CLOCK AND FRAME SYNC RUN at the pins" :
+	    "THE PINS DO NOT SHOW A RUNNING BIT CLOCK");
 	if (level == 1) {
 		sleep_ms(seconds * 1000);
 		ok = true;
@@ -1481,6 +1577,20 @@ hakios_sound_dsp_up(void)
 	}
 	if (level > 4) {
 		level = 4;
+	}
+	PE_parse_boot_argn("soc_sound_port", &port, sizeof(port));
+	PE_parse_boot_argn("soc_sound_clock", &clock_id, sizeof(clock_id));
+	PE_parse_boot_argn("soc_sound_bits", &port_bits, sizeof(port_bits));
+	PE_parse_boot_argn("soc_audio_stream", &audio_stream, sizeof(audio_stream));
+	mi2s = port >= 0x1000 && port <= 0x10ff;
+	if (mi2s) {
+		pins = quat_mi2s_pins;          /* (the only MI2S port there is so far: the OnePlus 6T's speaker) */
+		say("sound: another phone's port: MI2S %#x, clock %#x, %u bits; SMMU stream %#x\n", port, clock_id, port_bits,
+		    audio_stream);
+		if (level > 2) {
+			say("sound: sound=%u needs redwood's amplifiers, which this phone has not: sound=2 is done, not more\n", level);
+			level = 2;
+		}
 	}
 	PE_parse_boot_argn("sound_secs", &seconds, sizeof(seconds));
 	PE_parse_boot_argn("sound_below", &below, sizeof(below));

@@ -3463,7 +3463,7 @@ hakios_adsp_init(void)
 	init_us = now_us();
 	PE_parse_boot_argn("adsp_after", &adsp_after, sizeof(adsp_after));
 	soc_override();
-	if (apcs_ipc != 0 && (last_step == 0 || last_step > PORTED_APCS)) {
+	if (apcs_ipc != 0 && PORTED_APCS < STEPS && (last_step == 0 || last_step > PORTED_APCS)) {
 		printf("adsp: on this SoC (no IPCC) only steps 1 to %u have been ported; adsp_step=%u is done, not more\n", PORTED_APCS,
 		    PORTED_APCS);
 		last_step = PORTED_APCS;
