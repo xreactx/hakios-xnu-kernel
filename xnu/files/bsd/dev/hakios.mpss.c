@@ -1166,14 +1166,20 @@ mss_clocks_on(bool active)
 			put(&gcc, c->name, c->enable, was | 1u << c->bit);
 			mss_clock_ours[i] = true;
 		}
-		sleep_us(10);
 		if (c->status != 0) {
 			uint32_t status = rd(gcc.base + c->status);
+			/* (a voted branch's status may lag behind: polled for up to a millisecond, as Linux's clk-branch polls) */
+			bool voted = c->enable == GCC_VOTE || c->enable == 0x8a154 || c->enable == 0x8a004;
 
-			printf("mpss: %u: clock %s: %s (%#x)%s\n", step, c->name, status & CBCR_OFF ? "STILL OFF" : "runs", status,
-			    mss_clock_ours[i] ? "" : ", found on");
-			all = all && !(status & CBCR_OFF);
+			for (int t = 0; t < 100 && (status & CBCR_OFF); t++) {
+				sleep_us(10);
+				status = rd(gcc.base + c->status);
+			}
+			printf("mpss: %u: clock %s: %s (%#x)%s\n", step, c->name, !(status & CBCR_OFF) ? "runs" : voted ?
+			    "says off after 1 ms (a voted branch: going on)" : "STILL OFF", status, mss_clock_ours[i] ? "" : ", found on");
+			all = all && (!(status & CBCR_OFF) || voted);
 		} else {
+			sleep_us(10);
 			printf("mpss: %u: clock %s: asked for (a tap: no status)%s\n", step, c->name, mss_clock_ours[i] ? "" : ", found on");
 		}
 	}
@@ -2480,7 +2486,8 @@ ipa_space_on(void)
 	contexts = idr1 & 0xff;
 	ipa_space.page = idr1 >> 31 ? 0x10000 : 0x1000;
 	ipa_space.pages = 2u << (idr1 >> 28 & 7);
-	if ((scr0 & 1u << 3) || 2 * ipa_space.pages * ipa_space.page != 0x100000) {
+	if ((scr0 & 1u << 3) || (2 * ipa_space.pages * ipa_space.page != 0x100000 && 2 * ipa_space.pages * ipa_space.page != 0x80000) ||
+	    (idr1 & 0xff) > ipa_space.pages) {        /* (the SDM845's is 0x80000: 64 pages, 45 contexts) */
 		lck_mtx_unlock(&hakios_smmu_lock);
 		printf("mpss: ipa: the SMMU is not of the shape this knows (scr0 %#x, idr1 %#x)\n", scr0, idr1);
 		return false;
@@ -2665,8 +2672,11 @@ ipa_firmware_load(void)
 		printf("mpss: %u: the IPA's clock and buses are on; its firmware is the modem's to load on this SoC\n", step);
 		return true;
 	}
-	if (!option("modem_ipa_smmu_off") && mba_memory == 0) {
-		ipa_space_on();         /* (redwood's streams; the 6T's IPA, 3.5.1, has its own, not done here) */
+	if (!option("modem_ipa_smmu_off") && !ipa_space_on() && apcs_ipc != 0) {
+		/* (its streams through a context of ours: the SDM845's SMMU faults streams it does not know, and the 6T, its
+		 * GSI firmware started with them unmapped, reset into a crash dump before the modem was started -- 31 October) */
+		printf("mpss: %u: the IPA's streams are not mapped: its firmware is not started\n", step);
+		return false;
 	}
 	{
 		/* the IPA's firmware file is SoC-specific (dt: qcom,firmware-name of qcom,ipa_fws; "yupik_ipa_fws"
@@ -7219,6 +7229,11 @@ soc_override(void)
 	PE_parse_boot_argn("soc_mba_mem", &mba_memory, sizeof(mba_memory));
 	PE_parse_boot_argn("soc_mba_mem_size", &mba_memory_size, sizeof(mba_memory_size));
 	PE_parse_boot_argn("soc_imem", &ipa_imem, sizeof(ipa_imem));
+	if (apcs_ipc != 0) {
+		/* (the SDM845: Linux's sdm845.dtsi, iommus of ipa = <&apps_smmu 0x720 0>, <&apps_smmu 0x722 0>; the 6T's tree the same) */
+		ipa_stream = 0x720;
+		ipa_stream_uc = 0x722;
+	}
 	PE_parse_boot_argn("soc_ipa_stream", &ipa_stream, sizeof(ipa_stream));
 	PE_parse_boot_argn("soc_ipa_stream_uc", &ipa_stream_uc, sizeof(ipa_stream_uc));
 	PE_parse_boot_argn("soc_pas_mpss", &pas_mpss, sizeof(pas_mpss));
