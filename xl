@@ -153,13 +153,25 @@ run() { # run <oem command> <label>
 		# The phone's own boot-args (devices/$DEVICE/run.args: words, # to the line's end a comment),
 		# each one unless XL_CMDLINE already has it by name
 		local device_args=devices/${DEVICE:-poco-x5-pro}/run.args a
+		# (XL_DROP="NAME ...": those of them left out altogether -- e.g. the speaker's soc_sound_* while sound=0)
 		if [ -f "$device_args" ]; then
 			for a in $(sed 's/#.*//' "$device_args"); do
 				case " $args " in
 				*" ${a%%=*}="*|*" $a "*) ;;
-				*) args="$args $a" ;;
+				*) case " ${XL_DROP:-} " in *" ${a%%=*} "*) ;; *) args="$args $a" ;; esac ;;
 				esac
 			done
+		fi
+		# XNU's boot-args hold 607 characters (BOOT_LINE_LENGTH 608), and the loader cuts the line there without
+		# a word: on 31 October that cut soc_apcs_ipc=0x1799000c in the middle, the audio DSP rang a doorbell at
+		# 0x179, and the phone reset into a crash dump four times. The loader puts up to 84 of its own in front
+		# (debug=0x8 serial=3, rd=md0, cpus=1, hv_wdt_pet=1, battery_shared_pa=...): a line that may not fit is refused.
+		local line="loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args"
+		if [ $(( ${#line} + 84 )) -gt 607 ]; then
+			echo "xl: the command line is ${#line} characters, and the loader adds up to 84: more than XNU's 607." >&2
+			echo "xl: it would lose: ${line:$(( 607 - 84 ))}" >&2
+			echo "xl: leave out what this run does not need (XL_DROP=\"NAME ...\" for devices/${DEVICE:-poco-x5-pro}/run.args)" >&2
+			return 1
 		fi
 		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
 		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
