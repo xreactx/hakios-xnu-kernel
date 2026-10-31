@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             21
+#define PORTED_A630             22
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -3805,7 +3805,7 @@ step_core_commands(void)
 #define EVENT_FLUSH_COLOR       0x1d
 #define EVENT_CACHE_FLUSH       0x04
 #define TARGET_WIDTH            1080
-#define TARGET_HEIGHT           2400
+#define TARGET_HEIGHT           (a630 ? 2340u : 2400u)  /* the 6T's panel: 1080x2340 */
 #define TARGET_ROW              4352            /* 1088 pixels: the next multiple of 64 bytes */
 
 extern void MiniIOMobileFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t row_bytes);
@@ -3882,10 +3882,12 @@ step_frame(void)
 	printf("adreno: %u: the picture's first pixel is %02x %02x %02x %02x (blue green red alpha; told: 00 80 ff ff), one in "
 	    "the middle %02x %02x %02x %02x, one in the last row %02x %02x %02x %02x\n", step, pixel[0], pixel[1], pixel[2],
 	    pixel[3], pixel[1200 * TARGET_ROW + 2160], pixel[1200 * TARGET_ROW + 2161], pixel[1200 * TARGET_ROW + 2162],
-	    pixel[1200 * TARGET_ROW + 2163], pixel[2399 * TARGET_ROW + 4316], pixel[2399 * TARGET_ROW + 4317],
-	    pixel[2399 * TARGET_ROW + 4318], pixel[2399 * TARGET_ROW + 4319]);
-	if ((pixel[0] | pixel[1] | pixel[2]) == 0 || pixel[1200 * TARGET_ROW + 2160] == 0 || (pixel[2399 * TARGET_ROW + 4316] |
-	    pixel[2399 * TARGET_ROW + 4317] | pixel[2399 * TARGET_ROW + 4318]) == 0) {
+	    pixel[1200 * TARGET_ROW + 2163], pixel[(TARGET_HEIGHT - 1) * TARGET_ROW + 4316],
+	    pixel[(TARGET_HEIGHT - 1) * TARGET_ROW + 4317], pixel[(TARGET_HEIGHT - 1) * TARGET_ROW + 4318],
+	    pixel[(TARGET_HEIGHT - 1) * TARGET_ROW + 4319]);
+	if ((pixel[0] | pixel[1] | pixel[2]) == 0 || pixel[1200 * TARGET_ROW + 2160] == 0 ||
+	    (pixel[(TARGET_HEIGHT - 1) * TARGET_ROW + 4316] | pixel[(TARGET_HEIGHT - 1) * TARGET_ROW + 4317] |
+	    pixel[(TARGET_HEIGHT - 1) * TARGET_ROW + 4318]) == 0) {
 		printf("adreno: %u: the picture is not what the 3D core was told to draw\n", step);
 		return false;
 	}
@@ -4137,7 +4139,7 @@ hakios_adreno_quiesce(void)
  * far it has got (a "fence": a submission's number, written by the core when it is through
  * with it). The caller holds one lock around all of these.
  */
-#define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
+#define GPU_CHIP_ID             (a630 ? 0x06030001ull : 0x06030500ull)  /* dt: qcom,chipid */
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
@@ -4226,8 +4228,10 @@ bool
 hakios_gpu_parameter(uint32_t which, uint64_t *value)
 {
 	switch (which) {
+	case 0x06:                              /* GMEM_BASE: the a630's at 1 MB (Linux's uche_gmem_base), the a660's at 0 */
+		*value = a630 ? 0x100000 : 0;
+		return true;
 	case 0x01:                              /* GPU_ID: none, the chip ID says it */
-	case 0x06:                              /* GMEM_BASE */
 	case 0x08:                              /* PP_PGTABLE */
 	case 0x09:                              /* FAULTS */
 	case 0x0a:                              /* SUSPENDS */
@@ -4235,13 +4239,13 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 0;
 		return true;
 	case 0x02:                              /* GMEM_SIZE */
-		*value = 512 * 1024;
+		*value = a630 ? GMEM_630 : 512 * 1024;
 		return true;
 	case 0x03:                              /* CHIP_ID, with the speed bin above it */
 		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
 		return true;
 	case 0x04:                              /* MAX_FREQ */
-		*value = core_khz * 1000ull;
+		*value = a630 ? 257000000ull : core_khz * 1000ull;    /* (the a630: the level step 16 gave its GMU) */
 		return true;
 	case 0x05:                              /* TIMESTAMP */
 		*value = mach_absolute_time();
@@ -4249,14 +4253,14 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 	case 0x07:                              /* PRIORITIES */
 		*value = 1;
 		return true;
-	case 0x10:                              /* HIGHEST_BANK_BIT */
-		*value = 14;
+	case 0x10:                              /* HIGHEST_BANK_BIT (the a630's: a6xx_calc_ubwc_config, as step 20 sets it) */
+		*value = a630 ? 15 : 14;
 		return true;
 	case 0x12:                              /* UBWC_SWIZZLE */
 		*value = 6;
 		return true;
 	case 0x13:                              /* MACROTILE_MODE */
-		*value = 1;
+		*value = a630 ? 0 : 1;
 		return true;
 	default:                                /* among them VA_START, VA_SIZE: addresses are ours to give */
 		return false;
