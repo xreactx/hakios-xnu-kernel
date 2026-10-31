@@ -398,6 +398,158 @@ show_rpmh_resource(const char *name)
 	printf("adreno: %u: RPMh has \"%s\" at %#x; levels:%s\n", step, name, address, levels);
 }
 
+/*
+ * The a630's GMU firmware asks RPMh for the GPU's rail itself, at the command DB's gfx.lvl (0x30050
+ * here), and on this phone that request is sent but never done (run 003613: its RSC's slot 3,
+ * command 6 status 0x101, issued and not completed; mx.lvl beside it completed). Linux's PDC votes
+ * for 0x30080 on the SDM845 instead. So, at step 1: every rail the command DB has (the ARC slave,
+ * id 3), to see what lives at 0x30080; and with adreno_gfx=1 the application processor's own
+ * request for gfx.lvl (TCS 0 of its RSC, as hakios.adsp.c asks for CX), one position up at a time to
+ * the GMU's (9), then off again. Run 004219: 0x30080 is xo.lvl; position 1 is done in 250 us, position 9
+ * never. Where one is not reached, mx.lvl is raised to its top and that position asked for again.
+ */
+static void
+arcs_630(void)
+{
+	const struct cmd_db_header *db = cmd_db;
+	char line[200];
+	size_t used = 0;
+
+	if (db == NULL || db->magic[0] != 0xdb) {
+		return;
+	}
+	line[0] = 0;
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slave = &db->slave[s];
+		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
+
+		if (slave->id != 3 || slave->count > 512) {
+			continue;
+		}
+		for (unsigned i = 0; i < slave->count; i++) {
+			char id[9] = { 0 };
+
+			memcpy(id, entry[i].id, 8);
+			used += (size_t)snprintf(line + used, sizeof(line) - used, " %s=%#x", id, entry[i].address);
+			if (used > 140 || i + 1 == slave->count) {
+				printf("adreno: %u: the command DB's rails:%s\n", step, line);
+				used = 0;
+				line[0] = 0;
+			}
+		}
+	}
+}
+
+static struct block apps_rsc = { "apps rsc", 0x179e0000, 0x10000 };
+extern lck_mtx_t hakios_rsc_lock;       /* TCS 0 of that RSC, shared with the touch screen's and the DSPs' drivers */
+#define APPS_TCS0               0xd00
+#define APPS_TCS_IRQ_ENABLE     0x00
+#define APPS_TCS_IRQ_STATUS     0x04
+#define APPS_TCS_IRQ_CLEAR      0x08
+#define APPS_TCS_WAIT_FOR_DONE  0x10
+#define APPS_TCS_CONTROL        0x14
+#define APPS_TCS_STATUS         0x18    /* not zero: idle */
+#define APPS_TCS_ENABLED        0x1c
+#define APPS_TCS_COMMAND0       0x30
+#define APPS_TCS_ACTIVE         (1u << 16)
+#define APPS_TCS_TRIGGER        (1u << 24)
+#define APPS_MSGID_WRITE_WAITED (8u | 1u << 8 | 1u << 16)
+
+/* One request from the application processor; true if RPMh said done within 100 ms. */
+static bool
+apps_vote(uint32_t address, uint32_t value)
+{
+	vm_offset_t tcs;
+	uint32_t irq_enable, done = 0, waited = 0;
+
+	need(&apps_rsc);
+	tcs = apps_rsc.base + APPS_TCS0;
+	lck_mtx_lock(&hakios_rsc_lock);
+	if (rd(tcs + APPS_TCS_STATUS) == 0) {
+		printf("adreno: %u: the application processor's TCS 0 is busy: not asked\n", step);
+		lck_mtx_unlock(&hakios_rsc_lock);
+		return false;
+	}
+	irq_enable = rd(tcs + APPS_TCS_IRQ_ENABLE);
+	wr(tcs + APPS_TCS_IRQ_ENABLE, irq_enable | 1);
+	wr(tcs + APPS_TCS_IRQ_CLEAR, 1);
+	wr(tcs + APPS_TCS_COMMAND0, APPS_MSGID_WRITE_WAITED);
+	wr(tcs + APPS_TCS_COMMAND0 + 4, address);
+	wr(tcs + APPS_TCS_COMMAND0 + 8, value);
+	wr(tcs + APPS_TCS_WAIT_FOR_DONE, 1);
+	wr(tcs + APPS_TCS_ENABLED, 1);
+	wr(tcs + APPS_TCS_CONTROL, rd(tcs + APPS_TCS_CONTROL) & ~APPS_TCS_TRIGGER);
+	wr(tcs + APPS_TCS_CONTROL, rd(tcs + APPS_TCS_CONTROL) | APPS_TCS_ACTIVE);
+	wr(tcs + APPS_TCS_CONTROL, rd(tcs + APPS_TCS_CONTROL) | APPS_TCS_TRIGGER);
+	while (waited < 100000) {
+		done = rd(tcs + APPS_TCS_IRQ_STATUS) & 1;
+		if (done) {
+			break;
+		}
+		sleep_us(50);
+		waited += 50;
+	}
+	printf("adreno: %u: the application processor asked RPMh for %#x = %u: %s after ~%u us (command status %#x, TCS %#x)\n",
+	    step, address, value, done ? "DONE" : "NOT DONE", waited, rd(tcs + APPS_TCS_COMMAND0 + 12), rd(tcs + APPS_TCS_STATUS));
+	wr(tcs + APPS_TCS_IRQ_CLEAR, 1);
+	wr(tcs + APPS_TCS_CONTROL, rd(tcs + APPS_TCS_CONTROL) & ~(APPS_TCS_TRIGGER | APPS_TCS_ACTIVE));
+	wr(tcs + APPS_TCS_ENABLED, 0);
+	wr(tcs + APPS_TCS_IRQ_ENABLE, irq_enable);
+	lck_mtx_unlock(&hakios_rsc_lock);
+	return done != 0;
+}
+
+/*
+ * The rail behind gfx.lvl: PM8005 S1 (the device tree's pm8005_s1_level; the PMIC's second id, 5,
+ * peripheral 0x14), read through the PMIC arbiter: its type, status (0x08-0x0b), voltage setting
+ * (0x40-0x41), mode (0x45) and enable (0x46). Reads only.
+ */
+static void
+pm8005_s1_show(const char *when)
+{
+	uint8_t id[8] = { 0 }, set[8] = { 0 };
+	const char *bad = hakios_spmi_read(0x514, 0x04, id, 8);
+
+	if (bad == NULL) {
+		bad = hakios_spmi_read(0x514, 0x40, set, 8);
+	}
+	if (bad != NULL) {
+		printf("adreno: %u: pm8005 s1 (%s): not read: %s\n", step, when, bad);
+		return;
+	}
+	printf("adreno: %u: pm8005 s1 (%s): type %#x/%#x, status %02x %02x %02x %02x; set %02x %02x, mode %02x, enable %02x\n", step,
+	    when, id[0], id[1], id[4], id[5], id[6], id[7], set[0], set[1], set[5], set[6]);
+}
+
+static void
+gfx_vote_630(void)
+{
+	uint32_t test = 0, address = rpmh_resource("gfx.lvl", NULL, NULL);
+
+	if (!PE_parse_boot_argn("adreno_gfx", &test, sizeof(test)) || test == 0 || address == 0) {
+		return;
+	}
+	printf("adreno: %u: adreno_gfx=1: the application processor's own requests for gfx.lvl (%#x), one position up at a time\n",
+	    step, address);
+	pm8005_s1_show("before");
+	for (uint32_t position = 1; position <= 9; position++) {
+		bool done = apps_vote(address, position);
+
+		pm8005_s1_show(done ? "the position done" : "the position not done");
+		if (done) {
+			continue;
+		}
+		/* (gfx.lvl's levels run to 416 and mx.lvl's to 384: perhaps the rail waits for the memories' one) */
+		printf("adreno: %u: position %u is not reached: again with mx.lvl at its top (position 4) first\n", step, position);
+		if (apps_vote(rpmh_resource("mx.lvl", NULL, NULL), 4) && apps_vote(address, position)) {
+			printf("adreno: %u: GFX.LVL POSITION %u NEEDS MX.LVL RAISED (mx.lvl is left at position 4)\n", step, position);
+		}
+		break;
+	}
+	apps_vote(address, 0);
+	pm8005_s1_show("given back");
+}
+
 static bool
 step_outside(void)
 {
@@ -418,6 +570,10 @@ step_outside(void)
 	show_rpmh_resource("gfx.lvl");          /* the 3D core's own rail (dt: VDD_GFX_LEVEL, PM8350C S7) */
 	show_rpmh_resource("cx.lvl");           /* the rail of the CX half, shared with most of the SoC */
 	show_rpmh_resource("mx.lvl");           /* memories */
+	if (a630) {
+		arcs_630();
+		gfx_vote_630();
+	}
 	return true;
 }
 
@@ -1104,10 +1260,14 @@ rscc_show(void)
 
 		printf("adreno: %u: rscc slot %u: wait %#x, control %#x, idle %#x, enabled %#x; commands (number, address, data, "
 		    "status):\n", step, slot, rd(at + 0x10), rd(at + 0x14), rd(at + 0x18), rd(at + 0x1c));
-		printf("adreno: %u:   %x %x %x %x | %x %x %x %x | %x %x %x %x | %x %x %x %x\n", step,
-		    rd(at + 0x30), rd(at + 0x34), rd(at + 0x38), rd(at + 0x3c), rd(at + 0x44), rd(at + 0x48), rd(at + 0x4c),
-		    rd(at + 0x50), rd(at + 0x58), rd(at + 0x5c), rd(at + 0x60), rd(at + 0x64), rd(at + 0x6c), rd(at + 0x70),
-		    rd(at + 0x74), rd(at + 0x78));
+		for (uint32_t c = 0; c < 8; c += 4) {
+			vm_offset_t command = at + 0x30 + 20 * c;
+
+			printf("adreno: %u:   %u-%u: %x %x %x %x | %x %x %x %x | %x %x %x %x | %x %x %x %x\n", step, c, c + 3,
+			    rd(command), rd(command + 4), rd(command + 8), rd(command + 12), rd(command + 20), rd(command + 24),
+			    rd(command + 28), rd(command + 32), rd(command + 40), rd(command + 44), rd(command + 48), rd(command + 52),
+			    rd(command + 60), rd(command + 64), rd(command + 68), rd(command + 72));
+		}
 	}
 }
 
