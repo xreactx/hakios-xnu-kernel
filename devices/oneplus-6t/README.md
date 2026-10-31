@@ -565,6 +565,23 @@ path after it. The amplifier (TFA9894) comes after: a tone through the port with
 
 **11. Then** Wi-Fi; cellular last.
 
+**12. The modem** (started 31 October 2026). Backed up first, read only through the loader (`xl flash-read`, from a
+fresh loader: with the system image resident the uploads come back empty): `modemst1`, `modemst2`, `fsg` (2 MB each;
+`fsg` is all zeros on this phone) and `persist` (32 MB), outside the repository with a `SHA256SUMS` (they hold the
+phone's IMEI). `hakios.mpss.c` is redwood's; on the 6T what differs is the start:
+
+- redwood: TrustZone PAS image 4, IPCC doorbells, rails CX and MSS.
+- the 6T (dt `qcom,pil-q6v55-mss` at `0x4080000`, `qcom,pil-self-auth`; Linux `qcom_q6v5_mss.c`, `sdm845_mss`): the
+  MBA. Rails CX, MX and MSS (level 385); clocks xo and prng (proxy), iface and snoc_axi (reset), bus, mem, gpll0_mss and
+  mnoc_axi (active); the reset is the PDC's modem sync (`0xb2e0100`) held while the AOSS restart (`0xc2b0000`) is
+  pulsed with the RMB's alternate reset (`0x4180044`) set; both reserved regions (`mpss`, `mba`) handed to the modem
+  through the hypervisor (`SCM_MP_ASSIGN`, VMID 3 -> 15, as rmtfs's buffer already is); `mba.mbn` into the `mba` region,
+  its address to `RMB_MBA_IMAGE`, the Hexagon's sleep clock on, `BOOT_CORE_START`, `BOOT_CMD`, `MSS_STATUS` bit 0, then
+  the MBA's "XPU unlocked" (1 or 2) in `RMB_MBA_STATUS`; the image's header to `RMB_PMI_META_DATA` with "metadata
+  ready" (status 3), the segments into `mpss` with `RMB_PMI_CODE_START`/`LENGTH` and "load ready" (status 4).
+- doorbells through the APCS register (`0x1799000c`), as the audio DSP's; the rest -- SMP2P, GLINK, QRTR, rmtfs
+  served from memory and never written back, TFTP, QMI -- is redwood's with the 6T's numbers.
+
 ## Firmware
 
 ```sh
