@@ -270,6 +270,12 @@ clock controller as UEFI leaves it -- both power switches off (`0x222001`), the 
 GPU entirely down, nothing in the way of step 4. (A first try also read `gpu_iref` at `0x8c010`, past the 512 KB the
 driver maps of the clock controller: a panic of our own making. That run's log came back only through `logdump`.)
 
+Step 4 works (run 235850): the collapse bit of `gpu_cx_gdsc` cleared, the switch reads `0xf8222000` and its
+hardware-control register `0x80001fe0` (bit 31 of both: on); 20 s alive after it, then switched off again at the
+steps' end. On the a630 step 4 now notes that it switched CX on, and the end switches it off (redwood only did that
+with the GMU's address space up); a CX found on is only switched off first, not taken down by `stale_stop()`, whose
+GMU, sequencer and SMMU are redwood's addresses.
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the

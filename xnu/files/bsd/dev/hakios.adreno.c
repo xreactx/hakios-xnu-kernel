@@ -118,7 +118,8 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             3
+#define PORTED_A630             4
+static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
  * The kernel's log reaches the loader when a run is over, and a run that ends in a reset
@@ -598,6 +599,23 @@ step_cx_power(void)
 	announce("switch the CX half of the GPU block on (gpu_cx_gdsc): clear the collapse bit of its power switch");
 	gdscr = get(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR);
 	get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
+	if (cx_is_on() && a630) {
+		/*
+		 * Nothing beyond CX has been started on the Adreno 630 by any kernel: an earlier one's step 4
+		 * that did not get to switch it off again (a panic). Only the switch is put back, not
+		 * stale_stop()'s GMU, sequencer and SMMU, which are redwood's addresses.
+		 */
+		printf("adreno: %u: CX is on already (an earlier kernel's step 4): switched off first\n", step);
+		put(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR, gdscr | GDSC_SW_COLLAPSE);
+		for (int i = 0; i < 1000 && cx_is_on(); i++) {
+			sleep_us(100);
+		}
+		gdscr = get(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR);
+		if (cx_is_on()) {
+			printf("adreno: %u: CX stays on (cx_hw_ctrl %#x): left as it is\n", step, rd(gpucc.base + GPUCC_CX_HW_CTRL));
+			return false;
+		}
+	}
 	if (cx_is_on()) {
 		/*
 		 * A kernel that kept the GPU for the system to use (adreno_keep) leaves it running when
@@ -628,6 +646,7 @@ step_cx_power(void)
 		return false;
 	}
 	printf("adreno: %u: CX is on\n", step);
+	cx_ours = true;
 	if (rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON) {
 		/*
 		 * The 3D core kept its power while the rest of the block lost it: an ending that went
@@ -3148,7 +3167,8 @@ gpu_block_stop(void)
 	 * and the SMMU lose their power, and the next time starts from nothing (vendor's
 	 * a6xx_gmu_suspend). The switch takes votes; ours is all this withdraws.
 	 */
-	if (power_off && gpucc_answers()) {
+	if ((power_off || (a630 && cx_ours)) && gpucc_answers()) {
+		cx_ours = false;
 		put(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR, rd(gpucc.base + GPUCC_CX_GDSCR) | GDSC_SW_COLLAPSE);
 		for (int i = 0; i < 1000 && cx_is_on(); i++) {
 			sleep_us(100);
