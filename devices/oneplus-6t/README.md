@@ -332,6 +332,16 @@ into the next runs, until the phone restarted. The RSC's status, its "hidden" co
 the sequence) and the commands' message ids (their length bits: `0x10100` for `0x10108`) do not read back as
 written; everything else does, now checked.
 
+**Step 16 does not work yet** (run 003315). Written after Linux's legacy path: `a6xx_gmu_gfx_rail_on()` -- the GPU's top
+level as the GMU's votes (710 MHz: gfx.lvl's place 9, mx.lvl's 4, `0x1a00409`, made as `a6xx_gmu_rpmh_arc_votes_init()`
+makes them from this phone's lists) and the boot request (legacy bit 22, acknowledged on 30) --, then SPTPRAC, the HFI
+start and HFI's first version (init with the debug region, version `(1<<28)|(1<<19)|(1<<17)`, the level table in its
+first layout with sdm845.dtsi's GPU and GMU levels, the SDM845's fixed bus table, "test"); and a legacy slumber
+(`a6xx_gmu_notify_slumber()`) at the end. The boot request is not acknowledged in 100 ms: the GMU's firmware has taken it
+and sends a vote through its RSC's slot 3 (busy, commands 6 and 7 enabled), which RPMh does not complete. The GMU's log
+is empty and nothing reports a fault; the end puts everything back. Which vote it is, and what RPMh wants before it, is
+the next thing to find out.
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the

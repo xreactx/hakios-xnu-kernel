@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             15
+#define PORTED_A630             16
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -2382,6 +2382,177 @@ static struct block pdc = { "pdc", 0x0b290000, 0x10000 };       /* dt: qcom,gmu 
 #define RSCC_HIDDEN_TCS_CMD0_DATA (4 * 0x00e)
 #define RSCC_OVERRIDE_START_ADDR (4 * 0x100)
 
+/*
+ * The a630's GMU at the start of a boot, and its messages: Linux's a6xx_gmu_fw_start() after the
+ * firmware runs (a6xx_gmu_gfx_rail_on(), a6xx_sptprac_enable(), a6xx_gmu_hfi_start()) and
+ * a6xx_hfi_start_v1() -- the first version of the message protocol, which the older GMU speaks: its
+ * own messages (init with the debug region, the version, a table of levels in the first layout, the
+ * bus table, "test"), not the a660's. The "out of band" requests are the legacy bits: boot and
+ * slumber 22 (acknowledged on 30), the 3D core 16 (on 24).
+ *
+ * The levels are Linux's for the SDM845 (sdm845.dtsi's GPU and GMU tables), each voted as RPMh's
+ * lists on this phone have them: rail_vote() makes what a6xx_gmu_rpmh_arc_votes_init() makes.
+ */
+#define GMU_GX_SPTPRAC_POWER_CONTROL GMU_WORD(0x0081)
+#define GMU_BOOT_SLUMBER_OPTION GMU_WORD(0x23f8)
+#define GMU_GX_VOTE_IDX         GMU_WORD(0x23f9)
+#define GMU_MX_VOTE_IDX         GMU_WORD(0x23fa)
+#define GMU_POWER_COUNTER_ENABLE GMU_WORD(0x5040)
+#define OOB_BOOT_SLUMBER_630    22
+#define OOB_BOOT_SLUMBER_ACK_630 30
+#define OOB_GPU_630             16
+#define OOB_GPU_ACK_630         24
+#define HFI_V1_INIT             0
+#define HFI_V1_FW_VERSION       1
+#define HFI_V1_BW_TABLE         3
+#define HFI_V1_PERF_TABLE       4
+#define HFI_V1_TEST             5
+#define HFI_VERSION_630         (1u << 28 | 1u << 19 | 1u << 17)        /* a6xx_hfi_get_fw_version(): what the host speaks */
+
+static const struct { uint32_t khz, level; } gpu_levels_630[] = {
+	{ 0, 0 }, { 257000, 64 }, { 342000, 128 }, { 414000, 192 }, { 520000, 256 }, { 596000, 320 }, { 675000, 384 },
+	{ 710000, 416 },
+};
+static const struct { uint32_t khz, level; } gmu_levels_630[] = { { 0, 0 }, { 200000, 48 }, { 400000, 128 } };
+#define GPU_LEVELS_630          (sizeof(gpu_levels_630) / sizeof(gpu_levels_630[0]))
+#define GMU_LEVELS_630          (sizeof(gmu_levels_630) / sizeof(gmu_levels_630[0]))
+
+static bool hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words);
+static bool rail_vote(uint32_t level, const uint16_t *rail, unsigned rail_levels, const uint16_t *mx, unsigned mx_levels,
+    uint32_t *vote);
+
+/* An out-of-band request to the a630's GMU, its acknowledgement waited for, and cleared (a6xx_gmu_set_oob(), legacy bits). */
+static bool
+oob_630(const char *what, uint32_t request, uint32_t ack)
+{
+	bool acked;
+
+	put(&gmu, what, GMU_HOST2GMU_INTR_SET, 1u << request);
+	acked = wait_for(&gmu, GMU_GMU2HOST_INTR_INFO, 1u << ack, 1u << ack, 100);
+	get(&gmu, "gmu2host_intr_info", GMU_GMU2HOST_INTR_INFO);
+	put(&gmu, "gmu2host_intr_clr", GMU_GMU2HOST_INTR_CLR, 1u << ack);
+	if (!acked) {
+		printf("adreno: %u: THE GMU DOES NOT ACKNOWLEDGE %s within 100 ms\n", step, what);
+	}
+	return acked;
+}
+
+static bool
+gmu_talk_630(void)
+{
+	uint16_t gfx[16], mx[16], cx[16];
+	unsigned gfx_count = 0, mx_count = 0, cx_count = 0;
+	uint32_t gx_votes[GPU_LEVELS_630], cx_votes[GMU_LEVELS_630], top;
+	uint32_t init[5] = { 0, 0, GMU_DEBUG_ADDRESS, GMU_DEBUG_SIZE, 1 /* a cold boot */ }, version[2] = { 0, HFI_VERSION_630 };
+	uint32_t perf[3 + 16 * 2 + 4 * 2] = { 0 }, bw[160] = { 0 }, test[1];
+
+	if (rpmh_resource("gfx.lvl", gfx, &gfx_count) == 0 || rpmh_resource("mx.lvl", mx, &mx_count) == 0 ||
+	    rpmh_resource("cx.lvl", cx, &cx_count) == 0) {
+		printf("adreno: %u: RPMh's lists of gfx.lvl, mx.lvl and cx.lvl are wanted for the votes\n", step);
+		return false;
+	}
+	for (unsigned i = 0; i < GPU_LEVELS_630; i++) {
+		if (!rail_vote(gpu_levels_630[i].level, gfx, gfx_count, mx, mx_count, &gx_votes[i])) {
+			printf("adreno: %u: no vote for the GPU's level %u\n", step, gpu_levels_630[i].level);
+			return false;
+		}
+	}
+	for (unsigned i = 0; i < GMU_LEVELS_630; i++) {
+		if (!rail_vote(gmu_levels_630[i].level, cx, cx_count, mx, mx_count, &cx_votes[i])) {
+			printf("adreno: %u: no vote for the GMU's level %u\n", step, gmu_levels_630[i].level);
+			return false;
+		}
+	}
+	top = gx_votes[GPU_LEVELS_630 - 1];
+	printf("adreno: %u: votes: the GPU's top level (710 MHz) %#x -- gfx.lvl's place %u, mx.lvl's %u; the GMU's 200 MHz %#x\n",
+	    step, top, top & 0xff, top >> 8 & 0xff, cx_votes[1]);
+
+	announce("tell the GMU a boot begins (a6xx_gmu_gfx_rail_on): the GPU's top level as its votes, then the boot request "
+	    "(bit 22, acknowledged on 30)");
+	put(&gmu, "boot_slumber_option", GMU_BOOT_SLUMBER_OPTION, 0);
+	put(&gmu, "gx_vote_idx", GMU_GX_VOTE_IDX, top & 0xff);
+	put(&gmu, "mx_vote_idx", GMU_MX_VOTE_IDX, top >> 8 & 0xff);
+	if (!oob_630("the boot request", OOB_BOOT_SLUMBER_630, OOB_BOOT_SLUMBER_ACK_630)) {
+		gmu_post_mortem();
+		return false;
+	}
+
+	announce("our control of the SPTP's power collapse (a6xx_sptprac_enable), then the message queues started (HFI)");
+	put(&gmu, "gx_sptprac_power_control", GMU_GX_SPTPRAC_POWER_CONTROL, 0x778000);
+	if (!wait_for(&gmu, GMU_SPTPRAC_PWR_CLK_STATUS, 0x38, 0x28, 10)) {
+		printf("adreno: %u: SPTPRAC does not come on (sptprac_pwr_clk_status %#x): going on, as Linux does\n", step,
+		    rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS));
+	}
+	get(&gmu, "sptprac_pwr_clk_status", GMU_SPTPRAC_PWR_CLK_STATUS);
+	put(&gmu, "hfi_ctrl_init", GMU_HFI_CTRL_INIT, 1);
+	if (!wait_for(&gmu, GMU_HFI_CTRL_STATUS, 1, 1, 100)) {
+		printf("adreno: %u: THE GMU DOES NOT START ITS MESSAGE QUEUES (hfi_ctrl_status %#x)\n", step,
+		    rd(gmu.base + GMU_HFI_CTRL_STATUS));
+		gmu_post_mortem();
+		return false;
+	}
+	gmu_talks = true;
+
+	announce("the first messages, of HFI's first version (a6xx_hfi_start_v1): init, version, levels, buses, test");
+	perf[1] = GPU_LEVELS_630;
+	perf[2] = GMU_LEVELS_630;
+	for (unsigned i = 0; i < GPU_LEVELS_630; i++) {
+		perf[3 + 2 * i] = gx_votes[i];
+		perf[4 + 2 * i] = gpu_levels_630[i].khz;
+	}
+	for (unsigned i = 0; i < GMU_LEVELS_630; i++) {
+		perf[3 + 32 + 2 * i] = cx_votes[i];
+		perf[4 + 32 + 2 * i] = gmu_levels_630[i].khz;
+	}
+	/* a6xx_build_bw_table(): the 630's GMU does no bus scaling, one "off" level and the SDM845's fixed CNOC votes */
+	bw[1] = 1;              /* levels */
+	bw[2] = 3;              /* cnoc commands */
+	bw[3] = 3;              /* ddr commands */
+	bw[4] = 0x05;           /* cnoc wait mask */
+	bw[5] = 0x07;           /* ddr wait mask */
+	bw[6] = 0x50034;        /* cnoc addresses [6] */
+	bw[7] = 0x5007c;
+	bw[8] = 0x5004c;
+	bw[12] = 0x40000000;    /* cnoc data [2][6] */
+	bw[13] = 0x00000000;
+	bw[14] = 0x40000000;
+	bw[18] = 0x60000001;
+	bw[19] = 0x20000001;
+	bw[20] = 0x60000001;
+	bw[24] = 0x50000;       /* ddr addresses [8] */
+	bw[25] = 0x5005c;
+	bw[26] = 0x5000c;
+	bw[32] = 0x40000000;    /* ddr data [16][8] */
+	bw[33] = 0x40000000;
+	bw[34] = 0x40000000;
+	if (!hfi_send("init (the debug region, a cold boot)", HFI_V1_INIT, init, 5) ||
+	    !hfi_send("the version of the protocol", HFI_V1_FW_VERSION, version, 2) ||
+	    !hfi_send("the table of levels (8 of the GPU, 3 of its own)", HFI_V1_PERF_TABLE, perf, sizeof(perf) / 4) ||
+	    !hfi_send("the bus table", HFI_V1_BW_TABLE, bw, sizeof(bw) / 4) ||
+	    !hfi_send("\"test\" (no more messages until the next boot)", HFI_V1_TEST, test, 1)) {
+		return false;
+	}
+	printf("adreno: %u: THE GMU TAKES THE FIRST VERSION'S MESSAGES: it is ready for the 3D core\n", step);
+	return true;
+}
+
+/* a6xx_gmu_notify_slumber() for the a630 (and a6xx_sptprac_disable()): at the steps' end, before the GMU is stopped */
+static void
+gmu_slumber_630(void)
+{
+	put(&gmu, "power_counter_enable", GMU_POWER_COUNTER_ENABLE, 0);
+	put(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR, rd(gpucc.base + GPUCC_GX_GDSCR) | 1u << 11);  /* retention */
+	put(&gmu, "gx_sptprac_power_control", GMU_GX_SPTPRAC_POWER_CONTROL, 0x778001);
+	wait_for(&gmu, GMU_SPTPRAC_PWR_CLK_STATUS, 0x04, 0x04, 10);
+	put(&gmu, "boot_slumber_option", GMU_BOOT_SLUMBER_OPTION, 1);
+	if (oob_630("the slumber request", OOB_BOOT_SLUMBER_630, OOB_BOOT_SLUMBER_ACK_630)) {
+		put(&gmu, "clear the request", GMU_HOST2GMU_INTR_SET, 1u << OOB_BOOT_SLUMBER_ACK_630);
+		printf("adreno: %u: the GMU %s (rpmh_power_state %#x)\n", step, rd(gmu.base + GMU_RPMH_POWER_STATE) == 0x0f ?
+		    "slumbers" : "DOES NOT SAY IT SLUMBERS", rd(gmu.base + GMU_RPMH_POWER_STATE));
+	}
+	put(&gmu, "ao_ahb_fence_ctrl", GMU_AO_AHB_FENCE_CTRL, 0);
+}
+
 static bool
 step_gmu_queues(void)
 {
@@ -2389,6 +2560,9 @@ step_gmu_queues(void)
 
 	if (!cx_ready() || !gmu_runs) {
 		return false;
+	}
+	if (a630) {
+		return gmu_talk_630();         /* (its PDC was programmed before the start: step 15) */
 	}
 	announce("enable the GPU's part of the always-on sequencer (pdc, 0xb294500 and 0xb294520: a part of the SoC not "
 	    "touched before)");
@@ -3433,6 +3607,10 @@ gpu_block_stop(void)
 	if (core_is_on) {
 		put(&gmu, "host2gmu_intr_set", GMU_HOST2GMU_INTR_SET, 1u << 31);
 		core_is_on = false;
+	}
+	if (gmu_talks && a630) {
+		gmu_slumber_630();
+		gmu_talks = false;
 	}
 	if (gmu_talks) {
 		hfi_send("\"slumber\"", HFI_PREPARE_SLUMBER, slumber, 3);
