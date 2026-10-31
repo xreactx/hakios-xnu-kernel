@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             18
+#define PORTED_A630             19
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -3509,7 +3509,9 @@ step_core_space(void)
  * (Step 21 is what tells whether the 3D core gets out of secure mode with it.) There was a
  * boot-arg adreno_zap=0 for the second and later runs of a started phone; nothing reads it now.
  */
-#define ZAP_MEMORY              0x8b71a000ull
+#define ZAP_MEMORY_REDWOOD      0x8b71a000ull
+#define ZAP_MEMORY_630          0x8c415000ull   /* the 6T: reserved-memory gpu_region (8 KB, kept from UEFI by the loader) */
+#define ZAP_MEMORY              (a630 ? ZAP_MEMORY_630 : ZAP_MEMORY_REDWOOD)
 #define ZAP_MEMORY_SIZE         0x2000u
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_THREE_VALUES        3
@@ -3537,7 +3539,8 @@ step_zap_load(void)
 	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
 	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
 	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
-	segment = image_file("fw", "a660_zap.b02", &size);
+	/* (a630_zap.b02 too: its one loadable segment, relocatable -- p_flags bit 27 --, 0x7b0 bytes at the region's start) */
+	segment = image_file("fw", a630 ? "a630_zap.b02" : "a660_zap.b02", &size);
 	if (segment == NULL || size == 0 || size > 0x1000) {
 		return false;
 	}
