@@ -1284,7 +1284,7 @@ mba_power(void)
 static bool
 rpmh_command(const char *name, uint32_t value)
 {
-	uint32_t address = 0, done = 0;
+	uint32_t address = 0, done = 0, irq_enable;
 	uint64_t began;
 
 	if (rail_position(name, 0, &address) < 0 || address == 0) {
@@ -1301,6 +1301,8 @@ rpmh_command(const char *name, uint32_t value)
 	printf("mpss: %u: about to ask RPMh, through TCS %u, for %s (%#x) = %#x\n", step, RPMH_TCS, name, address, value);
 	snprintf(last_write, sizeof(last_write), "step %u asked RPMh for %s = %#x", step, name, value);
 	hold();
+	irq_enable = rd(rsc.base + RSC_IRQ_ENABLE);
+	wr(rsc.base + RSC_IRQ_ENABLE, irq_enable | 1u << RPMH_TCS);   /* (the SDM845 needs it for the done bit) */
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0), MSGID_WRITE_WAITED);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0) + 4, address);
@@ -1324,6 +1326,7 @@ rpmh_command(const char *name, uint32_t value)
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
+	wr(rsc.base + RSC_IRQ_ENABLE, irq_enable);
 	lck_mtx_unlock(&hakios_rsc_lock);
 	return done != 0;
 }
@@ -2226,6 +2229,7 @@ static uint32_t pas_ipa = PAS_IPA_DEFAULT;
  * the address Android uses, this is why. modem_ipa_fw_at=ADDRESS chooses (0x8b700000 allows 0x1a000).
  */
 static uint32_t ipa_fw_memory = 0x8b710000u, ipa_fw_size = 0xa000u;
+static bool ipa_tz_loaded;              /* TrustZone has the IPA's image (PAS 15): to be shut down at the end */
 
 
 /*
@@ -2607,6 +2611,25 @@ ipa_space_off(void)
 	printf("mpss: ipa: the IPA's streams and context %u of the SMMU are put back as they were found\n", ipa_space.context);
 }
 
+/*
+ * A file of the IPA's firmware: fw/NAME in the small image (the 6T's: a few KB, from its /vendor/firmware,
+ * which userland/build.sh copies there from ../fw-modem), else fw/image/NAME on the root (redwood's, in its
+ * firmware partition's image/). *in_image: it lies in the image, and is not ours to free.
+ */
+static const uint8_t *
+ipa_fw_file(const char *name, uint64_t *size, bool *in_image)
+{
+	char path[96];
+	const uint8_t *data = hakios_image_file("fw", name, size, NULL);
+
+	*in_image = data != NULL;
+	if (data != NULL) {
+		return data;
+	}
+	snprintf(path, sizeof(path), "image/%s", name);
+	return root_file(path, size);
+}
+
 static bool
 ipa_firmware_load(void)
 {
@@ -2617,10 +2640,14 @@ ipa_firmware_load(void)
 	vm_offset_t page = 0;
 	uint32_t count, loaded = 0, highest = 0, size;
 	int32_t result;
-	bool ok = false;
+	bool ok = false, in_image = false;
+	char fw[80] = "yupik_ipa_fws";
 
+	if (apcs_ipc != 0) {
+		ipa_fw_memory = 0x8c410000u;    /* (the SDM845, the 6T: reserved-memory ipa_gsi_region, 20 KB, the GPU's after it) */
+	}
 	PE_parse_boot_argn("modem_ipa_fw_at", &ipa_fw_memory, sizeof(ipa_fw_memory));
-	ipa_fw_size = ipa_fw_memory == 0x8b700000u ? 0x1a000u : 0xa000u;
+	ipa_fw_size = ipa_fw_memory == 0x8b700000u ? 0x1a000u : ipa_fw_memory == 0x8c410000u ? 0x5000u : 0xa000u;
 	announce("turn the IPA's clock on (RPMh), load the IPA's firmware (image 15) into its memory and have TrustZone start it, as "
 	    "Android does before the modem");
 	printf("mpss: %u: the IPA's image goes at %#x (%#x bytes allowed)\n", step, ipa_fw_memory, ipa_fw_size);
@@ -2628,22 +2655,35 @@ ipa_firmware_load(void)
 		printf("mpss: %u: the IPA's clock is not on: its firmware is not loaded (a start without the clock ends the kernel)\n", step);
 		return false;
 	}
-	if (!option("modem_ipa_smmu_off")) {
-		ipa_space_on();
+	/*
+	 * The SDM845 (no IPCC: soc_apcs_ipc), a phone with a modem: there the modem loads the IPA's GSI firmware itself
+	 * (Linux's sdm845 "modem-init"; Android's IPA driver loads it on an APQ, without a modem). Ours as well, through
+	 * TrustZone, reset the 6T into a crash dump (31 October); the modem only wants the IPA powered -- unclocked, it
+	 * gave up with "Failed to initialize GSI channel". modem_ipa_tz=1 loads it all the same.
+	 */
+	if (apcs_ipc != 0 && !option("modem_ipa_tz")) {
+		printf("mpss: %u: the IPA's clock and buses are on; its firmware is the modem's to load on this SoC\n", step);
+		return true;
+	}
+	if (!option("modem_ipa_smmu_off") && mba_memory == 0) {
+		ipa_space_on();         /* (redwood's streams; the 6T's IPA, 3.5.1, has its own, not done here) */
 	}
 	{
 		/* the IPA's firmware file is SoC-specific (dt: qcom,firmware-name of qcom,ipa_fws; "yupik_ipa_fws"
-		 * on the first phone, something else on another SoC); soc_ipa_fw= overrides the name */
-		char fw[80], path[96];
+		 * on the first phone, "ipa_fws" on the SDM845); soc_ipa_fw= overrides the name */
+		char path[96];
 
-		strlcpy(fw, "yupik_ipa_fws", sizeof(fw));
+		if (apcs_ipc != 0) {
+			strlcpy(fw, "ipa_fws", sizeof(fw));
+		}
 		PE_parse_boot_argn("soc_ipa_fw", fw, sizeof(fw));
-		snprintf(path, sizeof(path), "image/%s.mdt", fw);
-		header = root_file(path, &header_size);
+		snprintf(path, sizeof(path), "%s.mdt", fw);
+		header = ipa_fw_file(path, &header_size, &in_image);
 		if (header == NULL) {
-			printf("mpss: %u: no fw/%s: the IPA's firmware is not loaded\n", step, path);
+			printf("mpss: %u: no fw/%s nor fw/image/%s: the IPA's firmware is not loaded\n", step, path, path);
 			return false;
 		}
+		printf("mpss: %u: the IPA's firmware: %s, from %s\n", step, path, in_image ? "the small image" : "the root");
 	}
 	count = header_size >= 52 ? header[44] | header[45] << 8 : 0;
 	if (memcmp(header, "\177ELF\1", 5) != 0 || count == 0 || count > 8 || 52 + 32 * count > header_size) {
@@ -2682,8 +2722,10 @@ ipa_firmware_load(void)
 			goto out;
 		}
 		if (segments[i].file_size != 0) {
-			snprintf(name, sizeof(name), "image/yupik_ipa_fws.b%02u", i);
-			segment_file[i] = root_file(name, &segment_size[i]);
+			bool segment_in_image = false;
+
+			snprintf(name, sizeof(name), "%s.b%02u", fw, i);
+			segment_file[i] = ipa_fw_file(name, &segment_size[i], &segment_in_image);
 			if (segment_file[i] == NULL || segment_size[i] != segments[i].file_size) {
 				printf("mpss: %u: fw/%s: %s\n", step, name, segment_file[i] == NULL ? "not there" : "not the size the header says");
 				goto out;
@@ -2796,16 +2838,17 @@ ipa_firmware_load(void)
 		}
 	}
 	ok = true;
+	ipa_tz_loaded = true;
 out:
 	if (page != 0) {
 		kmem_free(kernel_map, page, PAGE_SIZE);
 	}
-	{
+	if (!in_image) {
 		uint8_t *gone = __DECONST(uint8_t *, header);
 
 		kfree_data(gone, header_size);
 	}
-	for (uint32_t i = 0; i < 8; i++) {
+	for (uint32_t i = 0; i < 8 && !in_image; i++) {     /* (where the header lies, its segments do: not ours to free there) */
 		if (segment_file[i] != NULL) {
 			uint8_t *gone = __DECONST(uint8_t *, segment_file[i]);
 
@@ -2820,7 +2863,10 @@ ipa_firmware_stop(void)
 {
 	uint64_t answer = ~0ull;
 
-	(void)scm("to shut the IPA's firmware down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, pas_ipa, 0, 0, 0, &answer);
+	if (ipa_tz_loaded) {
+		(void)scm("to shut the IPA's firmware down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, pas_ipa, 0, 0, 0, &answer);
+		ipa_tz_loaded = false;
+	}
 	if (!leaving) {
 		ipa_space_off();
 		ipa_clock(false);
@@ -2857,7 +2903,7 @@ step_start(void)
 	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
 	{
-		uint32_t ipa_fw = mba_memory == 0;    /* (the 6T's IPA, 3.5.1, is another matter: not here) */
+		uint32_t ipa_fw = 1;                  /* (the 6T's modem wants it too: without it "Failed to initialize GSI channel") */
 
 		PE_parse_boot_argn("modem_ipa_fw", &ipa_fw, sizeof(ipa_fw));
 		ipa_loaded = ipa_fw != 0 && ipa_firmware_load();

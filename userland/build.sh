@@ -399,6 +399,12 @@ if [ -n "$(ls -A ../fw-gpu 2>/dev/null)" ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
 fi
+# ... and the IPA's firmware where it is small and separate (the OnePlus 6T's /vendor/firmware/ipa_fws.*, 22 KB,
+# pulled as root into ../fw-modem): TrustZone loads it before the modem, which otherwise gives up in its IPA code
+if ls ../fw-modem/ipa_fws.mdt >/dev/null 2>&1; then
+	mkdir -p root/fw
+	cp ../fw-modem/ipa_fws.mdt ../fw-modem/ipa_fws.b[0-9][0-9] root/fw/
+fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (bsd/dev/hakios.wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
