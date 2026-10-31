@@ -4692,7 +4692,9 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 static bool
 start_by_itself(void)
 {
-	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
+	static const char *const files_660[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
+	static const char *const files_630[] = { "a630_gmu.bin", "a630_sqe.fw", "a630_zap.mdt", "a630_zap.b02" };
+	const char *const *files = a630 ? files_630 : files_660;
 	const char *missing = NULL;
 	uint64_t size;
 
@@ -4701,7 +4703,7 @@ start_by_itself(void)
 		return false;
 	}
 	image_asked_quietly = true;
-	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]) && missing == NULL; i++) {
+	for (unsigned i = 0; i < sizeof(files_660) / sizeof(files_660[0]) && missing == NULL; i++) {
 		if (image_file("fw", files[i], &size) == NULL) {
 			missing = files[i];
 		}
@@ -4776,11 +4778,7 @@ hakios_adreno_init(void)
 	if (last_step > STEPS) {
 		last_step = STEPS;
 	}
-	if (a630 && (by_itself || last_step > PORTED_A630)) {
-		if (by_itself) {
-			printf("adreno: gpu=1 is not for the Adreno 630 yet: the system draws with its software renderer\n");
-			return;
-		}
+	if (a630 && last_step > PORTED_A630) {
 		printf("adreno: adreno=%u: on the Adreno 630 only steps 1 to %u have been ported; those are done\n", last_step,
 		    PORTED_A630);
 		last_step = PORTED_A630;

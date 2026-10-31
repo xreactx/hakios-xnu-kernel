@@ -1,0 +1,22 @@
+#!/bin/sh
+# pkg-config for Mesa's cross build (tools/mk-mesa.sh): it knows one package, zlib, which the iOS SDK has
+# (usr/include/zlib.h, usr/lib/libz.tbd) and which meson otherwise finds only with Apple's own clang (its
+# "system" zlib is taken on trust there); every other package is not there, as with the 'false' before.
+version=1.2.11
+case " $* " in
+*" --version "*) echo 0.29.2; exit 0 ;;
+esac
+for a in "$@"; do
+	case "$a" in
+	-*) ;;
+	zlib) ;;
+	*) exit 1 ;;
+	esac
+done
+case " $* " in
+*" --modversion "*) echo $version ;;
+*" --libs "*) echo -lz ;;
+*" --cflags "*) echo ;;
+*" --variable"*) echo ;;
+esac
+exit 0
