@@ -2819,13 +2819,23 @@ ipa_firmware_load(void)
 			    first[0], first[1], first[2], first[3]);
 		}
 	}
+	if (apcs_ipc != 0 && !readback) {
+		/*
+		 * The SDM845's IPA is 3.5.1: what follows (GSI_CFG, which its TrustZone guards; the status, the local
+		 * memory, the hardware's set-up and our channels) is laid out for the first phone's IPA 4 and lands on
+		 * other registers there (crash dump 4, 31 October). Its firmware runs; the rest is the modem's for now.
+		 */
+		printf("mpss: %u: the IPA is an SDM845's (3.5.1): its status and set-up are not done from here\n", step);
+		ok = true;
+		ipa_tz_loaded = true;
+		goto out;
+	}
 	{
 		struct block gsi = { "gsi", 0x01e04000, 0xc000 };       /* GSI_CFG at 0, MCS_CFG at 0xb000 (the panic of cycle 26: 0x1000 mapped) */
 
 		need(&gsi);
 		tell("mpss: %u: GSI_CFG %#x (bit 0 GSI enable, 1 MCS enable, 2 double MCS clock, 3 uC is MCS, 4 power collapse, 5 bypass matrix off, "
-		    "[11:8] sleep clock divider), MCS_CFG %#x (bit 0: the sequencer runs)\n", step, rd(gsi.base + 0),
-		    readback ? rd(gsi.base + 0xb000) : 0);
+		    "[11:8] sleep clock divider), MCS_CFG %#x (bit 0: the sequencer runs)\n", step, rd(gsi.base + 0), rd(gsi.base + 0xb000));
 		if (option("modem_ipa_gsi_enable")) {
 			/*
 			 * What Android's gsi_enable_fw() writes when the firmware was put into the instruction memory by hand
