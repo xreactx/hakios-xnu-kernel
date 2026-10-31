@@ -293,6 +293,12 @@ slot idle, its sequencer not busy and not yet written (`seq_mem_0` 0: Linux's `a
 the a630 before the GMU starts). Next, steps 8 and 9: the GPU's SMMU, at `0x5040000` (64 KB in the tree, where
 redwood's is 128 KB).
 
+Steps 8 and 9 work (run 000851): the SMMU at `0x5040000` says 5 stream match registers, 5 contexts, 8 pages of 4 KB
+before the contexts' own -- 64 KB, as the tree has it; its stream table is empty (every match register unused, every
+stream to "fault"), no context has a kind, context 0 translates nothing and has no faults. The 6T's boot chain sets
+nothing up in it: the GPU's and the GMU's streams will be ours to give. The hypervisor answered the global registers'
+reads without trouble.
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the
