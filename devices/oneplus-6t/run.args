@@ -26,3 +26,4 @@ soc_apcs_ipc=0x1799000c
 soc_adsp_cx=1
 gpu=1           # iOS draws with the Adreno 630 (bsd/dev/hakios.adreno.c, Mesa freedreno; root built GL=1 ADSP=1 REST=1)
 soc_gpu=630     # ... the SDM845's GPU numbers (soc_cmd_db above gives its rails); the UEFI must be without CPRDxe (README step 9)
+adreno_speed=7  # ... at its top level, 710 MHz (1 = 257): the app zooms GPU-bound at 257, 40 % of frames slow -> 28 % (runs 140417, 141106; 49 C)
