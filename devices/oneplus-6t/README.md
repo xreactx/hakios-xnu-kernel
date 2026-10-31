@@ -359,6 +359,18 @@ acknowledged on 24 -- GX on (`0xf8222800`), SPTPRAC on, and the core at `0x50000
 back by setting 24. And the slumber at the end is now acknowledged and done (`rpmh_power_state` `0xf`): without the
 3D core asked for once, the firmware faulted (`CM3_FAULT`) on the slumber request.
 
+Steps 18 to 22 work (runs 043914-044825): the core's memory with `a630_sqe.fw` (stream 0 only: the 6T's `gfx3d_user`),
+the zap shader `a630_zap.b02` at `gpu_region` `0x8c415000`, Linux's `hw_init` for the a630 (VBIF, not GBIF; 1 MB of
+GMEM; its thresholds and UBWC, bank bit 15), `CP_ME_INIT`, secure mode left, a word written on command, and three bands
+filled by the 2D engine on the panel.
+
+**iOS draws with the GPU** (`gpu=1`, run 050504, 31 October): Mesa says "OpenGL ES 3.2 Mesa 25.0.7; FD630", CoreAnimation's
+OpenGL ES renderer draws the lock screen and SpringBoard with it -- colours right, touch and scrolling working --,
+with no GPU fault in thousands of frames; beside the audio DSP and the speaker too (run 051145). `gpu=1 soc_gpu=630`
+are in `run.args`; the root must be built `GL=1 ADSP=1 REST=1 userland/build.sh`. Mesa builds on Linux now
+(`tools/mk-mesa.sh` with meson and ninja on `PATH`, e.g. from pip in a python3.11 venv). Scrolling is still a little
+uneven.
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the
