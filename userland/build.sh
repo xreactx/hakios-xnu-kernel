@@ -599,10 +599,15 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# This stages the files; a separate XNU MPSS driver is still required to start the modem.
 	if [ -n "$MODEM" ]; then
 		[ -f ../fw-modem/modem.mdt ] || { echo "build.sh: MODEM=1 needs ../fw-modem/modem.mdt" >&2; exit 1; }
-		../devices/poco-x5-pro/tools/modem_firmware.py --dtb ../devices/poco-x5-pro/prebuilt/device-tree.dtb --firmware-dir ../fw-modem \
+		# (checked against the phone's own tree: DEVICE=oneplus-6t has its own, where the modem self-authenticates)
+		MODEM_DTB=../devices/poco-x5-pro/prebuilt/device-tree.dtb
+		[ "${DEVICE:-}" = oneplus-6t ] && MODEM_DTB=../devices/oneplus-6t/device-tree.dtb
+		../devices/poco-x5-pro/tools/modem_firmware.py --dtb $MODEM_DTB --firmware-dir ../fw-modem \
 			--node /soc/qcom,mss@4080000 >/dev/null
 		mkdir -p sysroot/fw
 		cp ../fw-modem/modem.mdt ../fw-modem/modem.b[0-9][0-9] sysroot/fw/
+		# (the modem's boot authenticator, for a self-authenticating modem: the 6T's -- hakios.mpss.c loads it first)
+		if [ -f ../fw-modem/mba.mbn ]; then cp ../fw-modem/mba.mbn sysroot/fw/; fi
 		# ... and the firmware partition's image/ (its mcfg configurations and the registry's *.jsn, pulled from
 		# the phone's /vendor/firmware_mnt/image into ../fw-modem/image), which the modem reads over TFTP (hakios.mpss.c)
 		if [ -d ../fw-modem/image ]; then

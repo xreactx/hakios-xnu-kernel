@@ -25,8 +25,9 @@ def inspect(dtb_path, firmware_dir, node_path):
     if node_path not in by_path:
         raise ValueError(f"modem node {node_path} is absent")
     props = by_path[node_path]["properties"]
-    if "memory-region" not in props or "qcom,pas-id" not in props:
-        raise ValueError("modem node lacks memory-region or qcom,pas-id")
+    # (a self-authenticating modem -- qcom,pil-self-auth, the SDM845's, started through its MBA -- has no PAS id)
+    if "memory-region" not in props or ("qcom,pas-id" not in props and "qcom,pil-self-auth" not in props):
+        raise ValueError("modem node lacks memory-region, or both qcom,pas-id and qcom,pil-self-auth")
     memory_phandle = cell(props["memory-region"])
     matches = [node for node in nodes if any(
         cell(node["properties"][name]) == memory_phandle
@@ -68,7 +69,7 @@ def inspect(dtb_path, firmware_dir, node_path):
     if not segments or min(item["address"] for item in segments) != base:
         raise ValueError("firmware has no segments starting at the modem memory base")
     return {"modem_node": node_path, "memory_node": region["path"], "memory_base": base,
-            "memory_size": size, "pas_id": cell(props["qcom,pas-id"]), "program_headers": count,
+            "memory_size": size, "pas_id": cell(props["qcom,pas-id"]) if "qcom,pas-id" in props else None, "program_headers": count,
             "loadable_segments": len(segments), "file_bytes": total, "segments": segments}
 
 

@@ -287,6 +287,9 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 #define SMEM_PHYS_DEFAULT       0x80900000u   /* dt: reg of /soc/qcom,smem */
 static uint32_t smem_phys = SMEM_PHYS_DEFAULT;
 static uint32_t apcs_ipc;               /* soc_apcs_ipc=: the SoC rings its processors through APCS, and has no IPCC (the SDM845) */
+static uint32_t mba_memory, mba_memory_size;    /* soc_mba_mem=, soc_mba_mem_size=: a modem started through its MBA (the 6T's) */
+static const uint8_t *mba_image;
+static uint64_t mba_image_size;
 #define SMEM_SIZE               0x00200000u
 #define SMEM_US                 0
 #define SMEM_MPSS               1               /* dt: qcom,remote-pid of qcom,smp2p-modem and qcom,glink/modem */
@@ -1257,6 +1260,20 @@ step_firmware(void)
 	printf("mpss: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
 	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
 	    image.segments, files, image.size, MPSS_MEMORY_SIZE, mpss_memory);
+	if (mba_memory != 0) {
+		/* a self-authenticating modem (dt qcom,pil-self-auth, the SDM845's): its MBA first, into a region of its own */
+		mba_image = image_file("mba.mbn", &mba_image_size);
+		if (mba_image == NULL) {
+			printf("mpss: %u: NO mba.mbn: a modem that authenticates itself cannot be started without it\n", step);
+			goto fail;
+		}
+		if (mba_image_size > mba_memory_size) {
+			printf("mpss: %u: mba.mbn is %llu bytes, more than its region's %#x\n", step, mba_image_size, mba_memory_size);
+			goto fail;
+		}
+		printf("mpss: %u: mba.mbn: %llu bytes for its region at %#x (%#x), starting %02x %02x %02x %02x\n", step,
+		    mba_image_size, mba_memory, mba_memory_size, mba_image[0], mba_image[1], mba_image[2], mba_image[3]);
+	}
 	announce("read the modem's four file systems from the phone's storage into memory of ours (rmtfs below)");
 	{
 		unsigned loaded = rmtfs_load();
@@ -6344,6 +6361,8 @@ soc_override(void)
 	PE_parse_boot_argn("soc_mpss_mem", &mpss_memory, sizeof(mpss_memory));
 	PE_parse_boot_argn("soc_mpss_mem_size", &mpss_memory_size, sizeof(mpss_memory_size));
 	PE_parse_boot_argn("soc_apcs_ipc", &apcs_ipc, sizeof(apcs_ipc));
+	PE_parse_boot_argn("soc_mba_mem", &mba_memory, sizeof(mba_memory));
+	PE_parse_boot_argn("soc_mba_mem_size", &mba_memory_size, sizeof(mba_memory_size));
 	PE_parse_boot_argn("soc_imem", &ipa_imem, sizeof(ipa_imem));
 	PE_parse_boot_argn("soc_ipa_stream", &ipa_stream, sizeof(ipa_stream));
 	PE_parse_boot_argn("soc_ipa_stream_uc", &ipa_stream_uc, sizeof(ipa_stream_uc));

@@ -14,7 +14,7 @@ import subprocess
 FDT_MAGIC = 0xD00DFEED
 BEGIN_NODE, END_NODE, PROP, NOP, END = 1, 2, 3, 4, 9
 KEYWORDS = ("modem", "mpss", "mss", "ipa", "qrtr", "glink", "smem", "smp2p", "remoteproc")
-PROPERTY_NAMES = {"compatible", "status", "memory-region", "qcom,pas-id", "qcom,smem", "qcom,smem-id", "reg", "interrupts", "phandle", "linux,phandle"}
+PROPERTY_NAMES = {"compatible", "status", "memory-region", "qcom,pas-id", "qcom,pil-self-auth", "qcom,smem", "qcom,smem-id", "reg", "interrupts", "phandle", "linux,phandle"}
 ANDROID_PROPERTIES = (
     "ro.product.device", "ro.boot.hardware.sku", "ro.board.platform", "ro.boot.hardware", "ro.boot.baseband",
     "gsm.version.baseband", "init.svc.vendor.qcrild", "init.svc.vendor.qcrild2",
