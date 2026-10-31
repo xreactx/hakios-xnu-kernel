@@ -75,16 +75,18 @@ if [ ! -x venv/bin/python3 ]; then
 fi
 export PATH=$B/venv/bin:$PATH
 
-# the compiler is the kernel's wrapper: it names the target (arm64-apple-ios) and the linker (ld64)
+# the compiler is the kernel's wrapper: it names the target (arm64-apple-ios) and the linker (ld64). On Linux its clang
+# does not look in the SDK for libc++'s headers, as Apple's does, and would link libstdc++: libc++ is named for C++. And pkg-config is
+# tools/mesa/pkg-config, which knows only zlib (in the SDK; meson trusts it to be there only with Apple's clang).
 cat > cross.ini <<INI
 [binaries]
 c = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK']
-cpp = ['$CC++', '-arch', 'arm64', '-isysroot', '$SDK', '-fuse-cxa-atexit']
+cpp = ['$CC++', '-arch', 'arm64', '-isysroot', '$SDK', '-stdlib=libc++', '-isystem', '$SDK/usr/include/c++/v1', '-fuse-cxa-atexit']
 objc = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK']
 ar = 'llvm-ar'
 ranlib = 'llvm-ranlib'
 strip = 'llvm-strip'
-pkg-config = 'false'
+pkg-config = '$ROOT/tools/mesa/pkg-config'
 
 [host_machine]
 system = 'darwin'
