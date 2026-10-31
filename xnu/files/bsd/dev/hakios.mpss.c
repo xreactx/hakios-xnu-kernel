@@ -2253,6 +2253,12 @@ ipa_status(const char *when)
 {
 	uint32_t shared, uc0, uc3, uc5, uc7, uc8, gsi, error;
 
+	if (apcs_ipc != 0) {
+		/* (the SDM845's IPA 3.5.1 has nothing at the local memory and GSI addresses below: the 6T, reading them at
+		 * the end of step 11, took a bus error and TrustZone reset it -- crash dump 6, 31 October) */
+		printf("mpss: ipa: %s: the status of an SDM845's IPA is not read from here\n", when);
+		return;
+	}
 	need(&ipa_regs);
 	need(&ipa_sram);
 	need(&gsi_ee0);
