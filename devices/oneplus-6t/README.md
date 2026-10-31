@@ -318,6 +318,20 @@ the processor held in reset, its second half landing in the data memory 16K furt
 all 32 768 bytes read back as written. (The words where the a660's firmware keeps its versions read 0: the legacy
 image keeps none there.)
 
+**Step 15 works: the GMU's firmware runs** (run 002741, 31 October). The a630 follows Linux's `a6xx_gmu_fw_start()`
+for a cold start, not redwood's order: first `a6xx_gmu_rpmh_init()` -- the GMU's RSC programmed, and the GPU's PDC,
+which on the SDM845 is ours to program (`0xb280000`; its sequencer `0xb480000`, from mainline's `sdm845.dtsi`): its
+program, and its two sets of commands for the GPU's sleep and wake, votes for mx.lvl, cx.lvl and the GPU's rail --,
+the RSC put to sleep; then register retention, the RSC woken, the firmware loaded again, the GMU's registers (chip ID
+`0x06030100`), and the processor let go: `fw_init_result` `0xbabeface`, the old firmware's word. At the end it is put
+back in reset, the RSC asleep, the SMMU and CX as found.
+
+The GPU's rail in the PDC's commands is **`0x30080`, Linux's constant**. This phone's command DB has `gfx.lvl` at
+`0x30050`; with that the wake never finished (runs 002231, 002434): the RSC's sequencer stayed busy -- and stayed so
+into the next runs, until the phone restarted. The RSC's status, its "hidden" command addresses (it fills them from
+the sequence) and the commands' message ids (their length bits: `0x10100` for `0x10108`) do not read back as
+written; everything else does, now checked.
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the

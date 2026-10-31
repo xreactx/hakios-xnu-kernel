@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             14
+#define PORTED_A630             15
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -2086,6 +2086,190 @@ struct hfi_table {
 static volatile struct hfi_table *hfi;  /* the uncached view */
 
 /*
+ * The a630's GMU talks to RPMh through a PDC that this kernel programs itself (on the a660 the
+ * always-on processor does): its sequencer's program, and the two sets of commands it sends when
+ * the GPU sleeps and wakes -- mx.lvl, cx.lvl and the GPU's own rail. Linux's a6xx_gmu_rpmh_init(),
+ * the a630's branches; the registers (in words) from a6xx.xml.h and a6xx_gmu.xml.h, the bases from
+ * sdm845.dtsi ("gmu_pdc", "gmu_pdc_seq"; the 6T's own tree gives one range over both, 0xb200000).
+ * The GPU's rail in those commands is 0x30080, Linux's constant for the a630 -- not where this
+ * phone's command DB has gfx.lvl (0x30050): with that, the wake (run 002434) never finished, the
+ * sequencer busy for good (it stayed so across runs, until the phone restarted).
+ */
+#define PDC_GFX_ADDRESS_630     0x30080
+static struct block pdc630 = { "pdc", 0x0b280000, 0x10000 };
+static struct block pdc630_seq = { "pdc sequencer", 0x0b480000, 0x10000 };
+#define PDC_GPU_ENABLE_PDC_630  (4 * 0x1140)
+#define PDC_GPU_SEQ_START_630   (4 * 0x1148)
+#define PDC_GPU_TCS1_630        (4 * 0x1572)    /* +0 control, +4 commands enabled, +8 waited for, +12 command 0: number, address, data */
+#define PDC_GPU_TCS3_630        (4 * 0x15d6)
+#define PDC_CMD(n)              (12 + 16 * (n))
+#define RSCC_HIDDEN_TCS_ADDR_630 (4 * 0x00d)
+#define RSCC_HIDDEN_TCS_DATA_630 (4 * 0x00e)
+#define RSCC_OVERRIDE_START_630 (4 * 0x100)
+#define RSCC_PDC_SEQ_START_630  (4 * 0x008)
+#define RSCC_PDC_MATCH_LO_630   (4 * 0x009)
+#define RSCC_PDC_MATCH_HI_630   (4 * 0x00a)
+#define RSCC_SEQ_630            0xa7a506a0u     /* the first word of the a630's RSC program (the a650 family's: 0xeaaae5a0) */
+#define GMU_CHIP_630            0x06030100      /* dt qcom,chipid 0x06030001 the way the firmware wants it (a6xx_gmu_fw_start) */
+#define GMU_STARTED_LEGACY      0xbabeface      /* fw_init_result once firmware of core version 0x20010004 or older runs */
+
+/*
+ * Written, and read back: what does not take is said (the wake that waits on all of it says nothing of
+ * which). Not so the RSC's status, its "hidden" command addresses (it fills them from the sequence's
+ * own) and a command's message id (its length bits do not read back: 0x10100 for 0x10108).
+ */
+static uint32_t pdc_wrong;
+
+static void
+put_checked(struct block *b, const char *name, uint32_t offset, uint32_t value)
+{
+	uint32_t back;
+
+	put(b, name, offset, value);
+	back = rd(b->base + offset);
+	if (back != value) {
+		pdc_wrong++;
+		printf("adreno: %u: %s %s at %#x READS BACK %#x, not %#x\n", step, b->name, name, b->phys + offset, back, value);
+	}
+}
+
+static void
+pdc_tcs_630(uint32_t tcs, const char *name, uint32_t mx, uint32_t cx, uint32_t gfx_address, uint32_t gfx)
+{
+	char what[40];
+
+	snprintf(what, sizeof(what), "%s commands enabled", name);
+	put_checked(&pdc630, what, tcs + 4, 7);
+	put_checked(&pdc630, "waited for", tcs + 8, 0);
+	put_checked(&pdc630, "control", tcs, 0);
+	put(&pdc630, "cmd0 msgid", tcs + PDC_CMD(0), 0x10108);
+	put_checked(&pdc630, "cmd0 address (mx.lvl)", tcs + PDC_CMD(0) + 4, 0x30010);
+	put_checked(&pdc630, "cmd0 data", tcs + PDC_CMD(0) + 8, mx);
+	put(&pdc630, "cmd1 msgid", tcs + PDC_CMD(1), 0x10108);
+	put_checked(&pdc630, "cmd1 address (cx.lvl)", tcs + PDC_CMD(1) + 4, 0x30000);
+	put_checked(&pdc630, "cmd1 data", tcs + PDC_CMD(1) + 8, cx);
+	put(&pdc630, "cmd2 msgid", tcs + PDC_CMD(2), 0x10108);
+	put_checked(&pdc630, "cmd2 address (gfx.lvl)", tcs + PDC_CMD(2) + 4, gfx_address);
+	put_checked(&pdc630, "cmd2 data", tcs + PDC_CMD(2) + 8, gfx);
+}
+
+/* a6xx_gmu_rpmh_init() for the a630, then a6xx_rpmh_stop(): the channel asleep, as Linux leaves it at probe */
+static bool
+rpmh_init_630(void)
+{
+	static const uint32_t rsc[5] = { RSCC_SEQ_630, 0xa1e6a6e7, 0xa2e081e1, 0xe9a982e2, 0x0020e8a8 };
+	static const uint32_t pdc_program[5] = { 0xfebea1e1, 0xa5a4a3a2, 0x8382a6e0, 0xbce3e284, 0x002081fc };
+	uint32_t gfx = PDC_GFX_ADDRESS_630;
+
+	printf("adreno: %u: the PDC's votes for the GPU's rail go to %#x (Linux's; the command DB's gfx.lvl is %#x)\n", step, gfx,
+	    rpmh_resource("gfx.lvl", NULL, NULL));
+	pdc_wrong = 0;
+	announce("program the GMU's RPMh channel and the GPU's PDC (0xb280000, its sequencer 0xb480000) for the GPU's sleep and "
+	    "wake, as Linux does for the a630 -- the first writes outside the GPU block");
+	put(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0, 1u << 24);       /* (a status register: not read back) */
+	put_checked(&rscc, "pdc_slave_id_drv0", RSCC_PDC_SLAVE_ID_DRV0, 1);
+	put_checked(&rscc, "hidden tcs cmd0 data", RSCC_HIDDEN_TCS_DATA_630, 0);
+	put(&rscc, "hidden tcs cmd0 addr", RSCC_HIDDEN_TCS_ADDR_630, 0);
+	put_checked(&rscc, "hidden tcs cmd1 data", RSCC_HIDDEN_TCS_DATA_630 + 8, 0);
+	put(&rscc, "hidden tcs cmd1 addr", RSCC_HIDDEN_TCS_ADDR_630 + 8, 0);
+	put_checked(&rscc, "hidden tcs cmd2 data", RSCC_HIDDEN_TCS_DATA_630 + 16, 0x80000000);
+	put(&rscc, "hidden tcs cmd2 addr", RSCC_HIDDEN_TCS_ADDR_630 + 16, 0);
+	put_checked(&rscc, "override_start_addr", RSCC_OVERRIDE_START_630, 0);
+	put_checked(&rscc, "pdc_seq_start_addr", RSCC_PDC_SEQ_START_630, 0x4520);
+	put_checked(&rscc, "pdc_match_value_lo", RSCC_PDC_MATCH_LO_630, 0x4510);
+	put_checked(&rscc, "pdc_match_value_hi", RSCC_PDC_MATCH_HI_630, 0x4514);
+	for (unsigned i = 0; i < 5; i++) {
+		put_checked(&rscc, "seq_mem_drv0", RSCC_SEQ_MEM_0_DRV0 + 4 * i, rsc[i]);
+	}
+	for (unsigned i = 0; i < 5; i++) {
+		put_checked(&pdc630_seq, "seq_mem", 4 * i, pdc_program[i]);
+	}
+	pdc_tcs_630(PDC_GPU_TCS1_630, "tcs1 (sleep)", 1, 0, gfx, 0);
+	pdc_tcs_630(PDC_GPU_TCS3_630, "tcs3 (wake)", 2, 3, gfx, 3);
+	put_checked(&pdc630, "seq_start_addr", PDC_GPU_SEQ_START_630, 0);
+	put_checked(&pdc630, "enable_pdc", PDC_GPU_ENABLE_PDC_630, 0x80000001);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	printf("adreno: %u: the RSC's and the PDC's programming: %s\n", step, pdc_wrong == 0 ? "every word reads back as written" :
+	    "SOME WORDS DO NOT READ BACK (above)");
+	/* a6xx_rpmh_stop() */
+	put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 1);
+	if (!wait_for(&rscc, RSCC_RSC_STATUS0_DRV0, RSCC_ASLEEP, RSCC_ASLEEP, 10)) {
+		printf("adreno: %u: the GMU's RPMh channel does not go to sleep (rsc_status0 %#x)\n", step,
+		    rd(rscc.base + RSCC_RSC_STATUS0_DRV0));
+	}
+	put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
+	get(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0);
+	return true;
+}
+
+/* a6xx_gmu_fw_start() for the a630 at a cold start, up to the firmware's word that it runs */
+static bool
+gmu_start_630(void)
+{
+	uint32_t result = 0;
+
+	if (!rpmh_init_630()) {
+		return false;
+	}
+	announce("register retention on, the GMU's RPMh channel woken (a6xx_rpmh_start), the firmware loaded again after it as "
+	    "Linux loads it");
+	put(&gmu, "general_7", GMU_GENERAL_7, 1);
+	put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 2);
+	if (!wait_for(&gmu, GMU_RSCC_CONTROL_ACK, 2, 2, 100) || !wait_for(&rscc, RSCC_SEQ_BUSY_DRV0, ~0u, 0, 100)) {
+		printf("adreno: %u: THE GMU'S RPMH CHANNEL DOES NOT WAKE in 100 ms (ack %#x, seq_busy %#x, rsc_status0 %#x)\n", step,
+		    rd(gmu.base + GMU_RSCC_CONTROL_ACK), rd(rscc.base + RSCC_SEQ_BUSY_DRV0), rd(rscc.base + RSCC_RSC_STATUS0_DRV0));
+		rscc_show();
+		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
+		return false;
+	}
+	put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
+	rsc_awake = true;
+	for (uint64_t offset = 0; offset + 4 <= gmu_firmware_size; offset += 4) {
+		uint32_t word;
+
+		memcpy(&word, gmu_firmware + offset, sizeof(word));
+		wr(gmu.base + GMU_ITCM + (uint32_t)offset, word);
+	}
+
+	announce("tell the GMU where things are, by its registers: the message table, the log, which GPU this is; its caches and "
+	    "its use of RPMh; then let its processor out of reset");
+	put(&gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT, 0);
+	put(&gmu, "cm3_boot_config", GMU_CM3_BOOT_CONFIG, 2);
+	put(&gmu, "hfi_qtbl_addr", GMU_HFI_QTBL_ADDR, GMU_HFI_ADDRESS);
+	put(&gmu, "hfi_qtbl_info", GMU_HFI_QTBL_INFO, 1);
+	put(&gmu, "ahb_fence_range_0", GMU_AHB_FENCE_RANGE_0, 1u << 31 | 0xa << 18 | 0xa0);
+	put(&gmu, "cm3_cfg", GMU_CM3_CFG, 0x4052);
+	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, GMU_CHIP_630);
+	put(&gmu, "pwr_col_cp_msg", GMU_PWR_COL_CP_MSG, GMU_LOG_ADDRESS | (GMU_LOG_SIZE / 4096 - 1));
+	put(&gmu, "sys_bus_config", GMU_SYS_BUS_CONFIG, 1);
+	put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
+	put(&gmu, "dcache_config", GMU_DCACHE_CONFIG, 1);
+	put(&gmu, "pwr_col_inter_frame_ctrl", GMU_PWR_COL_INTER_FRAME_CTRL, 0x9c40400);
+	set(&gmu, "rpmh_ctrl", GMU_RPMH_CTRL, GMU_RPMH_CTRL_ALL);
+	put(&gmu, "gmu2host_intr_clr", GMU_GMU2HOST_INTR_CLR, 0xffffffff);
+	/* a6xx_gmu_start() */
+	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
+	put(&gmu, "pwr_col_cp_resp", GMU_PWR_COL_CP_RESP, 0);
+	gmu_runs = true;
+	put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 0);
+	for (int i = 0; i < 5000 && result != GMU_STARTED_LEGACY; i++) {
+		sleep_us(100);
+		result = rd(gmu.base + GMU_CM3_FW_INIT_RESULT);
+	}
+	get(&gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT);
+	get(&gmu, "gmu2host_intr_info", GMU_GMU2HOST_INTR_INFO);
+	get(&gmu, "ao_host_interrupt_status", GMU_AO_HOST_INTERRUPT_STATUS);
+	get(&gmu, "hfi_ctrl_status", GMU_HFI_CTRL_STATUS);
+	if (space_faulted(&gmu_space) || result != GMU_STARTED_LEGACY) {
+		printf("adreno: %u: the GMU's firmware does not come up (fw_init_result %#x)\n", step, result);
+		gmu_post_mortem();
+		return false;
+	}
+	printf("adreno: %u: THE GMU'S FIRMWARE RUNS (fw_init_result 0xbabeface)\n", step);
+	return true;
+}
+
+/*
  * Everything the vendor's driver writes before it lets the processor go (a6xx_gmu_register_config,
  * a6xx_gmu_power_config), in its order; then out of reset (a6xx_gmu_device_start).
  */
@@ -2112,6 +2296,9 @@ step_gmu_start(void)
 		hfi->queue[i].type = i | (uint32_t)priority[i] << 8;
 		hfi->queue[i].words = HFI_QUEUE_WORDS;
 		hfi->queue[i].status = 1;
+	}
+	if (a630) {
+		return gmu_start_630();
 	}
 
 	announce("tell the GMU where things are, by its registers: the message table, the log, which GPU this is; its "
@@ -2370,10 +2557,12 @@ gmu_post_mortem(void)
 	}
 	rscc_show();
 	get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
-	get(&gpucc, "gx_sw_reset", GPUCC_GX_SW_RESET);
-	get(&gpucc, "gx_domain_misc", GPUCC_GX_DOMAIN_MISC);
-	get(&gpucc, "pll0 mode", GPUCC_PLL0_MODE);
-	get(&gpucc, "pll0 multiplier", GPUCC_PLL0_MODE + 4);
+	if (!a630) {            /* (not registers of gpucc-sdm845.c's) */
+		get(&gpucc, "gx_sw_reset", GPUCC_GX_SW_RESET);
+		get(&gpucc, "gx_domain_misc", GPUCC_GX_DOMAIN_MISC);
+		get(&gpucc, "pll0 mode", GPUCC_PLL0_MODE);
+		get(&gpucc, "pll0 multiplier", GPUCC_PLL0_MODE + 4);
+	}
 	get(&gpucc, "pll1 mode", GPUCC_PLL1_MODE);
 	get(&gpucc, "pll1 multiplier", GPUCC_PLL1_MODE + 4);
 	get(&gmu, "rpmh_power_state", GMU_RPMH_POWER_STATE);
@@ -3266,7 +3455,7 @@ gpu_block_stop(void)
 		zap_is_loaded = false;
 	}
 	/* vendor's a6xx_rscc_sleep_sequence: the GMU's votes in RPMh are dropped, by the always-on sequencer */
-	if (rsc_awake && rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == 0xeaaae5a0) {
+	if (rsc_awake && (rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == 0xeaaae5a0 || rd(rscc.base + RSCC_SEQ_MEM_0_DRV0) == RSCC_SEQ_630)) {
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 1);
 		if (!wait_for(&rscc, RSCC_RSC_STATUS0_DRV0, RSCC_ASLEEP, RSCC_ASLEEP, 100)) {
 			printf("adreno: %u: the GMU's RPMh channel does not go to sleep\n", step);
