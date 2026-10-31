@@ -373,8 +373,14 @@ are in `run.args`; the root must be built `GL=1 ADSP=1 REST=1 userland/build.sh`
 Frame pacing (`RC_JOBS=rc.jobs.fps`, `touch_lat=1`, `tools/frames.py`): at the GMU's first level, 257 MHz, 40 % of the
 gestures' frames came over 16.7 ms -- the zooms of opening and closing an app and Control Center waiting 40-50 ms for
 the GPU; at its top, `adreno_speed=7` (710 MHz, now in `run.args`), 28 % (the zooms 19-37 %; the phone at 49 C). The
-home screen's page swipes are the same at both (40-46 frames a second, over half slow): there the GPU is done in 2-3
-ms and the window server sits idle ~25 ms before it draws -- not the GPU's.
+home screen's page swipes looked the same at both (40-46 frames a second, over half slow), but frame by frame they are
+not slow while they move: the page steps at 16-17.6 ms. What frames.py counts there is (1) the home screen, once the
+page has settled (~700 ms on), going on at a steady 33 ms -- an animation at 30 Hz, not a stutter -- and (2) one gap at
+the start of every gesture: 40-90 ms for a page swipe, 50 ms for a fling, 170-190 ms for opening Settings. In that gap
+the window server is idle, waiting for SpringBoard's commit, the same in all three rounds (not shaders being compiled):
+SpringBoard's own work at a gesture's start, on the CPU. With the memory's bandwidth voted for (the kernel now does it
+on the 6T as on redwood, from 26 s: hakios.cpufreq.c, soc_cmd_db/soc_rsc) the slow frames are 25 % (run 142026). The big
+cores at their top (cpufreq_osm_mhz=3000) changed nothing: the SoC throttled them to 1.7 GHz at 69 C (run 142955).
 
 On the 6T `gpu=1` runs steps 10 to 12 too: without them, the first bring-up after Android reset the whole phone (a
 Qualcomm crash dump, 3 times of 3), with them never (3 of 3). Step 12 -- TrustZone handed the zap shader's header
