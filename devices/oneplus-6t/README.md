@@ -582,6 +582,29 @@ phone's IMEI). `hakios.mpss.c` is redwood's; on the 6T what differs is the start
 - doorbells through the APCS register (`0x1799000c`), as the audio DSP's; the rest -- SMP2P, GLINK, QRTR, rmtfs
   served from memory and never written back, TFTP, QMI -- is redwood's with the 6T's numbers.
 
+Where it stands (31 October): steps 1 to 10 work. The MBA runs ("XPU unlocked"), the image's header and
+segments are authenticated, **the modem's firmware runs** -- ready 60 ms after the MBA lets it go --, GLINK
+is up (IPCRTR open), QRTR carries its datagrams, and the modem reads its file systems through our rmtfs and
+asks TFTP. It then gives up in its IPA code: with the IPA unclocked, "Failed to initialize GSI channel";
+with the IPA powered (RPMh IP0 and its buses, done) it gets further and the phone resets into a crash
+dump. Next: the IPA's SMMU context (its streams 0x720 and 0x722), which redwood's code makes with redwood's
+numbers. A run (the line must fit XNU's 607 characters: xl now refuses one that does not):
+
+```sh
+XL_DROP="soc_sound_port soc_sound_clock soc_sound_bits soc_audio_stream soc_adsp_mem soc_adsp_mem_size soc_adsp_cx soc_gpu adreno_speed battery pmi_haptics slider" \
+XL_SECS=180 XL_CMDLINE="gpu=0 ufs=2 adsp=0 sound=0 modem_step=11 modem_leave=1 modem_pause=0 modem_no_nav=1 \
+  modem_buffer=0x95d00000 modem_meta=0x96000000 soc_mpss_mem=0x8e000000 soc_mpss_mem_size=0x7800000 \
+  soc_mba_mem=0x96600000 soc_mba_mem_size=0x200000" ./xl run
+```
+
+What each of those was found to need, each a crash dump first: `modem_meta` (RMB_PMI_META_DATA holds 32 bits,
+and this kernel's pages lie above 4 GB), `modem_no_nav` (the 6T's hypervisor has no NAV VM for the files'
+buffer), `modem_buffer` (redwood's default is ordinary memory here), `modem_leave=1` (halting and taking memory
+back from a modem that runs resets the phone; the next restart ends it instead), `modem_pause=0 gpu=0` (the
+modem's thread stalled while the GPU was being handed to the system). `modem_stop=1..3` ends step 7 early.
+USB brings the run's log back short: read it from `logdump` on a fresh loader (`xl reboot`, `xl enter`,
+`xl flash-read logdump 0 166000 F`). Every run on a fresh loader: one reused after a run stops answering.
+
 ## Firmware
 
 ```sh
