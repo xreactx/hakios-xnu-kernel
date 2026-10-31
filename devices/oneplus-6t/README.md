@@ -276,6 +276,11 @@ steps' end. On the a630 step 4 now notes that it switched CX on, and the end swi
 with the GMU's address space up); a CX found on is only switched off first, not taken down by `stale_stop()`, whose
 GMU, sequencer and SMMU are redwood's addresses.
 
+Step 5 works (run 000137, 31 October): the 300 MHz tap asked for (bit 16 of `0x52004`), memnoc and the memory's clock
+on (both voted: their status is not required), snoc on; the GMU's clock source to the tap / 1.5 (`0x602`: 200 MHz, the
+same as redwood's); `cxo` and `cx_gmu` running (their status bits are halt checks Linux trusts). The SDM845 has no hub,
+AHB or CB clock in the GPU's controller, and redwood's frequency counter is its vendor kernel's: not used here.
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the

@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             4
+#define PORTED_A630             5
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -715,6 +715,33 @@ step_clocks(void)
 	if (!cx_is_on()) {
 		printf("adreno: %u: CX is off: step 4\n", step);
 		return false;
+	}
+	if (a630) {
+		/*
+		 * gcc-sdm845.c and gpucc-sdm845.c: the memory's and memnoc's clocks are voted (their status bits
+		 * are not the clock's), snoc's is not; the GPU's controller has the GMU's clock source and two
+		 * clocks to give the GMU, no hub, AHB or CB clock; the GMU's 200 MHz is the 300 MHz tap / 1.5,
+		 * as redwood's. The frequency counter of measure_clocks() is redwood's vendor kernel's: not
+		 * used; the two clocks' status bits are the halt checks Linux trusts.
+		 */
+		announce("in the global clock controller: ask for the 300 MHz tap for the GPU; the GPU's bus and memory clocks on");
+		set(&gcc, "pll votes", GCC_PLL_VOTE_SDM845, GCC_PLL_VOTE_GPU_DIV);
+		if (!clock_on(&gcc, "gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CBCR, false) ||
+		    !clock_on(&gcc, "gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_GFX_CBCR, true) ||
+		    !clock_on(&gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR_SDM845, false)) {
+			return false;
+		}
+		announce("in the GPU's clock controller: the GMU's clock to 200 MHz");
+		if (!clock_source("gmu_clk_src", GPUCC_GMU_RCGR, RCG_GPLL0_DIV(3))) {
+			return false;
+		}
+		announce("in the GPU's clock controller: the GMU's clocks on (cxo, cx_gmu)");
+		if (!clock_on(&gpucc, "cxo", GPUCC_CXO_CBCR, true) || !clock_on(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true)) {
+			return false;
+		}
+		printf("adreno: %u: the GMU's clocks run (their status bits say so; not counted: redwood's frequency counter)\n",
+		    step);
+		return true;
 	}
 	announce("in the global clock controller: ask for the 300 MHz tap for the GPU; the GPU's bus and memory clocks on");
 	set(&gcc, "pll votes", GCC_PLL_VOTE, GCC_PLL_VOTE_GPU_DIV);
