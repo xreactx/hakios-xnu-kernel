@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             7
+#define PORTED_A630             9
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -1183,7 +1183,13 @@ step_smmu(void)
 	if (!cx_ready()) {
 		return false;
 	}
-	announce("read the ID registers of the GPU's SMMU (0x3da0000): global registers, which the hypervisor answers for");
+	{
+		char what[120];
+
+		snprintf(what, sizeof(what), "read the ID registers of the GPU's SMMU (%#x): global registers, which the hypervisor "
+		    "answers for", smmu.phys);
+		announce(what);
+	}
 	if (!smmu_layout()) {
 		return false;
 	}
@@ -3875,6 +3881,8 @@ hakios_adreno_init(void)
 		gmu.size = 0x30000;
 		cx_misc.phys = 0x0509e000;      /* dt: qcom,kgsl-3d0 "cx_misc" */
 		rscc.phys = 0x0506a000 + 0x23000;       /* inside the GMU's block on the a630 (a6xx_gmu.c: gmu->mmio + 0x23000) */
+		smmu.phys = 0x05040000;         /* dt: qcom,kgsl-smmu-v2 at 0x5040000, 64 KB */
+		smmu.size = 0x10000;
 		PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
 		printf("adreno: the OnePlus 6T's Adreno 630 (soc_gpu=630): its clock controller at %#x, the command DB at %#lx; steps "
 		    "1 to %u only, so far\n", gpucc.phys, cmd_db_phys, PORTED_A630);
