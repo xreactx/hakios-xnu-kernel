@@ -892,6 +892,7 @@ static const struct cmd_db_header *cmd_db;
 
 static struct block rsc = { "rsc", 0x18220000, 0x10000 };
 #define RSC_TCS_BASE            0xd00
+#define RSC_IRQ_ENABLE          (RSC_TCS_BASE + 0x00)   /* a bit per TCS: its done bit is set (the SDM845 needs it, hakios.adsp.c) */
 #define RSC_IRQ_STATUS          (RSC_TCS_BASE + 0x04)   /* a bit per TCS: done */
 #define RSC_IRQ_CLEAR           (RSC_TCS_BASE + 0x08)
 #define RSC_TCS(n)              (RSC_TCS_BASE + 672 * (n))
@@ -961,15 +962,23 @@ rail_position(const char *name, uint32_t level, uint32_t *address)
 	return -1;
 }
 
-/* The two rails at that level (Linux's proxy request), or given back (level 0). True: RPMh has said done. */
+/*
+ * The rails at that level (Linux's proxy request), or given back (level 0). True: RPMh has said done.
+ * redwood: CX and MSS. A modem started through its MBA (the SDM845, Linux's sdm845_mss): CX, MX and MSS --
+ * and there only MSS is given back: CX and MX are everybody's, and a request of 0 from us would replace
+ * what the boot loader asked for in our name (the display, the storage), which is not known here.
+ */
 static bool
 rails(uint32_t level)
 {
-	static const char *const names[2] = { "cx.lvl", "mss.lvl" };
-	uint32_t addresses[2] = { 0, 0 }, values[2] = { 0, 0 }, done = 0;
+	static const char *const two[2] = { "cx.lvl", "mss.lvl" }, *const three[3] = { "cx.lvl", "mx.lvl", "mss.lvl" },
+	    *const mss_only[1] = { "mss.lvl" };
+	const char *const *names = mba_memory == 0 ? two : level != 0 ? three : mss_only;
+	unsigned count = mba_memory == 0 ? 2 : level != 0 ? 3 : 1;
+	uint32_t addresses[3] = { 0, 0, 0 }, values[3] = { 0, 0, 0 }, done = 0, irq_enable;
 	uint64_t began;
 
-	for (unsigned r = 0; r < 2; r++) {
+	for (unsigned r = 0; r < count; r++) {
 		int position = level == 0 ? 0 : rail_position(names[r], level, &addresses[r]);
 
 		if (level == 0) {
@@ -990,18 +999,22 @@ rails(uint32_t level)
 		lck_mtx_unlock(&hakios_rsc_lock);
 		return false;
 	}
-	printf("mpss: %u: about to ask RPMh, through TCS %u, for cx.lvl (%#x) = %u and mss.lvl (%#x) = %u (level %u%s)\n", step,
-	    RPMH_TCS, addresses[0], values[0], addresses[1], values[1], level, level == 0 ? ": given back" : "");
+	for (unsigned r = 0; r < count; r++) {
+		printf("mpss: %u: about to ask RPMh, through TCS %u, for %s (%#x) = %u (level %u%s)\n", step, RPMH_TCS, names[r],
+		    addresses[r], values[r], level, level == 0 ? ": given back" : "");
+	}
 	snprintf(last_write, sizeof(last_write), "step %u asked RPMh for the modem's rails at level %u", step, level);
 	hold();
+	irq_enable = rd(rsc.base + RSC_IRQ_ENABLE);
+	wr(rsc.base + RSC_IRQ_ENABLE, irq_enable | 1u << RPMH_TCS);
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
-	for (unsigned r = 0; r < 2; r++) {
+	for (unsigned r = 0; r < count; r++) {
 		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r), MSGID_WRITE_WAITED);
 		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 4, addresses[r]);
 		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 8, values[r]);
 	}
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_WAIT_FOR_DONE, 3);
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 3);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_WAIT_FOR_DONE, (1u << count) - 1);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, (1u << count) - 1);
 	settle();
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~TCS_TRIGGER);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_ACTIVE_MODE);
@@ -1020,8 +1033,143 @@ rails(uint32_t level)
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
+	wr(rsc.base + RSC_IRQ_ENABLE, irq_enable);
 	lck_mtx_unlock(&hakios_rsc_lock);
 	return done != 0;
+}
+
+/* ---- a modem started through its MBA (the SDM845's): power, clocks, reset -------------------------- */
+
+/*
+ * dt qcom,mss@4080000 (qcom,pil-q6v55-mss, qcom,pil-self-auth); Linux's qcom_q6v5_mss.c, sdm845_mss. Its
+ * clocks are the global clock controller's (gcc-sdm845.c): xo is the crystal (on: RPMh's, the boot
+ * loader's), prng and boot_rom_ahb ("mem") and the modem's GPLL0 tap are votes in 0x52004, the others
+ * branches of their own, bit 0 to enable and bit 31 "off". Linux's order: the rails, the proxy clocks (xo,
+ * prng) and the reset ones (iface, snoc_axi) -- step 4; the reset let go -- then the active ones (bus,
+ * mem, gpll0_mss, mnoc_axi) -- step 5. A clock found on is left as found at the end.
+ */
+static struct block gcc = { "gcc", 0x00100000, 0x90000 };
+static struct block qdsp6 __attribute__((unused)) = { "the modem's Hexagon", 0x04080000, 0x1000 };
+static struct block rmb __attribute__((unused)) = { "the modem's RMB", 0x04180000, 0x1000 };
+#define GCC_VOTE                0x52004
+#define CBCR_OFF                (1u << 31)
+#define QDSP6SS_RESET_REG       0x014
+#define QDSP6SS_PWR_CTL_REG     0x030
+#define QDSP6SS_SLEEP           0x03c
+#define RMB_MBA_IMAGE_REG       0x00
+#define RMB_PBL_STATUS_REG      0x04
+#define RMB_MBA_COMMAND_REG     0x08
+#define RMB_MBA_STATUS_REG      0x0c
+#define RMB_MBA_MSS_STATUS      0x40
+#define RMB_MBA_ALT_RESET       0x44
+/* dt: reg-names restart_reg, pdc_sync, halt_q6, halt_modem, halt_nc of qcom,mss@4080000 */
+static struct block mss_restart = { "AOSS: the modem's", 0x0c2b0000, 0x1000 };
+static struct block mss_pdc_sync = { "PDC: the modem's", 0x0b2e0000, 0x1000 };
+static struct block mss_halt_q6 = { "TCSR: halt of the Hexagon's bus", 0x01f63000, 0x1000 };
+static struct block mss_halt_modem = { "TCSR: halt of the modem's bus", 0x01f65000, 0x1000 };
+static struct block mss_halt_nc = { "TCSR: halt of the modem's NC bus", 0x01f64000, 0x1000 };
+static struct block *const mss_halts[3] = { &mss_halt_q6, &mss_halt_modem, &mss_halt_nc };
+#define AXI_HALTREQ_REG         0x0
+#define AXI_HALTACK_REG         0x4
+#define AXI_IDLE_REG            0x8
+
+static const struct mss_clock {
+	const char *name;
+	uint32_t enable, bit, status;   /* status: the register whose bit 31 says "off"; 0: none */
+	bool active;                    /* Linux's active clocks: step 5; else step 4 */
+} mss_clocks[] = {
+	{ "prng (gcc_prng_ahb)", GCC_VOTE, 13, 0x34004, false },
+	{ "iface (gcc_mss_cfg_ahb)", 0x8a000, 0, 0x8a000, false },
+	{ "snoc_axi (gcc_mss_snoc_axi)", 0x8a150, 0, 0x8a150, false },
+	{ "bus (gcc_mss_q6_memnoc_axi)", 0x8a154, 0, 0x8a154, true },
+	{ "mem (gcc_boot_rom_ahb)", GCC_VOTE, 10, 0x38004, true },
+	{ "gpll0_mss (gcc_mss_gpll0_div_clk_src)", GCC_VOTE, 17, 0, true },
+	{ "mnoc_axi (gcc_mss_mfab_axis)", 0x8a004, 0, 0x8a004, true },
+};
+#define MSS_CLOCKS              (sizeof(mss_clocks) / sizeof(mss_clocks[0]))
+static bool mss_clock_ours[MSS_CLOCKS];         /* switched on by us: to be switched off */
+static bool mss_rails_ours;
+
+/* The clocks of one kind (Linux's active ones, or the others) on; true if each says it runs. */
+static bool
+mss_clocks_on(bool active)
+{
+	bool all = true;
+
+	need(&gcc);
+	for (unsigned i = 0; i < MSS_CLOCKS; i++) {
+		const struct mss_clock *c = &mss_clocks[i];
+		uint32_t was;
+
+		if (c->active != active) {
+			continue;
+		}
+		was = rd(gcc.base + c->enable);
+		if (!(was & 1u << c->bit)) {
+			put(&gcc, c->name, c->enable, was | 1u << c->bit);
+			mss_clock_ours[i] = true;
+		}
+		sleep_us(10);
+		if (c->status != 0) {
+			uint32_t status = rd(gcc.base + c->status);
+
+			printf("mpss: %u: clock %s: %s (%#x)%s\n", step, c->name, status & CBCR_OFF ? "STILL OFF" : "runs", status,
+			    mss_clock_ours[i] ? "" : ", found on");
+			all = all && !(status & CBCR_OFF);
+		} else {
+			printf("mpss: %u: clock %s: asked for (a tap: no status)%s\n", step, c->name, mss_clock_ours[i] ? "" : ", found on");
+		}
+	}
+	return all;
+}
+
+/* What was switched on for the modem, off again: our clocks, then our request for the MSS rail. */
+static void
+mss_unpower(void)
+{
+	for (unsigned i = MSS_CLOCKS; i-- > 0;) {
+		if (mss_clock_ours[i]) {
+			const struct mss_clock *c = &mss_clocks[i];
+
+			wr(gcc.base + c->enable, rd(gcc.base + c->enable) & ~(1u << c->bit));
+			mss_clock_ours[i] = false;
+		}
+	}
+	if (mss_rails_ours && !leaving) {
+		rails(0);
+	}
+	mss_rails_ours = false;
+	printf("mpss: %u: the modem's clocks that were ours are off%s\n", step, leaving ? "" : ", and the MSS rail given back");
+}
+
+/* Step 4 for a modem started through its MBA: rails, the proxy and reset clocks; its registers read. */
+static bool
+mba_power(void)
+{
+	announce("ask RPMh for the modem's rails (CX, MX, MSS at 384), and switch on its proxy and reset clocks (prng, iface, "
+	    "snoc_axi): nothing is started yet");
+	if (!rails(384)) {
+		return false;
+	}
+	mss_rails_ours = true;
+	if (!mss_clocks_on(false)) {
+		return false;
+	}
+	/*
+	 * (the modem's own registers -- its Hexagon, its RMB -- only once its reset has been let go, step 5, as
+	 * Linux reads them: a block held in reset may hang the bus. These are the always-on ones around it.)
+	 */
+	announce("read the modem's reset as the always-on parts hold it: the AOSS's restart (0xc2b0000), the PDC's sync "
+	    "(0xb2e0100), and the three halts of its buses (0x1f63000, 0x1f64000, 0x1f65000)");
+	get(&mss_restart, "restart", 0);
+	get(&mss_pdc_sync, "modem sync reset", 0x100);
+	for (unsigned i = 0; i < 3; i++) {
+		get(mss_halts[i], "halt requested", AXI_HALTREQ_REG);
+		get(mss_halts[i], "halt acknowledged", AXI_HALTACK_REG);
+		get(mss_halts[i], "idle", AXI_IDLE_REG);
+	}
+	printf("mpss: %u: THE MODEM HAS ITS RAILS AND FIRST CLOCKS; nothing of it is started\n", step);
+	return true;
 }
 
 
@@ -1580,6 +1728,9 @@ step_header(void)
 	uint64_t answer = ~0ull;
 	int32_t result;
 
+	if (mba_memory != 0) {
+		return mba_power();
+	}
 	if (image.segments == 0) {
 		return false;
 	}
@@ -1682,6 +1833,10 @@ segment_check(volatile uint8_t *dsp_memory, unsigned s)
 static bool
 step_image(void)
 {
+	if (mba_memory != 0) {
+		printf("mpss: %u: a modem started through its MBA: this step is not written yet\n", step);
+		return false;
+	}
 	volatile uint8_t *dsp_memory;
 	uint64_t written = 0, cleared = 0, wrong = 0, began;
 
@@ -6293,6 +6448,9 @@ static bool keep;                       /* the DSP and the link stay up while th
 static void
 steps_over(uint32_t done)
 {
+	if (mss_rails_ours || mss_clock_ours[0] || mss_clock_ours[1] || mss_clock_ours[2]) {
+		mss_unpower();
+	}
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started && done == last_step && keep) {
 		printf("mpss: THE MODEM STAYS ON while the system runs%s\n", link_runs ? ", and the link with it" : "");
