@@ -555,14 +555,15 @@ gfx_vote_630(void)
 		}
 		pm8005_s1_show("the other rails raised");
 	}
-	for (uint32_t position = 1; position <= 9; position++) {
+	/* adreno_gfx=3: straight to position 3 (Android's first request: init-voltage-level 49, i.e. 64), then 9 */
+	for (uint32_t position = test == 3 ? 3 : 1; position <= 9; position = test == 3 && position == 3 ? 9 : position + 1) {
 		bool done = apps_vote(address, position);
 
 		pm8005_s1_show(done ? "the position done" : "the position not done");
 		if (done) {
 			continue;
 		}
-		if (test == 2) {
+		if (test >= 2) {
 			break;
 		}
 		/* (gfx.lvl's levels run to 416 and mx.lvl's to 384: perhaps the rail waits for the memories' one) */
