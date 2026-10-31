@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             5
+#define PORTED_A630             6
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -953,6 +953,9 @@ cx_ready(void)
 		    cx_is_on() ? "on" : "off", gmu_clock);
 		return false;
 	}
+	if (a630) {
+		return true;            /* (the SDM845's GPU controller has no AHB clock of its own to measure, nor this counter) */
+	}
 	ahb_hz = measure_quietly(GPUCC_DEBUG_AHB);
 	if (ahb_hz == MEASURE_FAILED) {
 		printf("adreno: %u: the frequency counter did not finish (step 5 shows whether it works)\n", step);
@@ -1014,7 +1017,12 @@ step_first_words(void)
 	if (!cx_ready()) {
 		return false;
 	}
-	announce("read registers of the GMU (0x3d6a000): the first words from the GPU block itself");
+	{
+		char what[100];
+
+		snprintf(what, sizeof(what), "read registers of the GMU (%#x): the first words from the GPU block itself", gmu.phys);
+		announce(what);
+	}
 	get(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET);
 	get(&gmu, "cm3_boot_config", GMU_CM3_BOOT_CONFIG);
 	get(&gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT);
@@ -1041,6 +1049,16 @@ step_first_words(void)
 		get(&gmu, "dtcm, where firmware has its versions", GMU_DTCM_VERSIONS + 4 * i);
 	}
 
+	if (a630) {
+		/*
+		 * The a630's bus interface is VBIF, in the 3D core's own registers (a6xx.xml: words 0x3000 on), which
+		 * are not to be read while the core has no power; not GBIF in the CX half. Only cx_misc here.
+		 */
+		announce("read the CX odds and ends (0x509e000); the a630's bus interface (VBIF) is the 3D core's, left alone");
+		get(&cx_misc, "system_cache_cntl_0", CX_MISC_SYSTEM_CACHE_CNTL_0);
+		get(&cx_misc, "system_cache_cntl_1", CX_MISC_SYSTEM_CACHE_CNTL_1);
+		return true;
+	}
 	announce("read the GPU's bus interface (0x3d0f000) and the CX odds and ends (0x3d9e000)");
 	get(&gbif, "scache_cntl0", GBIF_SCACHE_CNTL0);
 	get(&gbif, "halt", GBIF_HALT);
@@ -3848,6 +3866,9 @@ hakios_adreno_init(void)
 	if (PE_parse_boot_argn("soc_gpu", &only, sizeof(only)) && only == 630) {
 		a630 = true;
 		gpucc.phys = 0x05090000;        /* dt: qcom,gpucc@5090000 */
+		gmu.phys = 0x0506a000;          /* dt: qcom,gmu "kgsl_gmu_reg" */
+		gmu.size = 0x30000;
+		cx_misc.phys = 0x0509e000;      /* dt: qcom,kgsl-3d0 "cx_misc" */
 		PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
 		printf("adreno: the OnePlus 6T's Adreno 630 (soc_gpu=630): its clock controller at %#x, the command DB at %#lx; steps "
 		    "1 to %u only, so far\n", gpucc.phys, cmd_db_phys, PORTED_A630);
