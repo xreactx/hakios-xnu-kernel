@@ -2094,7 +2094,13 @@ step_gmu_space(void)
 		}
 		printf("adreno: %u: %llu bytes of firmware, starting %08x %08x\n", step, gmu_firmware_size,
 		    ((const uint32_t *)gmu_firmware)[0], ((const uint32_t *)gmu_firmware)[1]);
-		if (!block_new(&gmu_space, &gmu_log, GMU_LOG_ADDRESS, GMU_LOG_SIZE, PTE_GMU) ||
+		/*
+		 * And Linux's "dummy" pages at 0x60000000 (a6xx_gmu_memory_probe, every a6xx): the a660's firmware
+		 * asks for them in its file; the a630's image cannot say so, and without them its firmware faulted
+		 * (CM3_FAULT) on the slumber request, after collapsing GX (runs 041907-042922).
+		 */
+		if (!block_new(&gmu_space, &gmu_blocks[gmu_block_count++], 0x60000000u, GMU_LOG_ADDRESS - 0x60000000u, PTE_GMU) ||
+		    !block_new(&gmu_space, &gmu_log, GMU_LOG_ADDRESS, GMU_LOG_SIZE, PTE_GMU) ||
 		    !block_new(&gmu_space, &gmu_hfi, GMU_HFI_ADDRESS, PAGE_SIZE, PTE_GMU) ||
 		    !block_new(&gmu_space, &gmu_debug, GMU_DEBUG_ADDRESS, GMU_DEBUG_SIZE, PTE_GMU)) {
 			return false;
@@ -2288,7 +2294,14 @@ struct hfi_table {
 };
 #define HFI_QUEUES              3               /* 0: ours to the GMU; 1: its answers; 2: its debugging messages */
 #define HFI_QUEUE_WORDS         1024
-#define HFI_QUEUE_AT(n)         (((uint32_t)sizeof(struct hfi_table) + 15) / 16 * 16 + 4096 * (n))
+#define HFI_QUEUE_AT(n)         (a630 ? 4096u * ((n) + 1) : ((uint32_t)sizeof(struct hfi_table) + 15) / 16 * 16 + 4096 * (n))
+/*
+ * The a630's legacy GMU wants Linux's table (a6xx_hfi_init with gmu->legacy): two queues, at 4 and 8 KB,
+ * its answers' queue numbered 4, the watermarks and the answer request 1, and the table's size in bytes.
+ * Given the layout above it wrote 0xfe to hfi_ctrl_status and never started (run 041230).
+ */
+#define HFI_QUEUES_630          2
+#define HFI_ANSWERS_ID_630      4
 
 static volatile struct hfi_table *hfi;  /* the uncached view */
 
@@ -2298,11 +2311,13 @@ static volatile struct hfi_table *hfi;  /* the uncached view */
  * the GPU sleeps and wakes -- mx.lvl, cx.lvl and the GPU's own rail. Linux's a6xx_gmu_rpmh_init(),
  * the a630's branches; the registers (in words) from a6xx.xml.h and a6xx_gmu.xml.h, the bases from
  * sdm845.dtsi ("gmu_pdc", "gmu_pdc_seq"; the 6T's own tree gives one range over both, 0xb200000).
- * The GPU's rail in those commands is 0x30080, Linux's constant for the a630 -- not where this
- * phone's command DB has gfx.lvl (0x30050): with that, the wake (run 002434) never finished, the
- * sequencer busy for good (it stayed so across runs, until the phone restarted).
+ * The GPU's rail in those commands is where the command DB has gfx.lvl (0x30050 on the 6T; the GMU's
+ * firmware asks for the same). Linux's constant for the a630, 0x30080, is xo.lvl here: it seemed to
+ * work (run 002741) only because the GPU's rail was then never asked for. Any request for gfx.lvl above
+ * retention hung -- RPMh set PM8005 S1 to 580 mV and never finished, until the phone restarted --
+ * while the UEFI ran Qualcomm's CPRDxe a second time; the 6T's UEFI leaves it out since (run 040840).
  */
-#define PDC_GFX_ADDRESS_630     0x30080
+#define PDC_GFX_ADDRESS_630     0x30080 /* (only if the command DB has no gfx.lvl) */
 static struct block pdc630 = { "pdc", 0x0b280000, 0x10000 };
 static struct block pdc630_seq = { "pdc sequencer", 0x0b480000, 0x10000 };
 #define PDC_GPU_ENABLE_PDC_630  (4 * 0x1140)
@@ -2366,10 +2381,12 @@ rpmh_init_630(void)
 {
 	static const uint32_t rsc[5] = { RSCC_SEQ_630, 0xa1e6a6e7, 0xa2e081e1, 0xe9a982e2, 0x0020e8a8 };
 	static const uint32_t pdc_program[5] = { 0xfebea1e1, 0xa5a4a3a2, 0x8382a6e0, 0xbce3e284, 0x002081fc };
-	uint32_t gfx = PDC_GFX_ADDRESS_630;
+	uint32_t gfx = rpmh_resource("gfx.lvl", NULL, NULL);
 
-	printf("adreno: %u: the PDC's votes for the GPU's rail go to %#x (Linux's; the command DB's gfx.lvl is %#x)\n", step, gfx,
-	    rpmh_resource("gfx.lvl", NULL, NULL));
+	if (gfx == 0) {
+		gfx = PDC_GFX_ADDRESS_630;
+	}
+	printf("adreno: %u: the PDC's votes for the GPU's rail go to %#x\n", step, gfx);
 	pdc_wrong = 0;
 	announce("program the GMU's RPMh channel and the GPU's PDC (0xb280000, its sequencer 0xb480000) for the GPU's sleep and "
 	    "wake, as Linux does for the a630 -- the first writes outside the GPU block");
@@ -2494,6 +2511,27 @@ step_gmu_start(void)
 		printf("adreno: %u: the page for the messages is not in one piece\n", step);
 		return false;
 	}
+	if (a630) {
+		hfi->version = 0;
+		hfi->words = 6 * 4 + HFI_QUEUES_630 * (uint32_t)sizeof(struct hfi_queue);    /* (bytes, as Linux has it) */
+		hfi->first_queue = 6;
+		hfi->queue_words = sizeof(struct hfi_queue) / 4;
+		hfi->queues = hfi->active_queues = HFI_QUEUES_630;
+		for (unsigned i = 0; i < HFI_QUEUES_630; i++) {
+			hfi->queue[i].start = GMU_HFI_ADDRESS + HFI_QUEUE_AT(i);
+			hfi->queue[i].type = (i == 0 ? 0 : HFI_ANSWERS_ID_630) | 10u << 8;
+			hfi->queue[i].words = HFI_QUEUE_WORDS;
+			hfi->queue[i].message_words = 0;
+			hfi->queue[i].unused[0] = 0;            /* dropped */
+			hfi->queue[i].unused[1] = 1;            /* rx watermark */
+			hfi->queue[i].unused[2] = 1;            /* tx watermark */
+			hfi->queue[i].unused[3] = 1;            /* rx request */
+			hfi->queue[i].unused[4] = 0;            /* tx request */
+			hfi->queue[i].read = hfi->queue[i].write = 0;
+			hfi->queue[i].status = 1;
+		}
+		return gmu_start_630();
+	}
 	hfi->words = sizeof(struct hfi_table) / 4;
 	hfi->first_queue = 6;
 	hfi->queue_words = sizeof(struct hfi_queue) / 4;
@@ -2607,6 +2645,11 @@ static struct block pdc = { "pdc", 0x0b290000, 0x10000 };       /* dt: qcom,gmu 
 #define GMU_POWER_COUNTER_ENABLE GMU_WORD(0x5040)
 #define OOB_BOOT_SLUMBER_630    22
 #define OOB_BOOT_SLUMBER_ACK_630 30
+#define OOB_DCVS_630            23
+#define OOB_DCVS_ACK_630        31
+#define GMU_DCVS_ACK_OPTION     GMU_WORD(0x23fc)
+#define GMU_DCVS_PERF_SETTING   GMU_WORD(0x23fd)
+#define GMU_DCVS_BW_SETTING     GMU_WORD(0x23fe)
 #define OOB_GPU_630             16
 #define OOB_GPU_ACK_630         24
 #define HFI_V1_INIT             0
@@ -2740,6 +2783,19 @@ gmu_talk_630(void)
 		return false;
 	}
 	printf("adreno: %u: THE GMU TAKES THE FIRST VERSION'S MESSAGES: it is ready for the 3D core\n", step);
+	/*
+	 * Its first level (a6xx_gmu_set_initial_freq, legacy: the DCVS registers and out-of-band request 23).
+	 * Android's kgsl sends it right after the messages, at the GPU's level 1 and every bus level allowed
+	 * (0x30000001, 0xff); without one the firmware faulted on the slumber request (run 042737).
+	 */
+	put(&gmu, "dcvs_ack_option", GMU_DCVS_ACK_OPTION, 0);
+	put(&gmu, "dcvs_perf_setting", GMU_DCVS_PERF_SETTING, 3u << 28 | 1);
+	put(&gmu, "dcvs_bw_setting", GMU_DCVS_BW_SETTING, 0xff);
+	if (!oob_630("the first level (DCVS)", OOB_DCVS_630, OOB_DCVS_ACK_630)) {
+		return false;
+	}
+	put(&gmu, "clear the request", GMU_HOST2GMU_INTR_SET, 1u << OOB_DCVS_ACK_630);
+	printf("adreno: %u: the GMU takes its first level\n", step);
 	return true;
 }
 
@@ -2747,17 +2803,45 @@ gmu_talk_630(void)
 static void
 gmu_slumber_630(void)
 {
+	/* (run 041517: the GMU faulted -- CM3_FAULT, bit 23 -- somewhere in here; its state after each part) */
+#define GMU_SAYS(after) printf("adreno: %u: after %s: the GMU's interrupts to us %#x\n", step, after, \
+	    rd(gmu.base + GMU_GMU2HOST_INTR_INFO))
+	/*
+	 * As Android's kgsl does it on this phone (its trace going to slumber, 2026-10-31): the power counter
+	 * off, the slumber option and the votes for the time asleep (GX 1, mx 4), the request. Not the SPTP's
+	 * collapse or GX's retention first, as Linux's a6xx_sptprac_disable does: with those done by us the
+	 * GMU's firmware faulted on the request (CM3_FAULT, run 041907) -- it does them itself.
+	 */
 	put(&gmu, "power_counter_enable", GMU_POWER_COUNTER_ENABLE, 0);
-	put(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR, rd(gpucc.base + GPUCC_GX_GDSCR) | 1u << 11);  /* retention */
-	put(&gmu, "gx_sptprac_power_control", GMU_GX_SPTPRAC_POWER_CONTROL, 0x778001);
-	wait_for(&gmu, GMU_SPTPRAC_PWR_CLK_STATUS, 0x04, 0x04, 10);
 	put(&gmu, "boot_slumber_option", GMU_BOOT_SLUMBER_OPTION, 1);
-	if (oob_630("the slumber request", OOB_BOOT_SLUMBER_630, OOB_BOOT_SLUMBER_ACK_630)) {
+	put(&gmu, "gx_vote_idx", GMU_GX_VOTE_IDX, 1);
+	put(&gmu, "mx_vote_idx", GMU_MX_VOTE_IDX, 4);
+	if (!oob_630("the slumber request", OOB_BOOT_SLUMBER_630, OOB_BOOT_SLUMBER_ACK_630)) {
+		const volatile uint32_t *log = (const volatile uint32_t *)gmu_log.memory;
+
+		GMU_SAYS("the slumber request");
+		to_memory(gmu_log.memory, 256);
+		for (uint32_t i = 0; i < 64; i += 8) {
+			printf("adreno: %u: the GMU's log +%#x: %x %x %x %x %x %x %x %x\n", step, 4 * i, log[i], log[i + 1], log[i + 2],
+			    log[i + 3], log[i + 4], log[i + 5], log[i + 6], log[i + 7]);
+		}
+		if (!space_faulted(&gmu_space)) {
+			printf("adreno: %u: the SMMU has refused the GMU nothing\n", step);
+		}
+		get(&gmu, "ao_host_interrupt_status", GMU_AO_HOST_INTERRUPT_STATUS);
+		get(&gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT);
+		get(&gmu, "hfi_ctrl_status", GMU_HFI_CTRL_STATUS);
+		get(&gmu, "sptprac_pwr_clk_status", GMU_SPTPRAC_PWR_CLK_STATUS);
+		get(&gmu, "rpmh_power_state", GMU_RPMH_POWER_STATE);
+	} else {
 		put(&gmu, "clear the request", GMU_HOST2GMU_INTR_SET, 1u << OOB_BOOT_SLUMBER_ACK_630);
 		printf("adreno: %u: the GMU %s (rpmh_power_state %#x)\n", step, rd(gmu.base + GMU_RPMH_POWER_STATE) == 0x0f ?
 		    "slumbers" : "DOES NOT SAY IT SLUMBERS", rd(gmu.base + GMU_RPMH_POWER_STATE));
 	}
 	put(&gmu, "ao_ahb_fence_ctrl", GMU_AO_AHB_FENCE_CTRL, 0);
+	put(&gmu, "rscc_control_req (sleep)", GMU_RSCC_CONTROL_REQ, 1);
+	sleep_us(200);
+	put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
 }
 
 static bool
@@ -2833,6 +2917,7 @@ programmed:
 #define HFI_PREPARE_SLUMBER     33
 #define HFI_ERROR               100
 #define HFI_ANSWER              1               /* in bits 19:16 */
+#define HFI_ANSWER_630          126             /* the legacy GMU's: its message id (Linux's HFI_F2H_MSG_ACK) */
 #define HFI_NO_INDEX            0xff
 
 struct hfi_perf_table {
@@ -2869,8 +2954,9 @@ hfi_receive(unsigned which, uint32_t number, uint32_t *verdict)
 			}
 			at = (at + 1) % HFI_QUEUE_WORDS;
 		}
-		queue->read = (at + 3) / 4 * 4 % HFI_QUEUE_WORDS;
-		if ((message[0] >> 16 & 0xf) == HFI_ANSWER && message[1] >> 20 == number) {
+		queue->read = a630 ? at : (at + 3) / 4 * 4 % HFI_QUEUE_WORDS;  /* (the legacy GMU's are not aligned) */
+		if ((a630 ? (message[0] & 0xff) == HFI_ANSWER_630 : (message[0] >> 16 & 0xf) == HFI_ANSWER) &&
+		    (message[1] >> 20 & 0xfff) == number) {
 			*verdict = message[2];
 			answered = true;
 		} else {
@@ -2965,7 +3051,7 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 	printf("adreno: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
 	snprintf(last_write, sizeof(last_write), "step %u sent the GMU message %u (%s)", step, id, what);
 	hold(true);
-	for (uint32_t i = 0; i < (words + 3) / 4 * 4; i++) {
+	for (uint32_t i = 0; i < (a630 ? words : (words + 3) / 4 * 4); i++) {    /* (the legacy GMU's: not padded) */
 		data[at] = i < words ? message[i] : 0xfafafafa;
 		at = (at + 1) % HFI_QUEUE_WORDS;
 	}
@@ -2983,7 +3069,9 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 			break;
 		}
 	}
-	hfi_receive(2, ~0u, &waiting);
+	if (!a630) {
+		hfi_receive(2, ~0u, &waiting);
+	}
 	if (!answered || verdict != 0) {
 		printf("adreno: %u: the GMU %s (%#x) to %s; fw_init_result %#x, gmu2host_intr_info %#x\n", step,
 		    answered ? "says no" : "does not answer", verdict, what, rd(gmu.base + GMU_CM3_FW_INIT_RESULT),
@@ -4622,8 +4710,28 @@ hakios_adreno_init(void)
 	 * keep the end of the log saying where things stand.
 	 */
 	for (uint32_t second = 1; second <= watch_seconds; second++) {
+		static bool fault_seen;
+
 		sleep_ms(1000);
-		printf("adreno: alive %u s after step %u; %s\n", second, done, last_write);
+		if (!(a630 && gmu_talks)) {
+			printf("adreno: alive %u s after step %u; %s\n", second, done, last_write);
+			continue;
+		}
+		/* (run 041517: the a630's GMU had faulted -- CM3_FAULT, bit 23 -- by the time of the slumber request) */
+		printf("adreno: alive %u s after step %u; the GMU's interrupts to us %#x, always-on ones %#x\n", second, done,
+		    rd(gmu.base + GMU_GMU2HOST_INTR_INFO), rd(gmu.base + GMU_AO_HOST_INTERRUPT_STATUS));
+		if ((rd(gmu.base + GMU_GMU2HOST_INTR_INFO) & 1u << 23) && !fault_seen) {
+			const volatile uint32_t *log = (const volatile uint32_t *)gmu_log.memory;
+
+			fault_seen = true;
+			printf("adreno: THE GMU'S PROCESSOR HAS FAULTED (CM3_FAULT)\n");
+			to_memory(gmu_log.memory, 256);
+			for (uint32_t i = 0; i < 64; i += 8) {
+				printf("adreno: the GMU's log +%#x: %x %x %x %x %x %x %x %x\n", 4 * i, log[i], log[i + 1], log[i + 2],
+				    log[i + 3], log[i + 4], log[i + 5], log[i + 6], log[i + 7]);
+			}
+			gmu_post_mortem();
+		}
 	}
 	gpu_block_stop();
 	if (PE_parse_boot_argn("adreno_return", &only, sizeof(only)) && only) {

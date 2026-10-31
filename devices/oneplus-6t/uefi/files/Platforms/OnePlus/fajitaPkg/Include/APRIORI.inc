@@ -29,7 +29,10 @@ APRIORI DXE {
   INF Binaries/enchilada/QcomPkg/Drivers/PdcDxe/PdcDxe.inf
   INF Binaries/enchilada/QcomPkg/Drivers/ClockDxe/ClockDxe.inf
 !if $(USE_CUSTOM_DISPLAY_DRIVER) == 1
-  INF Binaries/enchilada/QcomPkg/Drivers/CPRDxe/CPRDxe.inf
+  # Not CPRDxe: the stock boot loader has done CPR before this UEFI starts, and run again it leaves the GPU's
+  # rail (gfx.lvl, PM8005 S1) where RPMh never finishes raising it above retention -- every request for it
+  # from the GMU or the application processor hangs until the phone restarts (HakiOS runs 035830, 040840).
+  #INF Binaries/enchilada/QcomPkg/Drivers/CPRDxe/CPRDxe.inf
 !endif
 
   INF MdeModulePkg/Universal/Disk/DiskIoDxe/DiskIoDxe.inf
