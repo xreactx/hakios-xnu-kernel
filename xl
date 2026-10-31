@@ -164,19 +164,22 @@ run() { # run <oem command> <label>
 		fi
 		# XNU's boot-args hold 607 characters (BOOT_LINE_LENGTH 608), and the loader cuts the line there without
 		# a word: on 31 October that cut soc_apcs_ipc=0x1799000c in the middle, the audio DSP rang a doorbell at
-		# 0x179, and the phone reset into a crash dump four times. The loader puts up to 84 of its own in front
-		# (debug=0x8 serial=3, rd=md0, cpus=1, hv_wdt_pet=1, battery_shared_pa=...): a line that may not fit is refused.
+		# 0x179, and the phone reset into a crash dump four times. The loader puts up to 120 of its own in front
+		# (debug=0x8 serial=3, rd=md0, cpus=1, hv_wdt_pet=1, ufs_shared_pa=..., battery_shared_pa=...): a line that may not fit is refused.
 		local line="loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args"
-		if [ $(( ${#line} + 84 )) -gt 607 ]; then
-			echo "xl: the command line is ${#line} characters, and the loader adds up to 84: more than XNU's 607." >&2
-			echo "xl: it would lose: ${line:$(( 607 - 84 ))}" >&2
+		if [ $(( ${#line} + 120 )) -gt 607 ]; then
+			echo "xl: the command line is ${#line} characters, and the loader adds up to 120: more than XNU's 607." >&2
+			echo "xl: it would lose: ${line:$(( 607 - 120 ))}" >&2
 			echo "xl: leave out what this run does not need (XL_DROP=\"NAME ...\" for devices/${DEVICE:-poco-x5-pro}/run.args)" >&2
 			return 1
 		fi
 		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
 		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
 	fi
-	local live=; live_loader && live=1
+	# (asked twice: a loader just given a large image may not answer the first time, and then the run went without
+	# its live log, so that a phone that reset said nothing of when -- 31 October)
+	local live=; { live_loader || { sleep 2; live_loader; }; } && live=1
+	[ -n "$XL_FOLLOW" ] && [ -z "$live" ] && echo "xl: this loader does not say it answers while the kernel runs: no live log" >&2
 	fb $1 >/dev/null
 	if [ -n "$live" ] && [ "$1" != "oem selftest" ]; then
 		# the loader goes on answering: ask every two seconds until the result is no longer "running".
@@ -200,7 +203,7 @@ run() { # run <oem command> <label>
 		result=$(FB_TIMEOUT=$(( ${XL_SECS:-8} + 100 )) fb getvar result | grep '^result:')
 	fi
 	if [ -z "$result" ]; then
-		echo "xl: no answer — the kernel hung; waiting for the watchdog to reset the phone"
+		echo "xl: no answer — the kernel hung; waiting for the watchdog to reset the phone (live log fetches: ${followed_n:-0})"
 		wait_for android 120 && echo "xl: phone is back in Android" || echo "xl: phone did not come back (state: $(state))"
 		return 2
 	fi

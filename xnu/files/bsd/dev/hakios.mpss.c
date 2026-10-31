@@ -1094,6 +1094,17 @@ static bool mss_rails_ours;
 static bool mss_reset_done;             /* the reset let go by us (step 5): pulsed again at the end, as Linux stops it */
 static bool mss_mba_running;            /* its Hexagon started (step 6): its buses halted at the end */
 static bool mss_mpss_assigned, mss_mba_assigned;        /* the regions handed to the modem: to be taken back */
+static uint32_t mss_mpss_owners = 1;    /* who has the modem's region now (OWNER_HLOS, OWNER_MSA): it is shared while loaded */
+static bool mba_load_image(void);
+
+static uint32_t
+modem_stop(void)
+{
+	uint32_t where = 0;
+
+	PE_parse_boot_argn("modem_stop", &where, sizeof(where));
+	return where;
+}
 static bool mss_assign(uint64_t address, uint64_t size, bool to_modem, const char *what);
 static void mss_halt_port(struct block *b);
 static bool mba_boot(void);
@@ -1784,7 +1795,14 @@ dsp_shutdown(const char *why)
 		link_stop();
 	}
 	stopped_by_its_word = dsp_ask_to_stop(leaving ? 2000 : 5000);
-	result = scm("to shut the modem down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, pas_mpss, 0, 0, 0, &answer);
+	if (mba_memory != 0) {
+		/* (no TrustZone image to shut down: Linux's q6v5_stop() -- the buses halted, the reset, the memory back) */
+		mss_unpower();
+		answer = 0;
+		result = 0;
+	} else {
+		result = scm("to shut the modem down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, pas_mpss, 0, 0, 0, &answer);
+	}
 	if (result != 0 || answer != 0) {
 		printf("mpss: %u: TRUSTZONE DOES NOT SHUT THE MODEM DOWN: the call returns %d, its answer is %#llx\n", step, result,
 		    answer);
@@ -2784,7 +2802,7 @@ step_start(void)
 	int32_t result;
 	bool have, spoke = false, handed_over = false;
 
-	if (!image_written) {
+	if (!image_written && mba_memory == 0) {
 		printf("mpss: %u: the image is not in place\n", step);
 		return false;
 	}
@@ -2797,37 +2815,61 @@ step_start(void)
 	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
 	{
-		uint32_t ipa_fw = 1;
+		uint32_t ipa_fw = mba_memory == 0;    /* (the 6T's IPA, 3.5.1, is another matter: not here) */
 
 		PE_parse_boot_argn("modem_ipa_fw", &ipa_fw, sizeof(ipa_fw));
 		ipa_loaded = ipa_fw != 0 && ipa_firmware_load();
 	}
 	if (option("modem_share_off")) {
 		printf("mpss: %u: the buffer is not shared with the modem (modem_share_off)\n", step);
+	} else if (mba_memory != 0 && !PE_parse_boot_argn("modem_buffer", &answer, sizeof(answer))) {
+		/* (redwood's default is a window into redwood's compute DSP's memory: ordinary memory elsewhere) */
+		printf("mpss: %u: THE MODEM GETS NO BUFFER FOR ITS FILES: on this phone modem_buffer=ADDRESS must say where\n", step);
 	} else if (!rmtfs_buffer_make() || !rmtfs_share(true)) {
 		printf("mpss: %u: THE MODEM GETS NO BUFFER FOR ITS FILES: it is started all the same, and will offer little\n", step);
 	}
-	if (!rails(384)) {
+	/*
+	 * modem_stop=N (a modem started through its MBA): step 7 ends early, the modem not started -- 1 after the
+	 * buffer is shared, 2 after the header is authenticated, 3 after the segments, before the image runs --
+	 * so that a run whose next part would reset the phone ends in order, its log whole (31 October).
+	 */
+	if (mba_memory != 0 && modem_stop() == 1) {
+		printf("mpss: %u: modem_stop=1: step 7 ends here, the buffer shared\n", step);
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
-	rails_asked = true;
+	if (mba_memory == 0) {
+		if (!rails(384)) {
+			lck_mtx_unlock(&dsp_lock);
+			return false;
+		}
+		rails_asked = true;             /* (a modem started through its MBA has had its rails since step 4) */
+	}
 	if (!mailbox_send("{class: image, res: load_state, name: modem, val: on}")) {
-		rails(0);
-		rails_asked = false;
+		if (rails_asked) {
+			rails(0);
+			rails_asked = false;
+		}
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
-	result = scm("to authenticate the modem's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, pas_mpss, 0, 0, 0,
-	    &answer);
+	if (mba_memory != 0) {
+		answer = 0;
+		result = mba_load_image() ? 0 : -1;
+	} else {
+		result = scm("to authenticate the modem's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, pas_mpss, 0, 0, 0,
+		    &answer);
+	}
 	doorbell.since = started = now_us();
 	image_written = false;
 	if (result != 0 || answer != 0) {
-		printf("mpss: %u: TRUSTZONE DOES NOT START THE MODEM: the call returns %d, its answer is %#llx\n", step, result,
-		    answer);
+		printf("mpss: %u: %s: the call returns %d, its answer is %#llx\n", step, mba_memory != 0 ? "THE MBA DOES NOT START THE "
+		    "MODEM" : "TRUSTZONE DOES NOT START THE MODEM", result, answer);
 		mailbox_send("{class: image, res: load_state, name: modem, val: off}");
-		rails(0);
-		rails_asked = false;
+		if (rails_asked) {
+			rails(0);
+			rails_asked = false;
+		}
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
@@ -4101,8 +4143,22 @@ rmtfs_share(bool in)
  */
 #define VM_PERM_RWX             7
 
+#define OWNER_HLOS              1u
+#define OWNER_MSA               2u
+
+static bool
+mss_assign_owners(uint64_t address, uint64_t size, uint32_t from, uint32_t to, const char *what);
+
 static bool
 mss_assign(uint64_t address, uint64_t size, bool to_modem, const char *what)
+{
+	return to_modem ? mss_assign_owners(address, size, OWNER_HLOS, OWNER_MSA, what) :
+	       mss_assign_owners(address, size, OWNER_MSA, OWNER_HLOS, what);
+}
+
+/* From the owners `from` to the owners `to` (OWNER_HLOS: read, write, execute; OWNER_MSA: read and write). */
+static bool
+mss_assign_owners(uint64_t address, uint64_t size, uint32_t from, uint32_t to, const char *what)
 {
 	struct {
 		uint64_t address, size;                 /* +0: the memory */
@@ -4119,6 +4175,7 @@ mss_assign(uint64_t address, uint64_t size, bool to_modem, const char *what)
 	} *page;
 	vm_offset_t memory = 0;
 	uint64_t answer = ~0ull, pa;
+	unsigned sources = 0, destinations = 0;
 	int32_t result;
 
 	if (kmem_alloc(kernel_map, &memory, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
@@ -4127,28 +4184,39 @@ mss_assign(uint64_t address, uint64_t size, bool to_modem, const char *what)
 	page = (void *)memory;
 	page->address = address;
 	page->size = (size + 0xfff) & ~0xfffull;
-	page->sources[0] = to_modem ? VMID_HLOS : VMID_MSS_MSA;
-	page->destinations[0].vmid = to_modem ? VMID_MSS_MSA : VMID_HLOS;
-	page->destinations[0].permission = to_modem ? VM_PERM_RW : VM_PERM_RWX;
+	if (from & OWNER_HLOS) {
+		page->sources[sources++] = VMID_HLOS;
+	}
+	if (from & OWNER_MSA) {
+		page->sources[sources++] = VMID_MSS_MSA;
+	}
+	if (to & OWNER_HLOS) {
+		page->destinations[destinations].vmid = VMID_HLOS;
+		page->destinations[destinations++].permission = VM_PERM_RWX;
+	}
+	if (to & OWNER_MSA) {
+		page->destinations[destinations].vmid = VMID_MSS_MSA;
+		page->destinations[destinations++].permission = VM_PERM_RW;
+	}
 	pa = kvtophys(memory);
-	page->more[0] = 4;                                              /* argument 3: the size of the sources */
+	page->more[0] = sources * 4;                                    /* argument 3: the size of the sources */
 	page->more[1] = pa + 128;                                       /* 4: the destinations */
-	page->more[2] = sizeof(page->destinations[0]);                  /* 5: their size */
+	page->more[2] = destinations * sizeof(page->destinations[0]);   /* 5: their size */
 	page->more[3] = 0;                                              /* 6: spare */
 	for (vm_offset_t line = memory; line < memory + PAGE_SIZE; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
 	}
 	settle();
-	result = scm(to_modem ? "to hand memory to the modem" : "to take memory back from the modem", SCM_MP_ASSIGN,
-	    SCM_ASSIGN_ARGUMENTS, pa, 16, pa + 64, pa + 240, &answer);
+	result = scm("to change who has memory", SCM_MP_ASSIGN, SCM_ASSIGN_ARGUMENTS, pa, 16, pa + 64, pa + 240, &answer);
 	kmem_free(kernel_map, memory, PAGE_SIZE);
 	if (result != 0 || answer != 0) {
-		printf("mpss: %u: THE HYPERVISOR DOES NOT %s %s (%#llx, %#llx bytes): the call returns %d, its answer is %#llx\n", step,
-		    to_modem ? "HAND THE MODEM" : "GIVE US BACK", what, address, size, result, answer);
+		printf("mpss: %u: THE HYPERVISOR DOES NOT MOVE %s (%#llx, %#llx bytes) from %s%s to %s%s: the call returns %d, its answer "
+		    "is %#llx\n", step, what, address, size, from & OWNER_HLOS ? "HLOS " : "", from & OWNER_MSA ? "MSA" : "",
+		    to & OWNER_HLOS ? "HLOS " : "", to & OWNER_MSA ? "MSA" : "", result, answer);
 		return false;
 	}
-	printf("mpss: %u: %s (%#llx, %#llx bytes) %s\n", step, what, address, size, to_modem ? "is the modem's (MSA, read and write)" :
-	    "is ours again (HLOS)");
+	printf("mpss: %u: %s (%#llx, %#llx bytes) is now %s%s%s\n", step, what, address, size, to & OWNER_HLOS ? "ours" : "",
+	    to == (OWNER_HLOS | OWNER_MSA) ? " and " : "", to & OWNER_MSA ? "the modem's" : "");
 	return true;
 }
 
@@ -4159,8 +4227,9 @@ mss_reclaim(void)
 	if (mss_mba_assigned && mss_assign(mba_memory, mba_memory_size, false, "the MBA's region")) {
 		mss_mba_assigned = false;
 	}
-	if (mss_mpss_assigned && mss_assign(mpss_memory, MPSS_MEMORY_SIZE, false, "the modem's region")) {
+	if (mss_mpss_assigned && mss_assign_owners(mpss_memory, MPSS_MEMORY_SIZE, mss_mpss_owners, OWNER_HLOS, "the modem's region")) {
 		mss_mpss_assigned = false;
+		mss_mpss_owners = OWNER_HLOS;
 	}
 }
 
@@ -4242,6 +4311,7 @@ mba_boot(void)
 		return false;
 	}
 	mss_mpss_assigned = true;
+	mss_mpss_owners = OWNER_MSA;
 	if (!mss_assign(mba_memory, mba_memory_size, true, "the MBA's region")) {
 		return false;
 	}
@@ -4276,6 +4346,178 @@ mba_boot(void)
 	    value == RMB_MBA_XPU_UNLOCKED_SCRIBBLED ? ": XPU UNLOCKED (SCRIBBLED) -- THE MBA RUNS" : value == 0 ?
 	    ": nothing within 5 seconds" : ": not what Linux waits for");
 	return value == RMB_MBA_XPU_UNLOCKED || value == RMB_MBA_XPU_UNLOCKED_SCRIBBLED;
+}
+
+#define RMB_PMI_META_DATA_REG   0x10
+#define RMB_PMI_CODE_START_REG  0x14
+#define RMB_PMI_CODE_LENGTH_REG 0x18
+#define RMB_CMD_META_DATA_READY 1
+#define RMB_CMD_LOAD_READY      2
+#define RMB_MBA_META_DATA_AUTH_SUCCESS 3
+#define RMB_MBA_AUTH_COMPLETE   4
+
+/* Up to `ms` milliseconds for the MBA's status to be `wanted` (or an error: negative); its last value. */
+static int32_t
+mba_wait(int32_t wanted, uint32_t ms)
+{
+	int32_t value = 0;
+
+	for (uint32_t i = 0; i <= ms * 10; i++) {
+		value = (int32_t)rd(rmb.base + RMB_MBA_STATUS_REG);
+		if (value == wanted || value < 0) {
+			break;
+		}
+		sleep_us(100);
+	}
+	return value;
+}
+
+/*
+ * The modem's image to the MBA (Linux's q6v5_mpss_load() and q6v5_mpss_init_image()): its header with the
+ * hashes, modem.mdt whole, in a page of its own handed to the modem, "metadata ready", status 3 ("header
+ * authenticated") waited for and the page taken back; then the modem's region shared with us, the
+ * segments written into it with the RMB told where the code begins (and "load ready") and, after each,
+ * how much there is; the region the modem's alone again, and status 4 ("authentication complete").
+ */
+static bool
+mba_load_image(void)
+{
+	vm_offset_t page = 0;
+	volatile uint8_t *window;
+	uint64_t pa, total = 0, meta = 0;
+	int32_t status;
+	bool header_ours = true;
+
+	if (image.header == NULL || image.segments == 0 || image.header_size > PAGE_SIZE) {
+		printf("mpss: %u: the image is not in memory\n", step);
+		return false;
+	}
+	announce("hand the modem's header (modem.mdt with its hashes) to the MBA: \"metadata ready\", and wait for \"header "
+	    "authenticated\"");
+	put(&rmb, "code length", RMB_PMI_CODE_LENGTH_REG, 0);
+	/*
+	 * RMB_PMI_META_DATA holds 32 bits, and this kernel's pages lie above 4 GB on the 6T: an address cut there
+	 * sent the MBA into memory that was not the modem's, and the phone into a crash dump (31 October). Linux
+	 * allocates the header's buffer with a 32-bit DMA mask; here, modem_meta=ADDRESS names memory of ours
+	 * below 4 GB (the 6T: the compute DSP's region, past the files' buffer), else a page of ours if it is low.
+	 */
+	PE_parse_boot_argn("modem_meta", &meta, sizeof(meta));
+	if (meta != 0) {
+		window = (volatile uint8_t *)ml_io_map_unmappable((vm_offset_t)meta, PAGE_SIZE, VM_WIMG_WCOMB);
+		if (window == NULL) {
+			return false;
+		}
+		for (uint64_t i = 0; i < PAGE_SIZE; i++) {
+			window[i] = i < image.header_size ? image.header[i] : 0;
+		}
+		settle();
+		ml_io_unmap((vm_offset_t)window, PAGE_SIZE);
+		pa = meta;
+	} else {
+		if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			return false;
+		}
+		memcpy((void *)page, image.header, image.header_size);
+		for (vm_offset_t line = page; line < page + PAGE_SIZE; line += 64) {
+			__asm__ volatile ("dc civac, %0" : : "r" (line));
+		}
+		settle();
+		pa = kvtophys(page);
+	}
+	if (pa >> 32 != 0 || (pa & 0xfff) != 0) {
+		printf("mpss: %u: the header's buffer is at %#llx: the RMB takes 32 bits, at a page; modem_meta=ADDRESS below 4 GB "
+		    "is wanted\n", step, pa);
+		if (page != 0) {
+			kmem_free(kernel_map, page, PAGE_SIZE);
+		}
+		return false;
+	}
+	printf("mpss: %u: the header's buffer: %#llx (%s)\n", step, pa, meta != 0 ? "modem_meta" : "a page of ours");
+	if (!mss_assign(pa, image.header_size, true, "the header's page")) {
+		if (page != 0) {
+			kmem_free(kernel_map, page, PAGE_SIZE);
+		}
+		return false;
+	}
+	header_ours = false;
+	put(&rmb, "metadata", RMB_PMI_META_DATA_REG, (uint32_t)pa);
+	put(&rmb, "command: metadata ready", RMB_MBA_COMMAND_REG, RMB_CMD_META_DATA_READY);
+	status = mba_wait(RMB_MBA_META_DATA_AUTH_SUCCESS, 1000);
+	printf("mpss: %u: the MBA says %d%s\n", step, status, status == RMB_MBA_META_DATA_AUTH_SUCCESS ?
+	    ": THE HEADER IS AUTHENTICATED" : status < 0 ? ": an error" : ": not within a second");
+	if (mss_assign(pa, image.header_size, false, "the header's page")) {
+		header_ours = true;
+	}
+	if (header_ours && page != 0) {
+		kmem_free(kernel_map, page, PAGE_SIZE);   /* (else it is left: not ours to give back to the allocator) */
+	}
+	if (status != RMB_MBA_META_DATA_AUTH_SUCCESS) {
+		return false;
+	}
+	if (modem_stop() == 2) {
+		printf("mpss: %u: modem_stop=2: step 7 ends here, the header authenticated\n", step);
+		return false;
+	}
+
+	announce("share the modem's region with us, write the image's segments into it, tell the RMB where the code begins and "
+	    "how much there is, and wait for \"authentication complete\"");
+	if (!mss_assign_owners(mpss_memory, MPSS_MEMORY_SIZE, mss_mpss_owners, OWNER_HLOS, "the modem's region")) {
+		return false;
+	}
+	mss_mpss_owners = OWNER_HLOS;
+	if (!mss_assign_owners(mpss_memory, MPSS_MEMORY_SIZE, OWNER_HLOS, OWNER_HLOS | OWNER_MSA, "the modem's region")) {
+		return false;
+	}
+	mss_mpss_owners = OWNER_HLOS | OWNER_MSA;
+	window = (volatile uint8_t *)ml_io_map_unmappable(mpss_memory, MPSS_MEMORY_SIZE, VM_WIMG_WCOMB);
+	if (window == NULL) {
+		printf("mpss: %u: the modem's region cannot be mapped\n", step);
+		return false;
+	}
+	snprintf(last_write, sizeof(last_write), "step %u wrote the modem's segments", step);
+	for (unsigned i = 0; i < image.segments; i++) {
+		__typeof__(&image.segment[0]) seg = &image.segment[i];
+		volatile uint64_t *zero;
+
+		for (uint32_t b = 0; b + 8 <= seg->file_size; b += 8) {
+			*(volatile uint64_t *)(window + seg->at + b) = *(const uint64_t *)(seg->file + b);
+		}
+		for (uint32_t b = seg->file_size & ~7u; b < seg->file_size; b++) {
+			window[seg->at + b] = seg->file[b];
+		}
+		zero = (volatile uint64_t *)(window + seg->at + ((seg->file_size + 7) & ~7u));
+		for (uint32_t b = (seg->file_size + 7) & ~7u; b + 8 <= seg->memory_size; b += 8) {
+			*zero++ = 0;
+		}
+		settle();
+		total += seg->memory_size;
+		if (rd(rmb.base + RMB_PMI_CODE_LENGTH_REG) == 0) {
+			wr(rmb.base + RMB_PMI_CODE_START_REG, mpss_memory);
+			wr(rmb.base + RMB_MBA_COMMAND_REG, RMB_CMD_LOAD_READY);
+		}
+		wr(rmb.base + RMB_PMI_CODE_LENGTH_REG, (uint32_t)total);
+		status = (int32_t)rd(rmb.base + RMB_MBA_STATUS_REG);
+		if (status < 0) {
+			printf("mpss: %u: the MBA says %d after segment %u: an error\n", step, status, i);
+			ml_io_unmap((vm_offset_t)window, MPSS_MEMORY_SIZE);
+			return false;
+		}
+	}
+	ml_io_unmap((vm_offset_t)window, MPSS_MEMORY_SIZE);
+	printf("mpss: %u: %u segments written, %#llx bytes told to the RMB (code from %#x)\n", step, image.segments, total,
+	    mpss_memory);
+	if (modem_stop() == 3) {
+		printf("mpss: %u: modem_stop=3: step 7 ends here, the segments written, the region still shared\n", step);
+		return false;
+	}
+	if (!mss_assign_owners(mpss_memory, MPSS_MEMORY_SIZE, OWNER_HLOS | OWNER_MSA, OWNER_MSA, "the modem's region")) {
+		return false;
+	}
+	mss_mpss_owners = OWNER_MSA;
+	status = mba_wait(RMB_MBA_AUTH_COMPLETE, 10000);
+	printf("mpss: %u: the MBA says %d%s\n", step, status, status == RMB_MBA_AUTH_COMPLETE ?
+	    ": AUTHENTICATION COMPLETE -- THE MODEM'S IMAGE RUNS" : status < 0 ? ": an error" : ": not within 10 seconds");
+	return status == RMB_MBA_AUTH_COMPLETE;
 }
 
 /* A TLV of a QMI message: its value and length, or NULL. */
@@ -6738,8 +6980,9 @@ steps_over(uint32_t done)
 		for (unsigned i = 0; i < MSS_CLOCKS; i++) {
 			any = any || mss_clock_ours[i];
 		}
-		if (any) {
-			mss_unpower();
+		if (any && !dsp_started) {
+			mss_unpower();          /* (a started modem is stopped first: dsp_shutdown() below) */
+			rmtfs_share(false);     /* (and the buffer for its files, if it was shared: nothing if not) */
 		}
 	}
 	lck_mtx_lock(&dsp_lock);
