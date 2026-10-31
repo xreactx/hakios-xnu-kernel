@@ -281,6 +281,13 @@ on (both voted: their status is not required), snoc on; the GMU's clock source t
 same as redwood's); `cxo` and `cx_gmu` running (their status bits are halt checks Linux trusts). The SDM845 has no hub,
 AHB or CB clock in the GPU's controller, and redwood's frequency counter is its vendor kernel's: not used here.
 
+Step 6 works (run 000445): **the GPU block answers** -- the GMU's always-on counter at `0x506a000 + 0x14220` counts
+19 199 092 Hz, the 19.2 MHz crystal; its processor is held in reset (`cm3_sysreset` 1), no firmware has run
+(`fw_init_result` 0, its data memory random), and `sptprac_pwr_clk_status` `0xd4` says the 3D core has neither power
+nor clock. The GMU's register offsets are redwood's (Linux shares them). Not read: the a630's bus interface, VBIF,
+which is in the 3D core's registers (not GBIF in the CX half, as redwood's), while the core has no power. Next, step 7:
+the GMU's RPMh sequencer, which on the a630 lies inside the GMU's block, at `+0x23000` (`a6xx_gmu.c`), not apart.
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the
