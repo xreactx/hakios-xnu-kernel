@@ -2825,7 +2825,15 @@ ipa_firmware_load(void)
 		 * memory, the hardware's set-up and our channels) is laid out for the first phone's IPA 4 and lands on
 		 * other registers there (crash dump 4, 31 October). Its firmware runs; the rest is the modem's for now.
 		 */
-		printf("mpss: %u: the IPA is an SDM845's (3.5.1): its status and set-up are not done from here\n", step);
+		uint32_t shared;
+
+		/* (what Linux's ipa_mem_config() does there too: where the local memory begins, and the modem's processing contexts) */
+		need(&ipa_regs);
+		shared = rd(ipa_regs.base + 0x54);
+		ipa_mem_offset = 8 * (shared >> 16);
+		wr(ipa_regs.base + 0x1e8, ipa_mem_offset + 0x07d0);
+		printf("mpss: %u: the IPA is an SDM845's (3.5.1): its local memory is %u bytes at offset %#x (SHARED_MEM_SIZE %#x); the rest "
+		    "of its set-up is not done from here\n", step, 8 * (shared & 0xffff), ipa_mem_offset, shared);
 		ok = true;
 		ipa_tz_loaded = true;
 		goto out;
@@ -5771,7 +5779,7 @@ ipa_client_receive(__unused void *context, uint32_t node, uint32_t port, const v
 	}
 }
 
-/* The IPA's local memory as IPA v4.11 lays it out (Linux: ipa_data-v4.11.c), told to the modem. */
+/* The IPA's local memory as IPA v4.11 lays it out (Linux: ipa_data-v4.11.c), or the SDM845's v3.5.1 (ipa_data-v3.5.1.c), told to the modem. */
 static void
 ipa_init_driver(void)
 {
@@ -5780,6 +5788,7 @@ ipa_init_driver(void)
 	uint32_t routes = 8;                    /* the route tables' entries the modem may use: indices 0..7 of 15 (Android's driver:
 	                                         * v4_modem_rt_index_hi 7; its log "num_indices 7"); modem_ipa_routes=N */
 	const uint32_t o = ipa_mem_offset;
+	const bool v35 = apcs_ipc != 0;         /* (the SDM845: the 6T's modem asserted "Memory alloc'ed to Q6 less than its requirement 2048, 3176") */
 
 	PE_parse_boot_argn("modem_ipa_routes", &routes, sizeof(routes));
 
@@ -5790,12 +5799,12 @@ ipa_init_driver(void)
 	packet[3] = IPA_QMI_INIT_DRIVER;
 	packet[4] = 0;
 	at += qmi_put_u32(packet + at, 0x10, 3);                                /* platform: 3 = MSM Android (Android's log: "platform_type 3"; 1 is a data card) */
-	at += qmi_put_pair(packet + at, 0x11, o + 0x0688, o + 0x0688 + 0x0240 - 1); /* the modem's headers */
+	at += qmi_put_pair(packet + at, 0x11, o + 0x0688, o + 0x0688 + (v35 ? 0x0140 : 0x0240) - 1); /* the modem's headers */
 	at += qmi_put_pair(packet + at, 0x12, o + 0x0508, routes - 1);          /* IPv4 routes */
 	at += qmi_put_pair(packet + at, 0x13, o + 0x0608, routes - 1);          /* IPv6 routes */
 	at += qmi_put_u32(packet + at, 0x14, o + 0x0308);                       /* IPv4 filters */
 	at += qmi_put_u32(packet + at, 0x15, o + 0x0408);                       /* IPv6 filters */
-	at += qmi_put_pair(packet + at, 0x16, o + 0x27d8, 0x800);               /* the modem's own region (Android: modem_ofst 0x27d8, 0x800) */
+	at += qmi_put_pair(packet + at, 0x16, o + (v35 ? 0x0bd8 : 0x27d8), v35 ? 0x1024 : 0x800); /* the modem's own region (Android: modem_ofst 0x27d8, 0x800) */
 	at += qmi_put_u32(packet + at, 0x17, 16);                               /* our endpoint for its control messages (AP_MODEM_RX) */
 	{
 		/*
@@ -5814,15 +5823,17 @@ ipa_init_driver(void)
 			packet[at++] = 1;
 		}
 	}
-	at += qmi_put_pair(packet + at, 0x19, o + 0x0ad0, o + 0x0ad0 + 0x0ac0 - 1); /* the modem's processing contexts (Android: 0xad0, 0xac0) */
+	at += qmi_put_pair(packet + at, 0x19, o + (v35 ? 0x07d0 : 0x0ad0), o + (v35 ? 0x07d0 + 0x0200 : 0x0ad0 + 0x0ac0) - 1); /* the modem's processing contexts (Android: 0xad0, 0xac0) */
 	at += qmi_put_pair(packet + at, 0x1b, o + 0x0488, routes - 1);          /* hashed IPv4 routes */
 	at += qmi_put_pair(packet + at, 0x1c, o + 0x0588, routes - 1);          /* hashed IPv6 routes */
 	at += qmi_put_u32(packet + at, 0x1d, o + 0x0288);                       /* hashed IPv4 filters */
 	at += qmi_put_u32(packet + at, 0x1e, o + 0x0388);                       /* hashed IPv6 filters */
-	at += qmi_put_u32(packet + at, 0x1f, o + 0x1d00);                       /* the modem's quota statistics (Android: stats_quota_q6 0x1d00, 0x30) */
-	at += qmi_put_u32(packet + at, 0x20, 0x30);
-	at += qmi_put_u32(packet + at, 0x21, o + 0x27b0);                       /* drop statistics (Android: stats_drop 0x27b0, 0x20) */
-	at += qmi_put_u32(packet + at, 0x22, 0x20);
+	if (!v35) {                                                             /* (statistics: IPA 4 and later, as Linux sends them) */
+		at += qmi_put_u32(packet + at, 0x1f, o + 0x1d00);               /* the modem's quota statistics (Android: stats_quota_q6 0x1d00, 0x30) */
+		at += qmi_put_u32(packet + at, 0x20, 0x30);
+		at += qmi_put_u32(packet + at, 0x21, o + 0x27b0);               /* drop statistics (Android: stats_drop 0x27b0, 0x20) */
+		at += qmi_put_u32(packet + at, 0x22, 0x20);
+	}
 	packet[5] = (uint8_t)(at - 7);
 	packet[6] = (uint8_t)((at - 7) >> 8);
 	printf("mpss: ipa: about to ask the modem's IPA driver (node %u port %u) to initialize with the IPA's memory layout (%u bytes, "
