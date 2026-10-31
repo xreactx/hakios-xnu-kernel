@@ -286,6 +286,7 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value)
 
 #define SMEM_PHYS_DEFAULT       0x80900000u   /* dt: reg of /soc/qcom,smem */
 static uint32_t smem_phys = SMEM_PHYS_DEFAULT;
+static uint32_t apcs_ipc;               /* soc_apcs_ipc=: the SoC rings its processors through APCS, and has no IPCC (the SDM845) */
 #define SMEM_SIZE               0x00200000u
 #define SMEM_US                 0
 #define SMEM_MPSS               1               /* dt: qcom,remote-pid of qcom,smp2p-modem and qcom,glink/modem */
@@ -1026,7 +1027,12 @@ step_survey(void)
 	struct smp2p words;
 	uint32_t size = 0;
 
-	announce("read our partition with the modem in the shared memory (0x80900000), and its items");
+	{
+		char what[120];
+
+		snprintf(what, sizeof(what), "read our partition with the modem in the shared memory (%#x), and its items", smem_phys);
+		announce(what);
+	}
 	show_partition();
 	if (dsp_words(&words)) {
 		show_words("the DSP's item (435) is there: it has run since the phone was started", &words);
@@ -1037,8 +1043,13 @@ step_survey(void)
 	    smem_item(ITEM_SMP2P_OURS, &size) ? "there" : "not there", smem_item(478, &size) ? "there" : "NOT THERE",
 	    smem_item(479, &size) ? "there" : "NOT THERE", smem_item(480, &size) ? "there" : "not there (the DSP makes it)");
 	show_crash_reason();
-	need(&ipcc);
-	printf("mpss: %u: the doorbells say %#x\n", step, rd(ipcc.base + IPCC_RECEIVED));
+	if (apcs_ipc != 0) {
+		/* (the SDM845 has no IPCC: what is at redwood's address is something else; its doorbells are APCS bits) */
+		printf("mpss: %u: no IPCC on this SoC: the doorbells are bits of the APCS register %#x\n", step, apcs_ipc);
+	} else {
+		need(&ipcc);
+		printf("mpss: %u: the doorbells say %#x\n", step, rd(ipcc.base + IPCC_RECEIVED));
+	}
 	return smem_partition(SMEM_US, SMEM_MPSS, &size, &size) != 0;
 }
 
@@ -1046,7 +1057,9 @@ step_survey(void)
 
 #define MPSS_MEMORY_DEFAULT     0x8b800000u   /* dt: reserved-memory mpss@..., memory-region of qcom,mss */
 static uint32_t mpss_memory = MPSS_MEMORY_DEFAULT;
-#define MPSS_MEMORY_SIZE        0x0f600000u
+#define MPSS_MEMORY_SIZE_DEFAULT 0x0f600000u
+static uint32_t mpss_memory_size = MPSS_MEMORY_SIZE_DEFAULT;   /* soc_mpss_mem_size=: the 6T's region is 120 MB */
+#define MPSS_MEMORY_SIZE        mpss_memory_size
 #define PAS_MPSS_DEFAULT        4               /* dt: qcom,pas-id of qcom,mss */
 static uint32_t pas_mpss = PAS_MPSS_DEFAULT;
 
@@ -6329,6 +6342,8 @@ soc_override(void)
 	PE_parse_boot_argn("soc_smem", &smem_phys, sizeof(smem_phys));
 	PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
 	PE_parse_boot_argn("soc_mpss_mem", &mpss_memory, sizeof(mpss_memory));
+	PE_parse_boot_argn("soc_mpss_mem_size", &mpss_memory_size, sizeof(mpss_memory_size));
+	PE_parse_boot_argn("soc_apcs_ipc", &apcs_ipc, sizeof(apcs_ipc));
 	PE_parse_boot_argn("soc_imem", &ipa_imem, sizeof(ipa_imem));
 	PE_parse_boot_argn("soc_ipa_stream", &ipa_stream, sizeof(ipa_stream));
 	PE_parse_boot_argn("soc_ipa_stream_uc", &ipa_stream_uc, sizeof(ipa_stream_uc));
@@ -6336,7 +6351,8 @@ soc_override(void)
 	PE_parse_boot_argn("soc_pas_ipa", &pas_ipa, sizeof(pas_ipa));
 	if (said != 0 || smem_phys != SMEM_PHYS_DEFAULT || mpss_memory != MPSS_MEMORY_DEFAULT) {
 		printf("mpss: SoC addresses from boot-args: %u register blocks; shared memory %#x, command DB %#x, the modem's "
-		    "memory %#x, the SoC's internal memory %#x\n", said, smem_phys, cmd_db_phys, mpss_memory, ipa_imem);
+		    "memory %#x (%u MB), the SoC's internal memory %#x%s\n", said, smem_phys, cmd_db_phys, mpss_memory,
+		    mpss_memory_size >> 20, ipa_imem, apcs_ipc != 0 ? "; doorbells through APCS, no IPCC" : "");
 	}
 }
 
