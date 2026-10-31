@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             12
+#define PORTED_A630             13
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -1303,7 +1303,9 @@ step_gmu_memory(void)
 
 #define SMMU_S2CR_FAULT         (2u << 16)
 #define SMMU_SMR_VALID          (1u << 31)
-#define SMMU_STREAM_MASK        0x400           /* dt: the second cell of every "iommus" of this SMMU */
+#define SMMU_STREAM_MASK_DEFAULT 0x400          /* dt: the second cell of every "iommus" of this SMMU */
+static uint32_t smmu_stream_mask = SMMU_STREAM_MASK_DEFAULT;    /* the 6T's tree gives none (one cell): 0 there */
+#define SMMU_STREAM_MASK        smmu_stream_mask
 #define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)       /* our tables alone decide; weakest defaults */
 #define SMMU_CBA2R(n)           (0x800 + 4 * (n))                       /* in the second page, like CBAR */
 #define SMMU_CBA2R_64_BIT       1
@@ -1834,6 +1836,9 @@ step_zap_signature(void)
 #define GMU_LOG_ADDRESS         0x60002000u     /* after the two pages the firmware asks for at 0x60000000 */
 #define GMU_LOG_SIZE            0x4000u
 #define GMU_HFI_ADDRESS         0x60006000u
+#define GMU_DEBUG_ADDRESS       0x6000a000u     /* the a630's: a debug region of 16K besides (a6xx_gmu.c, the a630 family) */
+#define GMU_DEBUG_SIZE          0x4000u
+#define GMU_LEGACY_IMAGE_MOST   0x8000u         /* the a630's firmware: one image for its code memory, 32K at most */
 #define GMU_STREAM              5
 #define GMU_MATCH               1               /* entry of the stream table; 0 is kept for the 3D core */
 
@@ -1844,7 +1849,7 @@ struct gmu_firmware_block {
 #define GMU_FIRMWARE_NEEDS_KEPT 7
 
 static struct gpu_space gmu_space = { .name = "the GMU", .context = 1 };
-static struct gpu_block gmu_blocks[12], gmu_log, gmu_hfi;
+static struct gpu_block gmu_blocks[12], gmu_log, gmu_hfi, gmu_debug;
 static unsigned gmu_block_count;
 static const uint8_t *gmu_firmware;
 static uint64_t gmu_firmware_size;
@@ -1862,6 +1867,38 @@ step_gmu_space(void)
 {
 	if (!cx_ready()) {
 		return false;
+	}
+	if (a630) {
+		/*
+		 * The a630's GMU is the older kind (a6xx_gmu.c: gmu->legacy): its firmware is no file of blocks
+		 * but one image, written whole into its code memory (step 14), and it asks for no memory; Linux
+		 * gives it 16K each for a debug region, its log and the HFI queues, wherever they fall in its
+		 * address space -- it is told where by registers and by its first message.
+		 */
+		announce("find the GMU's firmware, fw/a630_gmu.bin (one image for its code memory), and make its log, its HFI "
+		    "queues and its debug region");
+		gmu_firmware = image_file("fw", "a630_gmu.bin", &gmu_firmware_size);
+		if (gmu_firmware == NULL) {
+			return false;
+		}
+		if (gmu_firmware_size > GMU_LEGACY_IMAGE_MOST || (gmu_firmware_size & 3)) {
+			printf("adreno: %u: %llu bytes: not an image for the a630's 32K of code memory\n", step, gmu_firmware_size);
+			return false;
+		}
+		printf("adreno: %u: %llu bytes of firmware, starting %08x %08x\n", step, gmu_firmware_size,
+		    ((const uint32_t *)gmu_firmware)[0], ((const uint32_t *)gmu_firmware)[1]);
+		if (!block_new(&gmu_space, &gmu_log, GMU_LOG_ADDRESS, GMU_LOG_SIZE, PTE_GMU) ||
+		    !block_new(&gmu_space, &gmu_hfi, GMU_HFI_ADDRESS, PAGE_SIZE, PTE_GMU) ||
+		    !block_new(&gmu_space, &gmu_debug, GMU_DEBUG_ADDRESS, GMU_DEBUG_SIZE, PTE_GMU)) {
+			return false;
+		}
+		announce("give the SMMU's context 1 these tables and send the GMU's requests (stream 5) through it: the first "
+		    "writes to the SMMU, the global ones (cbar, cba2r, s2cr, smr) through the hypervisor");
+		if (!smmu_layout()) {
+			return false;
+		}
+		gmu_space_is_on = true;
+		return space_on(&gmu_space, GMU_MATCH, GMU_STREAM);
 	}
 	announce("find the GMU's firmware, fw/a660_gmu.bin, in the small image, and make the memory it asks for");
 	gmu_firmware = image_file("fw", "a660_gmu.bin", &gmu_firmware_size);
@@ -3889,6 +3926,7 @@ hakios_adreno_init(void)
 		cx_misc.phys = 0x0509e000;      /* dt: qcom,kgsl-3d0 "cx_misc" */
 		rscc.phys = 0x0506a000 + 0x23000;       /* inside the GMU's block on the a630 (a6xx_gmu.c: gmu->mmio + 0x23000) */
 		smmu.phys = 0x05040000;         /* dt: qcom,kgsl-smmu-v2 at 0x5040000, 64 KB */
+		smmu_stream_mask = 0;           /* (its "iommus" are one cell: the GMU is stream 5 exactly) */
 		smmu.size = 0x10000;
 		PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
 		printf("adreno: the OnePlus 6T's Adreno 630 (soc_gpu=630): its clock controller at %#x, the command DB at %#lx; steps "
