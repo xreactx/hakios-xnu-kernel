@@ -306,6 +306,13 @@ and lists no image as "supported" (not even the audio DSP it starts: the questio
 **accepts the zap shader's signature** from `fw/a630_zap.mdt` (image 13: the header of 3 segments and 6536 bytes of
 hashes, as TrustZone takes it). From step 13 on comes the a630's own GMU: its firmware, its start, its messages.
 
+Step 13 works (run 001422): the a630's GMU firmware, `fw/a630_gmu.bin`, is one image of 32 768 bytes for its code
+memory (`a6xx_gmu.c`'s legacy load: no blocks, no memory asked for; it begins `00043f80 00000009`, a Cortex-M vector
+table); its log, HFI queues and a debug region, 16K each, at `0x60002000`, `0x60006000` and `0x6000a000` of its address
+space; the SMMU's context 1 with our tables, and stream 5 sent through it -- with no mask (the 6T's `iommus` have one
+cell; redwood's mask `0x400` is its tree's second). Every write, the global ones through the hypervisor too, reads back
+as written, and no fault; at the end all is put back and CX switched off.
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the
