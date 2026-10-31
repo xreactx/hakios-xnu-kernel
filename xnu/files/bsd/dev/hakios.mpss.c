@@ -619,6 +619,84 @@ static struct block aoss = { "mailbox", 0x0c300000, 0x400 };
 
 static struct block ipcc = { "ipcc", 0x00408000, 0x1000 };
 
+/*
+ * A SoC without IPCC (the SDM845; soc_apcs_ipc=0x1799000c, the APCS's IPC register) rings every other
+ * processor by a bit of that one register, written alone: the modem's GLINK is bit 12, its SMP2P bit 14,
+ * the always-on processor bit 0 (dt: qcom,irq-mask of qcom,glink-smem-native-xprt-modem, qcom,irq-bitmask
+ * of qcom,smp2p-modem, the second reg of qcom,qmp-aop). The modem's rings to us are the GIC's interrupts
+ * 449 (GLINK) and 451 (SMP2P), edge-triggered; nothing here takes interrupts, so their pending bits in the
+ * distributor are what is looked at, and cleared -- as hakios.adsp.c does for the audio DSP on that SoC.
+ */
+static struct block apcs = { "apcs", 0, 0x1000 };
+static struct block gicd = { "gic", 0x17a00000, 0x1000 };
+#define APCS_AOP                0
+#define APCS_MPSS_GLINK         12
+#define APCS_MPSS_SMP2P         14
+#define SPI_MPSS_GLINK          449
+#define SPI_MPSS_SMP2P          451
+#define GICD_ISPENDR(id)        (0x200 + 4 * ((id) / 32))
+#define GICD_ICPENDR(id)        (0x280 + 4 * ((id) / 32))
+
+/* A ring of the modem's doorbell for that signal (IPCC_GLINK or IPCC_SMP2P). */
+static void
+ring_mpss(uint32_t signal)
+{
+	if (apcs_ipc != 0) {
+		need(&apcs);
+		wr(apcs.base + (apcs_ipc & 0xfff), 1u << (signal == IPCC_GLINK ? APCS_MPSS_GLINK : APCS_MPSS_SMP2P));
+		return;
+	}
+	need(&ipcc);
+	wr(ipcc.base + IPCC_SEND, IPCC_MPSS << 16 | signal);
+}
+
+/* A ring from the modem, cleared: its signal (IPCC_GLINK or IPCC_SMP2P), or -1: none. */
+static int
+heard(void)
+{
+	uint32_t who;
+
+	if (apcs_ipc != 0) {
+		static const uint32_t spis[2] = { SPI_MPSS_GLINK, SPI_MPSS_SMP2P }, signals[2] = { IPCC_GLINK, IPCC_SMP2P };
+
+		need(&gicd);
+		for (unsigned i = 0; i < 2; i++) {
+			uint32_t id = 32 + spis[i], bit = 1u << (id % 32);
+
+			if (rd(gicd.base + GICD_ISPENDR(id)) & bit) {
+				wr(gicd.base + GICD_ICPENDR(id), bit);
+				return (int)signals[i];
+			}
+		}
+		return -1;
+	}
+	need(&ipcc);
+	who = rd(ipcc.base + IPCC_RECEIVED);
+	if (who == IPCC_NOBODY || who >> 16 != IPCC_MPSS) {
+		return -1;
+	}
+	wr(ipcc.base + IPCC_CLEAR, who);
+	return (int)(who & 0xffff);
+}
+
+/* Rings that came before, heard and cleared; then the modem's two signals listened for (IPCC), or not. */
+static void
+listen_doorbells(bool on)
+{
+	for (unsigned i = 0; on && i < 8 && heard() >= 0; i++) {
+	}
+	if (apcs_ipc != 0) {
+		return;                 /* (a pending bit is set whether anyone listens or not) */
+	}
+	need(&ipcc);
+	if (!on) {
+		wr(ipcc.base + IPCC_DISABLE, IPCC_MPSS << 16 | IPCC_SMP2P);  /* (unsaid: this is on a panic's way out too) */
+		return;
+	}
+	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_MPSS << 16 | IPCC_SMP2P);
+	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_MPSS << 16 | IPCC_GLINK);
+}
+
 static struct {
 	uint32_t glink, smp2p, said;
 	uint64_t since;
@@ -633,20 +711,19 @@ static void
 doorbells(void)
 {
 	for (unsigned i = 0; i < 8; i++) {
-		uint32_t who = rd(ipcc.base + IPCC_RECEIVED);
+		int who = heard();
 
-		if (who == IPCC_NOBODY || who >> 16 != IPCC_MPSS) {
+		if (who < 0) {
 			return;
 		}
-		wr(ipcc.base + IPCC_CLEAR, who);
-		doorbell.glink += (who & 0xffff) == IPCC_GLINK;
-		doorbell.smp2p += (who & 0xffff) == IPCC_SMP2P;
+		doorbell.glink += (uint32_t)who == IPCC_GLINK;
+		doorbell.smp2p += (uint32_t)who == IPCC_SMP2P;
 		if (doorbell.said < 24) {
 			uint64_t now = now_us() - doorbell.since;
 
 			doorbell.said++;
-			printf("mpss: doorbell: +%llu.%03llu ms: signal %u of the modem; heard and cleared\n", now / 1000, now % 1000,
-			    who & 0xffff);
+			printf("mpss: doorbell: +%llu.%03llu ms: signal %d of the modem; heard and cleared\n", now / 1000, now % 1000,
+			    who);
 		}
 	}
 }
@@ -668,6 +745,12 @@ mailbox_wait(uint32_t offset, uint32_t value, uint32_t ms)
 static void
 ring_aop(void)
 {
+	if (apcs_ipc != 0) {
+		need(&apcs);
+		wr(apcs.base + (apcs_ipc & 0xfff), 1u << APCS_AOP);
+		return;
+	}
+	need(&ipcc);
 	wr(ipcc.base + IPCC_SEND, IPCC_AOP << 16 | 0);
 }
 
@@ -678,7 +761,6 @@ mailbox_open(void)
 	uint32_t box, size;
 
 	need(&aoss);
-	need(&ipcc);
 	if (get(&aoss, "magic", QMP_MAGIC) != QMP_MAGIC_VALUE || get(&aoss, "version", QMP_VERSION) != 1) {
 		printf("mpss: %u: not a mailbox this knows\n", step);
 		return false;
@@ -1393,7 +1475,7 @@ dsp_listen(const struct smp2p *theirs)
 		    step, theirs->flags, smp2p_restart_acked);
 		smem_poke(our_item + SMP2P_AT_FLAGS, (ours.flags & ~SMP2P_RESTART_ACK) | (smp2p_restart_acked ? SMP2P_RESTART_ACK : 0));
 		settle();
-		wr(ipcc.base + IPCC_SEND, IPCC_MPSS << 16 | IPCC_SMP2P);
+		ring_mpss(IPCC_SMP2P);
 	}
 }
 
@@ -1424,14 +1506,13 @@ dsp_ask_to_stop(uint32_t bound_ms)
 		printf("mpss: %u: the DSP is not asked to stop first: its entry says %#x, not \"up\"\n", step, state);
 		return false;
 	}
-	need(&ipcc);
 	value_at = at + SMP2P_AT_VALUE((uint32_t)entry);
 	printf("mpss: %u: about to ask the DSP to stop: bit 0 of our entry \"%s\" at %#lx, and its SMP2P doorbell\n", step,
 	    OUR_ENTRY_STOP, smem_phys + value_at);
 	snprintf(last_write, sizeof(last_write), "step %u asked the modem to stop", step);
 	smem_poke(value_at, ours.entry[entry].value | DSP_STOP);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_MPSS << 16 | IPCC_SMP2P);
+	ring_mpss(IPCC_SMP2P);
 	asked = now = now_us();
 	while (now - asked < bound_ms * 1000ull) {
 		if (dsp_words(&theirs) && (dsp_state(&theirs) & (DSP_STOP_ACK | DSP_FATAL))) {
@@ -1446,7 +1527,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	    (now - asked) % 1000, state);
 	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_MPSS << 16 | IPCC_SMP2P);
+	ring_mpss(IPCC_SMP2P);
 	return (state & DSP_STOP_ACK) != 0;
 }
 
@@ -1478,8 +1559,7 @@ dsp_shutdown(const char *why)
 	if (!leaving) {
 		rmtfs_share(false);
 	}
-	need(&ipcc);
-	wr(ipcc.base + IPCC_DISABLE, IPCC_MPSS << 16 | IPCC_SMP2P);
+	listen_doorbells(false);
 	doorbells();
 	dsp_started = false;
 	mailbox_send("{class: image, res: load_state, name: modem, val: off}");
@@ -1776,8 +1856,7 @@ step_our_item(void)
 	smem_poke(our_item + SMP2P_AT_VERSION, SMP2P_RESTART_ACKS << 8 | SMP2P_VERSION);
 	settle();
 	smp2p_agreed = smp2p_restart_acks = smp2p_restart_acked = false;
-	need(&ipcc);
-	wr(ipcc.base + IPCC_SEND, IPCC_MPSS << 16 | IPCC_SMP2P);
+	ring_mpss(IPCC_SMP2P);
 	if (!smem_peek(our_item, &ours, sizeof(ours)) || ours.magic != SMP2P_MAGIC || smp2p_entry(&ours, OUR_ENTRY_STOP) < 0) {
 		printf("mpss: %u: OUR ITEM DOES NOT READ BACK AS WRITTEN\n", step);
 		return false;
@@ -2446,7 +2525,7 @@ step_start(void)
 {
 	struct smp2p words, last;
 	uint64_t answer = ~0ull, started, now, ready_at = 0, limit;
-	uint32_t state = 0, rang, changes = 0, wait_seconds = 10;
+	uint32_t state = 0, changes = 0, wait_seconds = 10;
 	int32_t result;
 	bool have, spoke = false, handed_over = false;
 
@@ -2459,12 +2538,7 @@ step_start(void)
 	have = dsp_words(&last);
 	announce("listen for the modem's doorbells, ask RPMh for its rails, tell the always-on processor that its image is "
 	    "loaded, and ask TrustZone to authenticate the image and let the DSP out of reset");
-	need(&ipcc);
-	for (unsigned i = 0; i < 8 && (rang = rd(ipcc.base + IPCC_RECEIVED)) != IPCC_NOBODY && rang >> 16 == IPCC_MPSS; i++) {
-		put(&ipcc, "heard", IPCC_CLEAR, rang);
-	}
-	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_MPSS << 16 | IPCC_SMP2P);
-	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_MPSS << 16 | IPCC_GLINK);
+	listen_doorbells(true);
 	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
 	{
@@ -2758,7 +2832,7 @@ glink_put(const void *first, uint32_t first_length, const void *second, uint32_t
 	settle();
 	smem_poke(glink.descriptor + GLINK_OUR_HEAD, (head + padded) % glink.ours_size);
 	settle();
-	wr(ipcc.base + IPCC_SEND, IPCC_MPSS << 16 | IPCC_GLINK);
+	ring_mpss(IPCC_GLINK);
 	glink.said++;
 	return true;
 }
@@ -2989,7 +3063,7 @@ glink_pump(void)
 		}
 		case GLINK_READ_NOTIFY:
 			glink_advance(length);
-			wr(ipcc.base + IPCC_SEND, IPCC_MPSS << 16 | IPCC_GLINK);
+			ring_mpss(IPCC_GLINK);
 			break;
 		case GLINK_CLOSE:
 			glink_advance(length);
@@ -6361,6 +6435,7 @@ soc_override(void)
 	PE_parse_boot_argn("soc_mpss_mem", &mpss_memory, sizeof(mpss_memory));
 	PE_parse_boot_argn("soc_mpss_mem_size", &mpss_memory_size, sizeof(mpss_memory_size));
 	PE_parse_boot_argn("soc_apcs_ipc", &apcs_ipc, sizeof(apcs_ipc));
+	apcs.phys = apcs_ipc & ~0xfffu;
 	PE_parse_boot_argn("soc_mba_mem", &mba_memory, sizeof(mba_memory));
 	PE_parse_boot_argn("soc_mba_mem_size", &mba_memory_size, sizeof(mba_memory_size));
 	PE_parse_boot_argn("soc_imem", &ipa_imem, sizeof(ipa_imem));
