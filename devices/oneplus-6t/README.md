@@ -589,7 +589,9 @@ streams (0x720, 0x722) mapped through a context of the apps SMMU, the modem acce
 (`INIT_DRIVER`), DMS puts it online, and NAS sees LTE (-100 to -118 dBm). Without a SIM it registers nowhere
 (UIM: both slots "card error 3", Android says ABSENT). At the end of step 11 it is asked to stop (SMP2P, acknowledged
 in 126 ms), its buses halted, reset, the MBA's region taken back, its clocks and rail given back, and iOS runs on.
-Next: a SIM, then this side of the IPA 3.5.1 (its endpoints and channels) for data. A run (the line must fit XNU's
+With a SIM (slot 1, run 231839, `modem_data_off=1`): UIM reads the card READY (PIN disabled), and **the modem
+registers on LTE** (-105 dBm, 3 bars) 4 s after DMS puts it online. (NAS's network id reads "0-0": not parsed yet.)
+Next: this side of the IPA 3.5.1 (its endpoints and channels) for data. A run (the line must fit XNU's
 607 characters: xl now refuses one that does not):
 
 ```sh
