@@ -2154,7 +2154,12 @@ step_our_item_smp2p(void)
 	 * (modem_ipa_item=0: not; our SMMU context maps all of DDR, so the item needs no mapping of its own).
 	 */
 	{
-		uint32_t ipa_item = 497, ipa_size = 0;
+		/*
+		 * (not on the SDM845 -- no IPCC, soc_apcs_ipc: the 6T's tree gives the IPA no qcom,ipa-q6-smem-size, Android
+		 * makes no such item there, and the modem allocates its own; one of ours, redwood's size, made the modem
+		 * give up in its IPA filter code, "ipa_ipfltr.c:424: smem_alloc_ex ... failed", 31 October)
+		 */
+		uint32_t ipa_item = apcs_ipc != 0 ? 0 : 497, ipa_size = 0;
 
 		PE_parse_boot_argn("modem_ipa_item", &ipa_item, sizeof(ipa_item));
 		if (ipa_item != 0) {
@@ -2165,6 +2170,34 @@ step_our_item_smp2p(void)
 			} else {
 				printf("mpss: %u: the IPA's item %u could not be made\n", step, ipa_item);
 			}
+		}
+	}
+	/*
+	 * GLINK's descriptor (478) and our queue (479): on redwood they are there before the kernel starts; on the
+	 * SDM845 (no IPCC: soc_apcs_ipc) nobody has made them, and Linux's qcom_glink_smem_register() makes them
+	 * before the modem starts -- 32 bytes and 16 KB, zeroed. Without 479 the modem made 478 and its own queue
+	 * (480) and our side of GLINK had no queue to write (31 October); hakios.adsp.c does the same for its DSP.
+	 */
+	if (apcs_ipc != 0) {
+		static const struct { uint32_t item, bytes; } glink_items[2] = { { 478, 32 }, { 479, 0x4000 } };
+
+		for (unsigned i = 0; i < 2; i++) {
+			uint32_t at, got = 0;
+
+			if (smem_item(glink_items[i].item, &got) != 0) {
+				continue;
+			}
+			if (!our_item_make(partition, glink_items[i].item, glink_items[i].bytes) ||
+			    (at = smem_item(glink_items[i].item, &got)) == 0 || got != glink_items[i].bytes) {
+				printf("mpss: %u: GLINK'S ITEM %u COULD NOT BE MADE\n", step, glink_items[i].item);
+				return false;
+			}
+			for (uint32_t word = 0; word < got; word += 4) {
+				smem_poke(at + word, 0);
+			}
+			settle();
+			printf("mpss: %u: GLINK's item %u made, %u bytes at %#lx, zeroed\n", step, glink_items[i].item, got,
+			    (unsigned long)smem_phys + at);
 		}
 	}
 	glink_reset();
