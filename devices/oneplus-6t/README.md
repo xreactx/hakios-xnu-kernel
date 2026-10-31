@@ -326,21 +326,38 @@ the RSC put to sleep; then register retention, the RSC woken, the firmware loade
 `0x06030100`), and the processor let go: `fw_init_result` `0xbabeface`, the old firmware's word. At the end it is put
 back in reset, the RSC asleep, the SMMU and CX as found.
 
-The GPU's rail in the PDC's commands is **`0x30080`, Linux's constant**. This phone's command DB has `gfx.lvl` at
-`0x30050`; with that the wake never finished (runs 002231, 002434): the RSC's sequencer stayed busy -- and stayed so
-into the next runs, until the phone restarted. The RSC's status, its "hidden" command addresses (it fills them from
+The GPU's rail in the PDC's commands is the command DB's `gfx.lvl`, `0x30050`. (For a while it was `0x30080`, Linux's
+constant, because with `0x30050` the wake never finished; but `0x30080` is `xo.lvl` on this phone, and it only "worked"
+because the GPU's rail was then never asked for. The real cause is below, under step 16.) The RSC's status, its "hidden" command addresses (it fills them from
 the sequence) and the commands' message ids (their length bits: `0x10100` for `0x10108`) do not read back as
 written; everything else does, now checked.
 
-**Step 16 does not work yet** (run 003315). Written after Linux's legacy path: `a6xx_gmu_gfx_rail_on()` -- the GPU's top
-level as the GMU's votes (710 MHz: gfx.lvl's place 9, mx.lvl's 4, `0x1a00409`, made as `a6xx_gmu_rpmh_arc_votes_init()`
-makes them from this phone's lists) and the boot request (legacy bit 22, acknowledged on 30) --, then SPTPRAC, the HFI
-start and HFI's first version (init with the debug region, version `(1<<28)|(1<<19)|(1<<17)`, the level table in its
-first layout with sdm845.dtsi's GPU and GMU levels, the SDM845's fixed bus table, "test"); and a legacy slumber
-(`a6xx_gmu_notify_slumber()`) at the end. The boot request is not acknowledged in 100 ms: the GMU's firmware has taken it
-and sends a vote through its RSC's slot 3 (busy, commands 6 and 7 enabled), which RPMh does not complete. The GMU's log
-is empty and nothing reports a fault; the end puts everything back. Which vote it is, and what RPMh wants before it, is
-the next thing to find out.
+**Step 16 works: the GMU boots and takes its messages** (run 041517). After Linux's legacy path: `a6xx_gmu_gfx_rail_on()`
+-- the GPU's top level as the GMU's votes (gfx.lvl's place 9, mx.lvl's 4, `0x1a00409`) and the boot request (legacy bit
+22, acknowledged on 30) --, SPTPRAC on, the HFI start, HFI's first version (init with the debug region, the version,
+the level table, the SDM845's bus table, "test"), and the first level by DCVS (out-of-band request 23, acknowledged on
+31, `0x30000001`/`0xff`, as Android's kgsl sends it right after the messages).
+
+What it took:
+
+- **The UEFI, not the GPU.** Every request for `gfx.lvl` above retention -- the GMU's, and the application processor's
+  own (`adreno_gfx=1..3`, at step 1) -- was sent and never finished: RPMh set PM8005 S1 to 580 mV and stopped there,
+  and stayed stuck until the phone restarted. Every other rail at its top changed nothing. The 6T's UEFI (Mu-Silicium)
+  runs Qualcomm's binary drivers again after the stock boot loader, and one of them, **`CPRDxe`** (voltage calibration
+  for mx, cx and gfx), run a second time leaves the GPU's rail so. `uefi/files` now leaves it out (`DXE.inc`,
+  `APRIORI.inc`); with that `gfx.lvl` goes to its top in 150 us (runs 040840, 041059 -- `LimitsDxe` is innocent).
+- **The legacy HFI table, as Linux has it** (`a6xx_hfi_init()` with `legacy`): two queues at 4 and 8 KB, the answers'
+  numbered 4, watermarks and request 1, the table's size in bytes; messages neither padded nor aligned; an answer is
+  message id 126. With the newer GMU's layout the firmware wrote `0xfe` to `hfi_ctrl_status` and never started.
+- Linux's "dummy" pages at `0x60000000` of the GMU's address space.
+
+Android's own sequence (kgsl's register writes, traced as root with `kgsl_regwrite` and the GMU events, on a
+`fastboot boot` of the Magisk image) is what to compare with from here on.
+
+**Step 17 works: the 3D core has power** (run 043638). The a630 sends no more messages: the out-of-band request 16,
+acknowledged on 24 -- GX on (`0xf8222800`), SPTPRAC on, and the core at `0x5000000` answers (`rbbm_status` 1) --, given
+back by setting 24. And the slumber at the end is now acknowledged and done (`rpmh_power_state` `0xf`): without the
+3D core asked for once, the firmware faulted (`CM3_FAULT`) on the slumber request.
 
 **10. Audio** (started 30 October 2026).
 

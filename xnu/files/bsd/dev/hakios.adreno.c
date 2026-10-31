@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             16
+#define PORTED_A630             17
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -3128,6 +3128,38 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
  * (a6xx_hfi.c: adreno_7c3_build_bw_table); "start"; and the speed wanted now. Then the request
  * to keep the 3D core powered while we use it (a6xx_gmu_oob_set), and its registers can be read.
  */
+/*
+ * The a630's: no tables, "start" or speed by message (the GMU had its levels and its first one at step
+ * 16), only the out-of-band request for the 3D core, legacy bits: 16, acknowledged on 24, and given back
+ * by setting 24 (a6xx_gmu_set_oob/clear_oob GMU_OOB_GPU_SET; Android's kgsl the same on this phone).
+ */
+static bool
+core_power_630(void)
+{
+	announce("ask the GMU to power the 3D core and keep it powered (the out-of-band request 16, acknowledged on 24)");
+	get(&gmu, "sptprac_pwr_clk_status", GMU_SPTPRAC_PWR_CLK_STATUS);
+	get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
+	if (!oob_630("the request for the 3D core", OOB_GPU_630, OOB_GPU_ACK_630)) {
+		space_faulted(&gmu_space);
+		return false;
+	}
+	core_is_on = true;                      /* to be given back (gpu_block_stop) */
+	get(&gmu, "sptprac_pwr_clk_status", GMU_SPTPRAC_PWR_CLK_STATUS);
+	get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
+	get(&gmu, "rpmh_power_state", GMU_RPMH_POWER_STATE);
+	if ((rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS) & 0xc0) != 0 || !(rd(gpucc.base + GPUCC_GX_GDSCR) & 1u << 31)) {
+		printf("adreno: %u: the GMU says yes, but the 3D core's power is not on\n", step);
+		return false;
+	}
+	announce("read registers of the 3D core itself (0x5000000): the first time it has power");
+	get(&gpu, "rbbm_status", RBBM_STATUS);
+	get(&gpu, "rbbm_int_0_status", RBBM_INT_0_STATUS);
+	get(&gpu, "rbbm_clock_cntl", RBBM_CLOCK_CNTL);
+	get(&gpu, "cp_rb_base", CP_RB_BASE);
+	printf("adreno: %u: THE 3D CORE HAS POWER AND ANSWERS\n", step);
+	return !space_faulted(&gmu_space);
+}
+
 static bool
 step_core_power(void)
 {
@@ -3142,6 +3174,9 @@ step_core_power(void)
 
 	if (!cx_ready() || !gmu_talks) {
 		return false;
+	}
+	if (a630) {
+		return core_power_630();
 	}
 	if (!rpmh_resource("gfx.lvl", gfx, &gfx_levels) || !rpmh_resource("cx.lvl", cx, &cx_levels) ||
 	    !rpmh_resource("mx.lvl", mx, &mx_levels)) {
@@ -3900,7 +3935,7 @@ gpu_block_stop(void)
 		    rd(gbif.base + GBIF_HALT_ACK));
 	}
 	if (core_is_on) {
-		put(&gmu, "host2gmu_intr_set", GMU_HOST2GMU_INTR_SET, 1u << 31);
+		put(&gmu, "host2gmu_intr_set", GMU_HOST2GMU_INTR_SET, a630 ? 1u << OOB_GPU_ACK_630 : 1u << 31);
 		core_is_on = false;
 	}
 	if (gmu_talks && a630) {
@@ -4617,6 +4652,7 @@ hakios_adreno_init(void)
 	if (PE_parse_boot_argn("soc_gpu", &only, sizeof(only)) && only == 630) {
 		a630 = true;
 		gpucc.phys = 0x05090000;        /* dt: qcom,gpucc@5090000 */
+		gpu.phys = 0x05000000;          /* dt: qcom,kgsl-3d0 "kgsl_3d0_reg_memory", 256 KB */
 		gmu.phys = 0x0506a000;          /* dt: qcom,gmu "kgsl_gmu_reg" */
 		gmu.size = 0x30000;
 		cx_misc.phys = 0x0509e000;      /* dt: qcom,kgsl-3d0 "cx_misc" */
