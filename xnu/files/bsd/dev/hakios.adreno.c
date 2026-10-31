@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             17
+#define PORTED_A630             18
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -3441,14 +3441,19 @@ step_core_space(void)
 {
 	const uint8_t *microcode;
 	uint64_t size = 0;
-	uint32_t stream1 = 1;
+	/*
+	 * (the a630: the 6T's tree gives the core stream 0 only, gfx3d_user; streams 1 and 2 are its secure context's,
+	 * gfx3d_secure -- and mainline's sdm845.dtsi has the GPU at stream 0 alone)
+	 */
+	uint32_t stream1 = a630 ? 0 : 1;
 
 	if (!cx_ready() || !core_is_on) {
 		return false;
 	}
 	PE_parse_boot_argn("adreno_stream1", &stream1, sizeof(stream1));
-	announce("make the 3D core's memory: its ring, its microcode (fw/a660_sqe.fw), a page to try writing to");
-	microcode = image_file("fw", "a660_sqe.fw", &size);
+	announce(a630 ? "make the 3D core's memory: its ring, its microcode (fw/a630_sqe.fw), a page to try writing to" :
+	    "make the 3D core's memory: its ring, its microcode (fw/a660_sqe.fw), a page to try writing to");
+	microcode = image_file("fw", a630 ? "a630_sqe.fw" : "a660_sqe.fw", &size);
 	if (microcode == NULL || size < 8 || size > 0x40000 ||
 	    !block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE) ||
 	    !block_new(&core_space, &core_sqe, CORE_SQE_ADDRESS, (uint32_t)size - 4, PTE_CORE | PTE_READ_ONLY) ||
