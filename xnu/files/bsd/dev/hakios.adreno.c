@@ -2687,6 +2687,8 @@ oob_630(const char *what, uint32_t request, uint32_t ack)
 	return acked;
 }
 
+static uint32_t core_khz;               /* (declared again with step 17's: the a630's is set here) */
+
 static bool
 gmu_talk_630(void)
 {
@@ -2788,8 +2790,18 @@ gmu_talk_630(void)
 	 * Android's kgsl sends it right after the messages, at the GPU's level 1 and every bus level allowed
 	 * (0x30000001, 0xff); without one the firmware faulted on the slumber request (run 042737).
 	 */
-	put(&gmu, "dcvs_ack_option", GMU_DCVS_ACK_OPTION, 0);
-	put(&gmu, "dcvs_perf_setting", GMU_DCVS_PERF_SETTING, 3u << 28 | 1);
+	/* (boot-arg adreno_speed=1..7: the level of gpu_levels_630 instead, 257 to 710 MHz; the GMU sets the clock and rail) */
+	{
+		uint32_t speed = 1;
+
+		if (PE_parse_boot_argn("adreno_speed", &speed, sizeof(speed)) && (speed < 1 || speed >= GPU_LEVELS_630)) {
+			speed = 1;
+		}
+		core_khz = gpu_levels_630[speed].khz;
+		printf("adreno: %u: the GPU's level: %u, %u MHz\n", step, speed, core_khz / 1000);
+		put(&gmu, "dcvs_ack_option", GMU_DCVS_ACK_OPTION, 0);
+		put(&gmu, "dcvs_perf_setting", GMU_DCVS_PERF_SETTING, 3u << 28 | speed);
+	}
 	put(&gmu, "dcvs_bw_setting", GMU_DCVS_BW_SETTING, 0xff);
 	if (!oob_630("the first level (DCVS)", OOB_DCVS_630, OOB_DCVS_ACK_630)) {
 		return false;
@@ -4245,7 +4257,7 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
 		return true;
 	case 0x04:                              /* MAX_FREQ */
-		*value = a630 ? 257000000ull : core_khz * 1000ull;    /* (the a630: the level step 16 gave its GMU) */
+		*value = core_khz * 1000ull;    /* (the a630: the level step 16 gave its GMU, adreno_speed) */
 		return true;
 	case 0x05:                              /* TIMESTAMP */
 		*value = mach_absolute_time();
@@ -4761,6 +4773,15 @@ hakios_adreno_init(void)
 		by_itself = true;
 		last_step = 21;
 		skip_steps = 1u << 10 | 1u << 11 | 1u << 12;
+		/*
+		 * Not on the 6T: there, the first bring-up after Android without steps 10 to 12 reset the whole
+		 * phone (Qualcomm crash dump) three times out of three, with them none in two (31 October; runs
+		 * after one of ours were fine either way). Step 12 is the likely one -- TrustZone handed the zap
+		 * shader's header while it still holds Android's -- but that is not proven.
+		 */
+		if (a630) {
+			skip_steps = 0;
+		}
 		pause_ms = 0;
 		watch_seconds = 0;
 		keep = 1;

@@ -368,8 +368,17 @@ filled by the 2D engine on the panel.
 OpenGL ES renderer draws the lock screen and SpringBoard with it -- colours right, touch and scrolling working --,
 with no GPU fault in thousands of frames; beside the audio DSP and the speaker too (run 051145). `gpu=1 soc_gpu=630`
 are in `run.args`; the root must be built `GL=1 ADSP=1 REST=1 userland/build.sh`. Mesa builds on Linux now
-(`tools/mk-mesa.sh` with meson and ninja on `PATH`, e.g. from pip in a python3.11 venv). Scrolling is still a little
-uneven.
+(`tools/mk-mesa.sh` with meson and ninja on `PATH`, e.g. from pip in a python3.11 venv).
+
+Frame pacing (`RC_JOBS=rc.jobs.fps`, `touch_lat=1`, `tools/frames.py`): at the GMU's first level, 257 MHz, 40 % of the
+gestures' frames came over 16.7 ms -- the zooms of opening and closing an app and Control Center waiting 40-50 ms for
+the GPU; at its top, `adreno_speed=7` (710 MHz, now in `run.args`), 28 % (the zooms 19-37 %; the phone at 49 C). The
+home screen's page swipes are the same at both (40-46 frames a second, over half slow): there the GPU is done in 2-3
+ms and the window server sits idle ~25 ms before it draws -- not the GPU's.
+
+On the 6T `gpu=1` runs steps 10 to 12 too: without them, the first bring-up after Android reset the whole phone (a
+Qualcomm crash dump, 3 times of 3), with them never (3 of 3). Step 12 -- TrustZone handed the zap shader's header
+while it still has Android's -- is the likely reason; not proven.
 
 **10. Audio** (started 30 October 2026).
 
