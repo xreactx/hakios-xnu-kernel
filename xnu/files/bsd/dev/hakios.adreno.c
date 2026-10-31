@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             13
+#define PORTED_A630             14
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -1950,6 +1950,40 @@ step_gmu_firmware(void)
 
 	if (!cx_ready() || gmu_firmware == NULL) {
 		return false;
+	}
+	if (a630) {
+		/*
+		 * a6xx_gmu.c, legacy: the image written whole from the code memory's first register on
+		 * (gmu_write_bulk(REG_A6XX_GMU_CM3_ITCM_START, ...)); 32K, so its second half lands in the data
+		 * memory, 16K further on in the registers. The processor stays in reset (step 15 lets it go).
+		 */
+		char what[140];
+
+		snprintf(what, sizeof(what), "load the GMU's firmware: %llu bytes through its registers from its code memory (%#x) on, "
+		    "the processor held in reset", gmu_firmware_size, gmu.phys + GMU_ITCM);
+		announce(what);
+		put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
+		for (uint64_t offset = 0; offset + 4 <= gmu_firmware_size; offset += 4) {
+			uint32_t word;
+
+			memcpy(&word, gmu_firmware + offset, sizeof(word));
+			wr(gmu.base + GMU_ITCM + (uint32_t)offset, word);
+		}
+		for (uint64_t offset = 0; offset + 4 <= gmu_firmware_size; offset += 4) {
+			uint32_t word;
+
+			memcpy(&word, gmu_firmware + offset, sizeof(word));
+			wrong += rd(gmu.base + GMU_ITCM + (uint32_t)offset) != word;
+		}
+		snprintf(last_write, sizeof(last_write), "step %u wrote the GMU's firmware into its code and data memory", step);
+		if (wrong) {
+			printf("adreno: %u: %u words of the GMU's own memory do not read back as written\n", step, wrong);
+			return false;
+		}
+		printf("adreno: %u: THE GMU'S FIRMWARE IS LOADED (%llu bytes read back as written); the words where firmware keeps its "
+		    "versions: %#x %#x %#x\n", step, gmu_firmware_size, rd(gmu.base + GMU_DTCM_VERSIONS),
+		    rd(gmu.base + GMU_DTCM_VERSIONS + 8), rd(gmu.base + GMU_DTCM_VERSIONS + 16));
+		return true;
 	}
 	announce("load the GMU's firmware: its first 16K of code and of data through the GMU's registers (0x3d6d000, "
 	    "0x3d71000), the rest into the memory just made");
