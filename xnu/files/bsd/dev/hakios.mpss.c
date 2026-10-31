@@ -1049,8 +1049,8 @@ rails(uint32_t level)
  * mem, gpll0_mss, mnoc_axi) -- step 5. A clock found on is left as found at the end.
  */
 static struct block gcc = { "gcc", 0x00100000, 0x90000 };
-static struct block qdsp6 __attribute__((unused)) = { "the modem's Hexagon", 0x04080000, 0x1000 };
-static struct block rmb __attribute__((unused)) = { "the modem's RMB", 0x04180000, 0x1000 };
+static struct block qdsp6 = { "the modem's Hexagon", 0x04080000, 0x1000 };
+static struct block rmb = { "the modem's RMB", 0x04180000, 0x1000 };
 #define GCC_VOTE                0x52004
 #define CBCR_OFF                (1u << 31)
 #define QDSP6SS_RESET_REG       0x014
@@ -1069,6 +1069,8 @@ static struct block mss_halt_q6 = { "TCSR: halt of the Hexagon's bus", 0x01f6300
 static struct block mss_halt_modem = { "TCSR: halt of the modem's bus", 0x01f65000, 0x1000 };
 static struct block mss_halt_nc = { "TCSR: halt of the modem's NC bus", 0x01f64000, 0x1000 };
 static struct block *const mss_halts[3] = { &mss_halt_q6, &mss_halt_modem, &mss_halt_nc };
+#define PDC_SYNC_REG            0x100
+#define PDC_MSS_BIT             (1u << 9)       /* dt: qcom,mss_pdc_offset = 9 */
 #define AXI_HALTREQ_REG         0x0
 #define AXI_HALTACK_REG         0x4
 #define AXI_IDLE_REG            0x8
@@ -1089,6 +1091,43 @@ static const struct mss_clock {
 #define MSS_CLOCKS              (sizeof(mss_clocks) / sizeof(mss_clocks[0]))
 static bool mss_clock_ours[MSS_CLOCKS];         /* switched on by us: to be switched off */
 static bool mss_rails_ours;
+static bool mss_reset_done;             /* the reset let go by us (step 5): pulsed again at the end, as Linux stops it */
+
+/*
+ * Linux's q6v5_reset_deassert() with has_alt_reset (the SDM845): the PDC's modem sync reset held, the
+ * RMB's alternate reset set, the AOSS's restart pulsed, the alternate reset cleared, the sync reset let go.
+ * The same without the alternate reset is its q6v5_reset_assert(), on the way down.
+ */
+static void
+mss_reset_pulse(bool alternate)
+{
+	uint32_t sync;
+
+	need(&mss_pdc_sync);
+	need(&mss_restart);
+	need(&rmb);
+	sync = rd(mss_pdc_sync.base + PDC_SYNC_REG);
+	wr(mss_pdc_sync.base + PDC_SYNC_REG, sync | PDC_MSS_BIT);
+	settle();
+	sleep_us(2);
+	if (alternate) {
+		wr(rmb.base + RMB_MBA_ALT_RESET, 1);
+		settle();
+		sleep_us(2);
+	}
+	wr(mss_restart.base, 1);
+	settle();
+	sleep_us(2);
+	wr(mss_restart.base, 0);
+	settle();
+	sleep_us(2);
+	if (alternate) {
+		wr(rmb.base + RMB_MBA_ALT_RESET, 0);
+		settle();
+	}
+	wr(mss_pdc_sync.base + PDC_SYNC_REG, sync & ~PDC_MSS_BIT);
+	settle();
+}
 
 /* The clocks of one kind (Linux's active ones, or the others) on; true if each says it runs. */
 static bool
@@ -1123,10 +1162,15 @@ mss_clocks_on(bool active)
 	return all;
 }
 
-/* What was switched on for the modem, off again: our clocks, then our request for the MSS rail. */
+/* What was switched on for the modem, off again: its reset pulsed as Linux stops it, our clocks, our MSS rail. */
 static void
 mss_unpower(void)
 {
+	if (mss_reset_done) {
+		mss_reset_pulse(false);
+		mss_reset_done = false;
+		printf("mpss: %u: the modem's reset pulsed again, as Linux stops it\n", step);
+	}
 	for (unsigned i = MSS_CLOCKS; i-- > 0;) {
 		if (mss_clock_ours[i]) {
 			const struct mss_clock *c = &mss_clocks[i];
@@ -1140,6 +1184,37 @@ mss_unpower(void)
 	}
 	mss_rails_ours = false;
 	printf("mpss: %u: the modem's clocks that were ours are off%s\n", step, leaving ? "" : ", and the MSS rail given back");
+}
+
+/* Step 5 for a modem started through its MBA: its reset let go, its active clocks on, its own registers read. */
+static bool
+mba_reset(void)
+{
+	announce("let the modem's reset go as Linux does on the SDM845: the PDC's modem sync reset (bit 9 of 0xb2e0100) held, "
+	    "the RMB's alternate reset (0x4180044) set, the AOSS's restart (0xc2b0000) pulsed, both let go");
+	printf("mpss: %u: about to pulse the modem's reset\n", step);
+	snprintf(last_write, sizeof(last_write), "step %u pulsed the modem's reset", step);
+	hold();
+	mss_reset_pulse(true);
+	mss_reset_done = true;
+	get(&mss_restart, "restart", 0);
+	get(&mss_pdc_sync, "modem sync reset", PDC_SYNC_REG);
+	announce("switch on the modem's active clocks (bus, mem, gpll0_mss, mnoc_axi)");
+	if (!mss_clocks_on(true)) {
+		return false;
+	}
+	announce("read the modem's Hexagon (0x4080000) and its RMB (0x4180000): the first words from the modem's own block");
+	get(&qdsp6, "reset", QDSP6SS_RESET_REG);
+	get(&qdsp6, "power control", QDSP6SS_PWR_CTL_REG);
+	get(&qdsp6, "sleep clock", QDSP6SS_SLEEP);
+	get(&rmb, "MBA image", RMB_MBA_IMAGE_REG);
+	get(&rmb, "PBL status", RMB_PBL_STATUS_REG);
+	get(&rmb, "MBA command", RMB_MBA_COMMAND_REG);
+	get(&rmb, "MBA status", RMB_MBA_STATUS_REG);
+	get(&rmb, "MSS status", RMB_MBA_MSS_STATUS);
+	get(&rmb, "alternate reset", RMB_MBA_ALT_RESET);
+	printf("mpss: %u: THE MODEM'S BLOCK ANSWERS; its Hexagon is not started\n", step);
+	return true;
 }
 
 /* Step 4 for a modem started through its MBA: rails, the proxy and reset clocks; its registers read. */
@@ -1834,8 +1909,7 @@ static bool
 step_image(void)
 {
 	if (mba_memory != 0) {
-		printf("mpss: %u: a modem started through its MBA: this step is not written yet\n", step);
-		return false;
+		return mba_reset();
 	}
 	volatile uint8_t *dsp_memory;
 	uint64_t written = 0, cleared = 0, wrong = 0, began;
@@ -6448,8 +6522,15 @@ static bool keep;                       /* the DSP and the link stay up while th
 static void
 steps_over(uint32_t done)
 {
-	if (mss_rails_ours || mss_clock_ours[0] || mss_clock_ours[1] || mss_clock_ours[2]) {
-		mss_unpower();
+	{
+		bool any = mss_rails_ours || mss_reset_done;
+
+		for (unsigned i = 0; i < MSS_CLOCKS; i++) {
+			any = any || mss_clock_ours[i];
+		}
+		if (any) {
+			mss_unpower();
+		}
 	}
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started && done == last_step && keep) {
