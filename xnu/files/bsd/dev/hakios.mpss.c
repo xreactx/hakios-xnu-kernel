@@ -2793,8 +2793,12 @@ ipa_firmware_load(void)
 	 * GSI's instruction memory at 0x1e1f000 and the microcontroller's at 0x1e81000, both in the IPA's
 	 * register space) is checked by reading them back: the GSI's status bit alone does not prove its
 	 * firmware runs (24 October: the modem's IPA_CTL task never answers, as if GSI answered nothing).
+	 * Not on the SDM845 (soc_apcs_ipc) unless modem_ipa_readback=1: once started, its TrustZone guards those
+	 * memories, and the 6T, reading them, reset into a crash dump (crash dump 3, 31 October; Linux never reads them).
 	 */
-	for (uint32_t i = 0; i < count; i++) {
+	bool readback = apcs_ipc == 0 || option("modem_ipa_readback");
+
+	for (uint32_t i = 0; i < count && readback; i++) {
 		if (segments[i].type == 1 && !MDT_HASH(segments[i].flags) && segment_file[i] != NULL && segments[i].file_size >= 16 &&
 		    segments[i].vaddr >= 0x01e00000u && segments[i].vaddr < 0x01f00000u) {
 			struct block iram = { "ipa iram", segments[i].vaddr & ~0xfffu, 0x8000 };
@@ -2820,7 +2824,8 @@ ipa_firmware_load(void)
 
 		need(&gsi);
 		tell("mpss: %u: GSI_CFG %#x (bit 0 GSI enable, 1 MCS enable, 2 double MCS clock, 3 uC is MCS, 4 power collapse, 5 bypass matrix off, "
-		    "[11:8] sleep clock divider), MCS_CFG %#x (bit 0: the sequencer runs)\n", step, rd(gsi.base + 0), rd(gsi.base + 0xb000));
+		    "[11:8] sleep clock divider), MCS_CFG %#x (bit 0: the sequencer runs)\n", step, rd(gsi.base + 0),
+		    readback ? rd(gsi.base + 0xb000) : 0);
 		if (option("modem_ipa_gsi_enable")) {
 			/*
 			 * What Android's gsi_enable_fw() writes when the firmware was put into the instruction memory by hand
