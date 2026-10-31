@@ -313,6 +313,11 @@ space; the SMMU's context 1 with our tables, and stream 5 sent through it -- wit
 cell; redwood's mask `0x400` is its tree's second). Every write, the global ones through the hypervisor too, reads back
 as written, and no fault; at the end all is put back and CX switched off.
 
+Step 14 works (run 001625): the image written whole through the GMU's registers from its code memory (`0x506d000`) on,
+the processor held in reset, its second half landing in the data memory 16K further on, as Linux's legacy load does;
+all 32 768 bytes read back as written. (The words where the a660's firmware keeps its versions read 0: the legacy
+image keeps none there.)
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the
