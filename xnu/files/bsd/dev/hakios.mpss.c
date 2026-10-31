@@ -1092,6 +1092,13 @@ static const struct mss_clock {
 static bool mss_clock_ours[MSS_CLOCKS];         /* switched on by us: to be switched off */
 static bool mss_rails_ours;
 static bool mss_reset_done;             /* the reset let go by us (step 5): pulsed again at the end, as Linux stops it */
+static bool mss_mba_running;            /* its Hexagon started (step 6): its buses halted at the end */
+static bool mss_mpss_assigned, mss_mba_assigned;        /* the regions handed to the modem: to be taken back */
+static bool mss_assign(uint64_t address, uint64_t size, bool to_modem, const char *what);
+static void mss_halt_port(struct block *b);
+static bool mba_boot(void);
+static bool step_our_item_smp2p(void);
+static void mss_reclaim(void);
 
 /*
  * Linux's q6v5_reset_deassert() with has_alt_reset (the SDM845): the PDC's modem sync reset held, the
@@ -1166,11 +1173,20 @@ mss_clocks_on(bool active)
 static void
 mss_unpower(void)
 {
+	/* (Linux's q6v5_mba_reclaim(): the buses halted, the reset, the memory taken back, the clocks off) */
+	if (mss_mba_running) {
+		for (unsigned i = 0; i < 3; i++) {
+			mss_halt_port(mss_halts[i]);
+		}
+		mss_mba_running = false;
+		printf("mpss: %u: the modem's three buses are halted\n", step);
+	}
 	if (mss_reset_done) {
 		mss_reset_pulse(false);
 		mss_reset_done = false;
 		printf("mpss: %u: the modem's reset pulsed again, as Linux stops it\n", step);
 	}
+	mss_reclaim();
 	for (unsigned i = MSS_CLOCKS; i-- > 0;) {
 		if (mss_clock_ours[i]) {
 			const struct mss_clock *c = &mss_clocks[i];
@@ -2021,6 +2037,16 @@ static void glink_reset(void);
 
 static bool
 step_our_item(void)
+{
+	if (mba_memory != 0) {
+		/* (the modem's main image reads our SMP2P item once it runs: written now, as redwood's step 6 writes it) */
+		return step_our_item_smp2p() && mba_boot();
+	}
+	return step_our_item_smp2p();
+}
+
+static bool
+step_our_item_smp2p(void)
 {
 	struct smem_partition header;
 	struct smp2p ours;
@@ -4066,6 +4092,190 @@ rmtfs_share(bool in)
 		tell("mpss: %u: the shared buffer takes our write: it reads %#x\n", step, *(volatile uint32_t *)(rmtfs_window + 0x200));
 	}
 	return true;
+}
+
+/*
+ * A modem started through its MBA: its two regions handed to it and back (Linux's q6v5_xfer_mem_ownership():
+ * qcom_scm_assign_mem() from who has the memory to who is to have it -- the modem's MSA read and write, or
+ * HLOS read, write and execute -- in the page layout rmtfs_share() uses).
+ */
+#define VM_PERM_RWX             7
+
+static bool
+mss_assign(uint64_t address, uint64_t size, bool to_modem, const char *what)
+{
+	struct {
+		uint64_t address, size;                 /* +0: the memory */
+		uint64_t pad0[6];
+		uint32_t sources[3];                    /* +64: who has it */
+		uint32_t pad1[13];
+		struct {                                /* +128: who is to have it */
+			uint32_t vmid, permission;
+			uint64_t context;
+			uint32_t context_size, unused;
+		} destinations[3];
+		uint8_t pad2[40];
+		uint64_t more[7];                       /* +240: the arguments beyond the registers */
+	} *page;
+	vm_offset_t memory = 0;
+	uint64_t answer = ~0ull, pa;
+	int32_t result;
+
+	if (kmem_alloc(kernel_map, &memory, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		return false;
+	}
+	page = (void *)memory;
+	page->address = address;
+	page->size = (size + 0xfff) & ~0xfffull;
+	page->sources[0] = to_modem ? VMID_HLOS : VMID_MSS_MSA;
+	page->destinations[0].vmid = to_modem ? VMID_MSS_MSA : VMID_HLOS;
+	page->destinations[0].permission = to_modem ? VM_PERM_RW : VM_PERM_RWX;
+	pa = kvtophys(memory);
+	page->more[0] = 4;                                              /* argument 3: the size of the sources */
+	page->more[1] = pa + 128;                                       /* 4: the destinations */
+	page->more[2] = sizeof(page->destinations[0]);                  /* 5: their size */
+	page->more[3] = 0;                                              /* 6: spare */
+	for (vm_offset_t line = memory; line < memory + PAGE_SIZE; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	settle();
+	result = scm(to_modem ? "to hand memory to the modem" : "to take memory back from the modem", SCM_MP_ASSIGN,
+	    SCM_ASSIGN_ARGUMENTS, pa, 16, pa + 64, pa + 240, &answer);
+	kmem_free(kernel_map, memory, PAGE_SIZE);
+	if (result != 0 || answer != 0) {
+		printf("mpss: %u: THE HYPERVISOR DOES NOT %s %s (%#llx, %#llx bytes): the call returns %d, its answer is %#llx\n", step,
+		    to_modem ? "HAND THE MODEM" : "GIVE US BACK", what, address, size, result, answer);
+		return false;
+	}
+	printf("mpss: %u: %s (%#llx, %#llx bytes) %s\n", step, what, address, size, to_modem ? "is the modem's (MSA, read and write)" :
+	    "is ours again (HLOS)");
+	return true;
+}
+
+/* Both regions taken back from the modem, those that were handed to it. */
+static void
+mss_reclaim(void)
+{
+	if (mss_mba_assigned && mss_assign(mba_memory, mba_memory_size, false, "the MBA's region")) {
+		mss_mba_assigned = false;
+	}
+	if (mss_mpss_assigned && mss_assign(mpss_memory, MPSS_MEMORY_SIZE, false, "the modem's region")) {
+		mss_mpss_assigned = false;
+	}
+}
+
+/* Linux's q6v5proc_halt_axi_port(): a bus of the modem's halted (it stays so until the reset). */
+static void
+mss_halt_port(struct block *b)
+{
+	need(b);
+	if (rd(b->base + AXI_IDLE_REG)) {
+		return;
+	}
+	wr(b->base + AXI_HALTREQ_REG, 1);
+	for (int i = 0; i < 1000 && !rd(b->base + AXI_HALTACK_REG); i++) {
+		sleep_us(100);
+	}
+	if (!rd(b->base + AXI_IDLE_REG)) {
+		printf("mpss: %u: %s: the port did not halt\n", step, b->name);
+	}
+	wr(b->base + AXI_HALTREQ_REG, 0);
+}
+
+/* Up to `ms` milliseconds for a register of the RMB to be other than 0 (or to have `bit`); its last value. */
+static uint32_t
+rmb_wait(uint32_t offset, uint32_t bit, uint32_t ms)
+{
+	uint32_t value = 0;
+
+	for (uint32_t i = 0; i <= ms * 10; i++) {
+		value = rd(rmb.base + offset);
+		if (bit != 0 ? (value & bit) != 0 : value != 0) {
+			break;
+		}
+		sleep_us(100);
+	}
+	return value;
+}
+
+#define QDSP6SS_BOOT_CORE_START 0x400
+#define QDSP6SS_BOOT_CMD        0x404
+#define RMB_PBL_SUCCESS         1
+#define RMB_MBA_XPU_UNLOCKED    1
+#define RMB_MBA_XPU_UNLOCKED_SCRIBBLED 2
+
+/*
+ * Step 6 for a modem started through its MBA (Linux's q6v5_mba_load() from the reset on, and q6v5proc_reset()
+ * for the SDM845): mba.mbn copied as it is into its region, both regions handed to the modem, the region's
+ * address to the RMB, the Hexagon's sleep clock on and its boot state machine started; then the boot ROM's
+ * "success" and the MBA's "XPU unlocked" waited for.
+ */
+static bool
+mba_boot(void)
+{
+	volatile uint8_t *window;
+	uint32_t value;
+
+	if (mba_image == NULL) {
+		return false;
+	}
+	{
+		char what[160];
+
+		snprintf(what, sizeof(what), "copy mba.mbn (%llu bytes) into its region (%#x) and hand that region and the modem's "
+		    "(%#x) to the modem through the hypervisor", mba_image_size, mba_memory, mpss_memory);
+		announce(what);
+	}
+	window = (volatile uint8_t *)ml_io_map_unmappable(mba_memory, mba_memory_size, VM_WIMG_WCOMB);
+	if (window == NULL) {
+		printf("mpss: %u: the MBA's region cannot be mapped\n", step);
+		return false;
+	}
+	for (uint64_t i = 0; i < mba_image_size; i++) {
+		window[i] = mba_image[i];
+	}
+	settle();
+	value = window[0] | window[1] << 8 | window[2] << 16 | (uint32_t)window[3] << 24;
+	ml_io_unmap((vm_offset_t)window, mba_memory_size);      /* (ours no more from here: not to be touched) */
+	printf("mpss: %u: mba.mbn is in its region (it begins %#x)\n", step, value);
+	if (!mss_assign(mpss_memory, MPSS_MEMORY_SIZE, true, "the modem's region")) {
+		return false;
+	}
+	mss_mpss_assigned = true;
+	if (!mss_assign(mba_memory, mba_memory_size, true, "the MBA's region")) {
+		return false;
+	}
+	mss_mba_assigned = true;
+	put(&rmb, "MBA image", RMB_MBA_IMAGE_REG, mba_memory);
+
+	announce("start the modem's Hexagon: its sleep clock, BOOT_CORE_START, BOOT_CMD; its boot ROM, then its MBA, waited for");
+	put(&qdsp6, "sleep clock", QDSP6SS_SLEEP, rd(qdsp6.base + QDSP6SS_SLEEP) | 1);
+	for (int i = 0; i < 20 && (rd(qdsp6.base + QDSP6SS_SLEEP) & CBCR_OFF); i++) {
+		sleep_us(10);
+	}
+	if (get(&qdsp6, "sleep clock", QDSP6SS_SLEEP) & CBCR_OFF) {
+		printf("mpss: %u: the Hexagon's sleep clock does not run\n", step);
+		return false;
+	}
+	mss_mba_running = true;                 /* (from the next write on, it is to be halted at the end) */
+	put(&qdsp6, "boot core start", QDSP6SS_BOOT_CORE_START, 1);
+	put(&qdsp6, "boot command", QDSP6SS_BOOT_CMD, 1);
+	value = rmb_wait(RMB_MBA_MSS_STATUS, 1, 10);
+	printf("mpss: %u: the boot state machine %s (MSS status %#x)\n", step, value & 1 ? "IS DONE" : "DID NOT FINISH", value);
+	if (!(value & 1)) {
+		return false;
+	}
+	value = rmb_wait(RMB_PBL_STATUS_REG, 0, 1000);
+	printf("mpss: %u: the modem's boot ROM says %#x%s\n", step, value, value == RMB_PBL_SUCCESS ? ": SUCCESS" :
+	    value == 0 ? ": nothing within a second" : ": not success");
+	if (value != RMB_PBL_SUCCESS) {
+		return false;
+	}
+	value = rmb_wait(RMB_MBA_STATUS_REG, 0, 5000);
+	printf("mpss: %u: the MBA says %#x%s\n", step, value, value == RMB_MBA_XPU_UNLOCKED ? ": XPU UNLOCKED -- THE MBA RUNS" :
+	    value == RMB_MBA_XPU_UNLOCKED_SCRIBBLED ? ": XPU UNLOCKED (SCRIBBLED) -- THE MBA RUNS" : value == 0 ?
+	    ": nothing within 5 seconds" : ": not what Linux waits for");
+	return value == RMB_MBA_XPU_UNLOCKED || value == RMB_MBA_XPU_UNLOCKED_SCRIBBLED;
 }
 
 /* A TLV of a QMI message: its value and length, or NULL. */
@@ -6523,7 +6733,7 @@ static void
 steps_over(uint32_t done)
 {
 	{
-		bool any = mss_rails_ours || mss_reset_done;
+		bool any = mss_rails_ours || mss_reset_done || mss_mba_running || mss_mpss_assigned || mss_mba_assigned;
 
 		for (unsigned i = 0; i < MSS_CLOCKS; i++) {
 			any = any || mss_clock_ours[i];
