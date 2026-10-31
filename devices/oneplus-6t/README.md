@@ -380,7 +380,13 @@ the start of every gesture: 40-90 ms for a page swipe, 50 ms for a fling, 170-19
 the window server is idle, waiting for SpringBoard's commit, the same in all three rounds (not shaders being compiled):
 SpringBoard's own work at a gesture's start, on the CPU. With the memory's bandwidth voted for (the kernel now does it
 on the 6T as on redwood, from 26 s: hakios.cpufreq.c, soc_cmd_db/soc_rsc) the slow frames are 25 % (run 142026). The big
-cores at their top (cpufreq_osm_mhz=3000) changed nothing: the SoC throttled them to 1.7 GHz at 69 C (run 142955).
+cores at their top (cpufreq_osm_mhz=3000) changed nothing: the SoC throttled them to 1.7 GHz at 69 C (run 142955). And it
+is not SpringBoard being busy either: its main thread sampled every 12 ms through a whole round (run 152351,
+`ustacks=SpringBoard ustacks_threads=1 ustacks_tname=*`, named with ipsw against the shared cache) sits in its run
+loop waiting for the next event in most of each gesture's first 150 ms -- busy in 1 to 13 of ~12-24 snapshots, at
+nothing in particular, and never waiting on another process. The touches reach the window server within 0-1 ms of
+the kernel posting them (every 8 ms). So in that first gap nobody in the port is holding anything up: it is UIKit
+waiting for the gesture to be recognised (and with rwtouch's synthetic swipes); a real finger may differ.
 
 On the 6T `gpu=1` runs steps 10 to 12 too: without them, the first bring-up after Android reset the whole phone (a
 Qualcomm crash dump, 3 times of 3), with them never (3 of 3). Step 12 -- TrustZone handed the zap shader's header
