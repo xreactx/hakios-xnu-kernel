@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             19
+#define PORTED_A630             20
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -3586,6 +3586,58 @@ step_zap_load(void)
 
 /* ---- step 20: the 3D core's registers, its command processor started, its first command ------------------- */
 
+/*
+ * The a630's part of Linux's hw_init (a6xx_gpu.c, v6.12, and a6xx_catalog.c's entry for chip 0x06030001):
+ * its bus interface is the older VBIF, in the core's own registers -- no GBIF to let go of, a QoS of 3 and
+ * VBIF_GATE_OFF_WRREQ_EN 9 --; the UCHE told where the 1 MB of GMEM is; its ROQ thresholds and primitive FIFO
+ * threshold; UBWC as a6xx_calc_ubwc_config has it for the a630 (highest bank bit 15, swizzle 6: hbb_lo 2);
+ * none of the a660's LPAC, chicken bits or extended APRIV. Left out as for the a660: clock gating and the
+ * protection of registers from user programs' commands.
+ */
+#define RBBM_VBIF_CLIENT_QOS_CNTL GPU_WORD(0x0010)
+#define VBIF_VERSION            GPU_WORD(0x3000)
+#define VBIF_GATE_OFF_WRREQ_EN  GPU_WORD(0x302a)
+#define UCHE_GMEM_RANGE_MIN     GPU_WORD(0x0e0b)
+#define UCHE_GMEM_RANGE_MAX     GPU_WORD(0x0e0d)
+#define GMEM_630                0x100000u
+
+static void
+core_registers_630(const uint32_t *address_modes, unsigned count)
+{
+	announce("write the 3D core's registers as Linux does for the a630 before it starts the command processor: the "
+	    "first writes to the core itself");
+	get(&gpu, "vbif_version", VBIF_VERSION);
+	put(&gpu, "rbbm_secvid_tsb_cntl", RBBM_SECVID_TSB_CNTL, 0);
+	put64(&gpu, "rbbm_secvid_tsb_trusted_base", RBBM_SECVID_TSB_TRUSTED_BASE, 0);
+	put(&gpu, "rbbm_secvid_tsb_trusted_size", RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
+	for (unsigned i = 0; i < count; i++) {
+		put(&gpu, "address mode: 64 bits", GPU_WORD(address_modes[i]), 1);
+	}
+	put(&gpu, "rbbm_vbif_client_qos_cntl", RBBM_VBIF_CLIENT_QOS_CNTL, 3);
+	put(&gpu, "vbif_gate_off_wrreq_en", VBIF_GATE_OFF_WRREQ_EN, 9);
+	put(&gpu, "rbbm_perfctr_gpu_busy_masked", RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
+	put64(&gpu, "uche_write_range_max", UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
+	put64(&gpu, "uche_trap_base", UCHE_TRAP_BASE, 0x0001fffffffff000ull);
+	put64(&gpu, "uche_write_thru_base", UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
+	put64(&gpu, "uche_gmem_range_min", UCHE_GMEM_RANGE_MIN, 0x100000);
+	put64(&gpu, "uche_gmem_range_max", UCHE_GMEM_RANGE_MAX, 0x100000 + GMEM_630 - 1);
+	put(&gpu, "uche_filter_cntl", UCHE_FILTER_CNTL, 0x804);
+	put(&gpu, "uche_cache_ways", UCHE_CACHE_WAYS, 0x4);
+	put(&gpu, "cp_roq_thresholds_2", CP_ROQ_THRESHOLDS_2, 0x010000c0);
+	put(&gpu, "cp_roq_thresholds_1", CP_ROQ_THRESHOLDS_1, 0x8040362c);
+	put(&gpu, "cp_mem_pool_size", CP_MEM_POOL_SIZE, 128);
+	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, 0x00180000);
+	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
+	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
+	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 2u << 1);
+	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), 2u << 1);
+	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 1);
+	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), 2u << 21);
+	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), 0);
+	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x1fffff);
+	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, 1u << 7 | 1);
+}
+
 static bool
 step_core_start(void)
 {
@@ -3595,6 +3647,10 @@ step_core_start(void)
 
 	if (!cx_ready() || !core_is_on || !core_space_is_on) {
 		return false;
+	}
+	if (a630) {
+		core_registers_630(address_modes, sizeof(address_modes) / sizeof(address_modes[0]));
+		goto start;
 	}
 	announce("write the 3D core's registers as Linux does before it starts the command processor: the first writes "
 	    "to the core itself");
@@ -3644,6 +3700,7 @@ step_core_start(void)
 	 * nothing is. All it can do then is ask the SMMU for it, and the SMMU's record of the refusal
 	 * shows that its requests come through context 0 as meant, and what they look like.
 	 */
+start:
 	PE_parse_boot_argn("adreno_blind", &blind, sizeof(blind));
 	put64(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE, blind ? CORE_NOWHERE : CORE_SQE_ADDRESS);
 	put64(&gpu, "cp_rb_base", CP_RB_BASE, CORE_RING_ADDRESS);
@@ -3903,9 +3960,22 @@ stale_stop(void)
  * Otherwise the halt is lifted again at once, as Linux does: the GMU reaches its memory through
  * the same interface, and one that cannot read its messages does not answer "slumber".
  */
+#define VBIF_XIN_HALT_CTRL0     GPU_WORD(0x3080)
+#define VBIF_XIN_HALT_CTRL1     GPU_WORD(0x3081)
+
 static void
 core_bus_halt(bool for_good)
 {
+	if (a630) {
+		/* (its VBIF, in the core's registers: a6xx_bus_clear_pending_transactions without GBIF; Android's 0xf then 0) */
+		wr(gpu.base + VBIF_XIN_HALT_CTRL0, 0xf);
+		for (int i = 0; i < 100000 && (rd(gpu.base + VBIF_XIN_HALT_CTRL1) & 0xf) != 0xf; i++) {
+		}
+		if (!for_good) {
+			wr(gpu.base + VBIF_XIN_HALT_CTRL0, 0);
+		}
+		return;
+	}
 	if (for_good) {
 		wr(gpu.base + RBBM_GBIF_HALT, 1);
 		for (int i = 0; i < 100000 && !(rd(gpu.base + RBBM_GBIF_HALT_ACK) & 1); i++) {
@@ -3938,9 +4008,14 @@ gpu_block_stop(void)
 		    "sees it busy: %#x\n", step, rd(gpu.base + RBBM_STATUS), rd(gpu.base + RBBM_INT_0_STATUS),
 		    rd(gpu.base + CP_RB_RPTR), ring_at, rd(gmu.base + GMU_AO_GPU_CX_BUSY_STATUS));
 		core_bus_halt(core_stuck);
-		printf("adreno: %u: the GPU block's bus has been halted%s (rbbm_gbif_halt_ack %#x, gbif halt_ack %#x)\n", step,
-		    core_stuck ? ", the 3D core's side too, and stays so" : " and let go again", rd(gpu.base + RBBM_GBIF_HALT_ACK),
-		    rd(gbif.base + GBIF_HALT_ACK));
+		if (a630) {
+			printf("adreno: %u: the 3D core's bus (VBIF) has been halted%s (xin_halt_ctrl1 %#x)\n", step,
+			    core_stuck ? ", and stays so" : " and let go again", rd(gpu.base + VBIF_XIN_HALT_CTRL1));
+		} else {
+			printf("adreno: %u: the GPU block's bus has been halted%s (rbbm_gbif_halt_ack %#x, gbif halt_ack %#x)\n", step,
+			    core_stuck ? ", the 3D core's side too, and stays so" : " and let go again", rd(gpu.base + RBBM_GBIF_HALT_ACK),
+			    rd(gbif.base + GBIF_HALT_ACK));
+		}
 	}
 	if (core_is_on) {
 		put(&gmu, "host2gmu_intr_set", GMU_HOST2GMU_INTR_SET, a630 ? 1u << OOB_GPU_ACK_630 : 1u << 31);
