@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             6
+#define PORTED_A630             7
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -1117,7 +1117,12 @@ step_rscc(void)
 	if (!cx_ready()) {
 		return false;
 	}
-	announce("read the GMU's RPMh channel (0x3de0000)");
+	{
+		char what[80];
+
+		snprintf(what, sizeof(what), "read the GMU's RPMh channel (%#x)", rscc.phys);
+		announce(what);
+	}
 	get(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0);
 	get(&rscc, "pdc_slave_id_drv0", RSCC_PDC_SLAVE_ID_DRV0);
 	get(&rscc, "seq_busy_drv0", RSCC_SEQ_BUSY_DRV0);
@@ -3869,6 +3874,7 @@ hakios_adreno_init(void)
 		gmu.phys = 0x0506a000;          /* dt: qcom,gmu "kgsl_gmu_reg" */
 		gmu.size = 0x30000;
 		cx_misc.phys = 0x0509e000;      /* dt: qcom,kgsl-3d0 "cx_misc" */
+		rscc.phys = 0x0506a000 + 0x23000;       /* inside the GMU's block on the a630 (a6xx_gmu.c: gmu->mmio + 0x23000) */
 		PE_parse_boot_argn("soc_cmd_db", &cmd_db_phys, sizeof(cmd_db_phys));
 		printf("adreno: the OnePlus 6T's Adreno 630 (soc_gpu=630): its clock controller at %#x, the command DB at %#lx; steps "
 		    "1 to %u only, so far\n", gpucc.phys, cmd_db_phys, PORTED_A630);
