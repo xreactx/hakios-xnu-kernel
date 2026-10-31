@@ -299,6 +299,13 @@ stream to "fault"), no context has a kind, context 0 translates nothing and has 
 nothing up in it: the GPU's and the GMU's streams will be ours to give. The hypervisor answered the global registers'
 reads without trouble.
 
+Steps 10 to 12 work (run 001123, with `adsp=0 sound=0` so that no TrustZone call of the audio DSP's crosses them; the
+small image carries `fw-gpu/` whenever it has files): two words into the GMU's data memory (`0x5071000`) read back as
+written, and put back -- its firmware can go in that way; TrustZone takes the "is it available" question and calls,
+and lists no image as "supported" (not even the audio DSP it starts: the question tells nothing, as on redwood); and it
+**accepts the zap shader's signature** from `fw/a630_zap.mdt` (image 13: the header of 3 segments and 6536 bytes of
+hashes, as TrustZone takes it). From step 13 on comes the a630's own GMU: its firmware, its start, its messages.
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the

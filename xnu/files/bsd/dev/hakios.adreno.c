@@ -118,7 +118,7 @@ static bool quiet;                      /* repeating accesses that have been ann
  * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
-#define PORTED_A630             9
+#define PORTED_A630             12
 static bool cx_ours;                    /* step 4 switched CX on: the steps' end switches it off again (on the a630) */
 
 /*
@@ -1250,7 +1250,13 @@ step_gmu_memory(void)
 	if (!cx_ready()) {
 		return false;
 	}
-	announce("hold the GMU's processor in reset, write two words into its data memory (0x3d71000), read them back");
+	{
+		char what[120];
+
+		snprintf(what, sizeof(what), "hold the GMU's processor in reset, write two words into its data memory (%#x), read them "
+		    "back", gmu.phys + GMU_DTCM);
+		announce(what);
+	}
 	if (get(&gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT) == 0xbabeface) {
 		printf("adreno: %u: firmware is running in the GMU: leaving its memory alone\n", step);
 		return false;
@@ -1761,7 +1767,7 @@ zap_header(uint64_t *phys)
 	uint64_t size = 0;
 	uint32_t segments, hashes;
 
-	header = image_file("fw", "a660_zap.mdt", &size);
+	header = image_file("fw", a630 ? "a630_zap.mdt" : "a660_zap.mdt", &size);
 	if (header == NULL) {
 		return false;
 	}
@@ -1795,7 +1801,8 @@ step_zap_signature(void)
 	uint64_t header = 0, answer = ~0ull;
 	int32_t result;
 
-	announce("find the zap shader's header, fw/a660_zap.mdt, in the small image that came with the kernel");
+	announce(a630 ? "find the zap shader's header, fw/a630_zap.mdt, in the small image that came with the kernel" :
+	    "find the zap shader's header, fw/a660_zap.mdt, in the small image that came with the kernel");
 	if (!zap_header(&header)) {
 		return false;
 	}
