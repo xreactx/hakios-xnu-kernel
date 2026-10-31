@@ -1794,6 +1794,15 @@ dsp_shutdown(const char *why)
 	if (!leaving) {
 		link_stop();
 	}
+	if (mba_memory != 0 && option("modem_leave")) {
+		/*
+		 * (a test: the modem started through its MBA left running, neither asked to stop nor halted, its memory
+		 * not taken back -- the next restart of the phone ends it. Whether a run that started it ends in order
+		 * when nothing is done to it, its log whole: 31 October)
+		 */
+		printf("mpss: %u: modem_leave=1: the modem is left running as it is; the phone's restart ends it\n", step);
+		return false;
+	}
 	stopped_by_its_word = dsp_ask_to_stop(leaving ? 2000 : 5000);
 	if (mba_memory != 0) {
 		/* (no TrustZone image to shut down: Linux's q6v5_stop() -- the buses halted, the reset, the memory back) */
