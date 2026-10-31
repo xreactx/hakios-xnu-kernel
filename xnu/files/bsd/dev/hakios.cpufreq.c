@@ -23,6 +23,7 @@
  * is restarted.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
@@ -459,7 +460,9 @@ load_start(void)
  * left, with what is needed to vote for bandwidth on them -- only read. (membench=2 says the cores
  * together get no more from memory than one alone: 12 GB/s; nobody here votes for more.)
  */
-#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_REDWOOD          0x80860000UL
+static vm_offset_t cmd_db_phys = CMD_DB_REDWOOD;   /* soc_cmd_db=: the 6T's, 0x85fe0000 */
+#define CMD_DB_PHYS             cmd_db_phys
 #define CMD_DB_SIZE             0x20000UL
 #define CMD_DB_BCM              5               /* the kind of resource in a slave's id: bus clock managers */
 
@@ -531,7 +534,9 @@ ddr_look(void)
  * each (sc7280's qcom,tcs-config): every command with an address, and which of them go to the BCMs
  * above -- the bandwidth it asked for, and that is in force whenever the processors are awake.
  */
-#define RSC_PHYS                0x18220000UL
+#define RSC_REDWOOD             0x18220000UL
+static vm_offset_t rsc_phys = RSC_REDWOOD;         /* soc_rsc=: the 6T's, 0x179e0000 */
+#define RSC_PHYS                rsc_phys
 #define RSC_SIZE                0x10000UL
 #define RSC_TCS(n, reg)         (0xd00 + 0x2a0 * (n) + (reg))
 #define RSC_TCS_COUNT           9
@@ -668,6 +673,15 @@ ddr_vote(uint32_t vote)
 	return ddr_rpmh_write(address, data, 3);
 }
 
+/*
+ * The OnePlus 6T (soc_cmd_db= and soc_rsc= given, cpufreq_osm= for its cores): the same vote, but from a
+ * thread at 26 s and under hakios_rsc_lock -- command slot set 0 of the RSC is also UEFI's RPMh driver's for
+ * the run's first 24 s (on the loader's core), and the touch screen's driver's after.
+ */
+extern lck_mtx_t hakios_rsc_lock;
+static bool ddr_later;
+#define DDR_LATER_S             26
+
 static void
 ddr_raise(void)
 {
@@ -682,7 +696,13 @@ ddr_raise(void)
 		return;
 	}
 	ddr_rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	if (ddr_later) {
+		lck_mtx_lock(&hakios_rsc_lock);
+	}
 	ddr_voted = ddr_vote(vote);
+	if (ddr_later) {
+		lck_mtx_unlock(&hakios_rsc_lock);
+	}
 	tell("ddr: memory bandwidth vote %u on MC0 (%#x) and SH0 (%#x)%s\n", vote, ddr_mc0, ddr_sh0, ddr_voted ? "" : ": FAILED");
 }
 
@@ -707,6 +727,20 @@ hakios_ddr_quiesce(void)
 	tell("ddr: memory bandwidth vote %u for the loader: %s\n", rest, done ? "done" : "FAILED");
 }
 
+static void ddr_raise(void);
+
+static void
+ddr_later_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	uint64_t now_ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+	if (now_ns < DDR_LATER_S * NSEC_PER_SEC) {
+		delay_for_interval((uint32_t)((DDR_LATER_S * NSEC_PER_SEC - now_ns) / NSEC_PER_MSEC), NSEC_PER_MSEC);
+	}
+	ddr_raise();
+}
+
 void
 hakios_cpufreq_init(void)
 {
@@ -721,6 +755,24 @@ hakios_cpufreq_init(void)
 		ddr_slots();
 	} else if (enabled == 2 && cpufreq_wanted()) {
 		ddr_raise();
+	} else if (enabled == 2) {
+		vm_offset_t phys = 0;
+		uint32_t osm = 0;
+		thread_t later;
+
+		/* the 6T: its numbers, and the vote later (see ddr_later) */
+		if (PE_parse_boot_argn("cpufreq_osm", &osm, sizeof(osm)) && osm >= 2 &&
+		    PE_parse_boot_argn("soc_cmd_db", &phys, sizeof(phys)) && phys != 0) {
+			cmd_db_phys = phys;
+			phys = 0;
+			if (PE_parse_boot_argn("soc_rsc", &phys, sizeof(phys)) && phys != 0) {
+				rsc_phys = phys;
+				ddr_later = true;
+				if (kernel_thread_start(ddr_later_thread, NULL, &later) == KERN_SUCCESS) {
+					thread_deallocate(later);
+				}
+			}
+		}
 	}
 	enabled = 0;
 	if (PE_parse_boot_argn("cpufreq_osm", &enabled, sizeof(enabled)) && enabled) {
