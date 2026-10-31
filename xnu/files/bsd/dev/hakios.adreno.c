@@ -519,6 +519,10 @@ pm8005_s1_show(const char *when)
 	}
 	printf("adreno: %u: pm8005 s1 (%s): type %#x/%#x, status %02x %02x %02x %02x; set %02x %02x, mode %02x, enable %02x\n", step,
 	    when, id[0], id[1], id[4], id[5], id[6], id[7], set[0], set[1], set[5], set[6]);
+	if (hakios_spmi_read(0x514, 0x10, id, 8) == NULL && hakios_spmi_read(0x517, 0x40, set, 8) == NULL) {
+		printf("adreno: %u: pm8005 s1 interrupts (0x10-0x17) %02x %02x %02x %02x %02x %02x %02x %02x; s2 set %02x %02x, mode %02x, "
+		    "enable %02x\n", step, id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7], set[0], set[1], set[5], set[6]);
+	}
 }
 
 static void
@@ -532,6 +536,25 @@ gfx_vote_630(void)
 	printf("adreno: %u: adreno_gfx=1: the application processor's own requests for gfx.lvl (%#x), one position up at a time\n",
 	    step, address);
 	pm8005_s1_show("before");
+	/*
+	 * A position not reached leaves RPMh's sequence for the rail stuck until the phone restarts (S1 stays
+	 * at its new setting when the rail is given back), so what is tried after it says nothing: with
+	 * adreno_gfx=2 every other rail is raised to its top before gfx.lvl is first asked (and left there).
+	 */
+	if (test == 2) {
+		static const char *const others[7] = { "mx.lvl", "xo.lvl", "cx.lvl", "ebi.lvl", "lmx.lvl", "lcx.lvl", "mss.lvl" };
+
+		for (unsigned r = 0; r < 7; r++) {
+			uint16_t levels[16];
+			unsigned count = 0;
+			uint32_t other = rpmh_resource(others[r], levels, &count);
+
+			if (other != 0 && count > 0) {
+				apps_vote(other, count - 1);
+			}
+		}
+		pm8005_s1_show("the other rails raised");
+	}
 	for (uint32_t position = 1; position <= 9; position++) {
 		bool done = apps_vote(address, position);
 
@@ -539,10 +562,33 @@ gfx_vote_630(void)
 		if (done) {
 			continue;
 		}
+		if (test == 2) {
+			break;
+		}
 		/* (gfx.lvl's levels run to 416 and mx.lvl's to 384: perhaps the rail waits for the memories' one) */
 		printf("adreno: %u: position %u is not reached: again with mx.lvl at its top (position 4) first\n", step, position);
 		if (apps_vote(rpmh_resource("mx.lvl", NULL, NULL), 4) && apps_vote(address, position)) {
 			printf("adreno: %u: GFX.LVL POSITION %u NEEDS MX.LVL RAISED (mx.lvl is left at position 4)\n", step, position);
+			break;
+		}
+		/* (run 004713: not mx. Linux's PDC asks for 0x30080 -- xo.lvl here -- at the GPU's wake; then CX) */
+		/* (run 035332: not xo, not CX either; then DDR, the audio's rails, and the modem's, PM8005's other phase) */
+		for (unsigned r = 0; r < 6; r++) {
+			static const char *const others[6] = { "xo.lvl", "cx.lvl", "ebi.lvl", "lmx.lvl", "lcx.lvl", "mss.lvl" };
+			uint16_t levels[16];
+			unsigned count = 0;
+			uint32_t other = rpmh_resource(others[r], levels, &count);
+
+			show_rpmh_resource(others[r]);
+			if (other == 0 || count == 0) {
+				continue;
+			}
+			printf("adreno: %u: %s raised to its top (position %u, left there), then gfx.lvl position %u again\n", step,
+			    others[r], count - 1, position);
+			if (apps_vote(other, count - 1) && apps_vote(address, position)) {
+				printf("adreno: %u: GFX.LVL POSITION %u NEEDS %s RAISED\n", step, position, others[r]);
+				break;
+			}
 		}
 		break;
 	}
