@@ -288,6 +288,11 @@ nor clock. The GMU's register offsets are redwood's (Linux shares them). Not rea
 which is in the 3D core's registers (not GBIF in the CX half, as redwood's), while the core has no power. Next, step 7:
 the GMU's RPMh sequencer, which on the a630 lies inside the GMU's block, at `+0x23000` (`a6xx_gmu.c`), not apart.
 
+Step 7 works (run 000648): the GMU's RPMh channel at `0x508d000` answers -- `pdc_slave_id` 1, its first command
+slot idle, its sequencer not busy and not yet written (`seq_mem_0` 0: Linux's `a6xx_gmu_rpmh_init()` writes it for
+the a630 before the GMU starts). Next, steps 8 and 9: the GPU's SMMU, at `0x5040000` (64 KB in the tree, where
+redwood's is 128 KB).
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the
