@@ -118,6 +118,7 @@ static uint32_t step;                   /* the one being performed */
 static uint32_t new_from;               /* the first of the steps that have not been seen to work: they wait */
 static char last_write[96] = "nothing written";
 static bool leaving;                    /* on the way back to the loader after a panic: no lock is taken, nothing sleeps */
+static bool dsp_started;                /* the DSP has been let out of reset (step 7) and not shut down since */
 
 /*
  * Every line goes to the log the loader reads from another core as well (as in hakios.wifi.c);
@@ -1109,7 +1110,7 @@ static bool mss_assign(uint64_t address, uint64_t size, bool to_modem, const cha
 static void mss_halt_port(struct block *b);
 static bool mba_boot(void);
 static bool step_our_item_smp2p(void);
-static void mss_reclaim(void);
+static void mss_reclaim(bool mpss_too);
 
 /*
  * Linux's q6v5_reset_deassert() with has_alt_reset (the SDM845): the PDC's modem sync reset held, the
@@ -1193,17 +1194,21 @@ mss_unpower(void)
 	/* (Linux's q6v5_mba_reclaim(): the buses halted, the reset, the memory taken back, the clocks off) */
 	if (mss_mba_running) {
 		for (unsigned i = 0; i < 3; i++) {
+			tell("mpss: %u: about to halt the modem's bus: %s\n", step, mss_halts[i]->name);
 			mss_halt_port(mss_halts[i]);
 		}
 		mss_mba_running = false;
-		printf("mpss: %u: the modem's three buses are halted\n", step);
+		tell("mpss: %u: the modem's three buses are halted\n", step);
 	}
 	if (mss_reset_done) {
+		tell("mpss: %u: about to pulse the modem's reset\n", step);
 		mss_reset_pulse(false);
 		mss_reset_done = false;
-		printf("mpss: %u: the modem's reset pulsed again, as Linux stops it\n", step);
+		tell("mpss: %u: the modem's reset pulsed again, as Linux stops it\n", step);
 	}
-	mss_reclaim();
+	tell("mpss: %u: about to take back the MBA's region%s\n", step, dsp_started ? " (the modem's stays the modem's, as Linux leaves it)" :
+	    " and the modem's");
+	mss_reclaim(!dsp_started);
 	for (unsigned i = MSS_CLOCKS; i-- > 0;) {
 		if (mss_clock_ours[i]) {
 			const struct mss_clock *c = &mss_clocks[i];
@@ -1660,7 +1665,6 @@ step_mailbox(void)
 
 static LCK_MTX_DECLARE(dsp_lock, &mpss_lock_group);     /* the DSP being started or stopped */
 static bool rails_asked;                /* our request for its rails stands (until it asks for its own, or is shut down) */
-static bool dsp_started;
 static bool stopped_by_its_word;
 static uint32_t our_item;
 static bool smp2p_agreed, smp2p_restart_acks, smp2p_restart_acked;
@@ -1826,8 +1830,12 @@ dsp_shutdown(const char *why)
 		    answer);
 		return false;
 	}
-	printf("mpss: %u: THE MODEM IS SHUT DOWN\n", step);
-	if (ipa_loaded) {
+	tell("mpss: %u: THE MODEM IS SHUT DOWN\n", step);
+	if (ipa_loaded && apcs_ipc != 0) {
+		/* (the SDM845: Linux leaves the IPA powered, mapped and its firmware running when the modem stops; the 6T
+		 * resets on IPA traffic through an unmapped stream, and on a bus error from an unclocked block) */
+		printf("mpss: %u: the IPA's firmware, its streams and its clock are left as they are\n", step);
+	} else if (ipa_loaded) {
 		ipa_firmware_stop();
 		ipa_loaded = false;
 	}
@@ -4347,14 +4355,17 @@ mss_assign_owners(uint64_t address, uint64_t size, uint32_t from, uint32_t to, c
 	return true;
 }
 
-/* Both regions taken back from the modem, those that were handed to it. */
+/*
+ * The regions taken back from the modem, those that were handed to it: the MBA's always, the modem's own only when
+ * asked -- after a modem that has run, Linux's q6v5_stop() leaves it the modem's, and takes it back at the next load.
+ */
 static void
-mss_reclaim(void)
+mss_reclaim(bool mpss_too)
 {
 	if (mss_mba_assigned && mss_assign(mba_memory, mba_memory_size, false, "the MBA's region")) {
 		mss_mba_assigned = false;
 	}
-	if (mss_mpss_assigned && mss_assign_owners(mpss_memory, MPSS_MEMORY_SIZE, mss_mpss_owners, OWNER_HLOS, "the modem's region")) {
+	if (mpss_too && mss_mpss_assigned && mss_assign_owners(mpss_memory, MPSS_MEMORY_SIZE, mss_mpss_owners, OWNER_HLOS, "the modem's region")) {
 		mss_mpss_assigned = false;
 		mss_mpss_owners = OWNER_HLOS;
 	}
