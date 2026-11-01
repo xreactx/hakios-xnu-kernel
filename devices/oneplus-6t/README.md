@@ -388,6 +388,14 @@ nothing in particular, and never waiting on another process. The touches reach t
 the kernel posting them (every 8 ms). So in that first gap nobody in the port is holding anything up: it is UIKit
 waiting for the gesture to be recognised (and with rwtouch's synthetic swipes); a real finger may differ.
 
+The panel-locked vsync (`fb_scan=1`, in `run.args` since 1 November, run 031204): the firmware leaves the display
+controller sending the framebuffer to the panel at 119.93 Hz, and our 60 Hz timer drifted against it (frames 22 ms
+then 11 ms apart while a page moved). Now the vsync is the start of every second scan, by the DSI interface's frame
+and line counters: in the moving part of the home screen's swipes the steps outside 15-19 ms went from 21 % to 16 %,
+and the swipes look right. The whole-gesture figure (25 % over 16.7 ms) is mostly the home screen's 30 Hz animation
+after a page settles and the gesture's first 40-70 ms, neither of which this touches. Still untried: more cores for
+the scaling copy (`fb_threads=N`, 3 now: 6-11 ms a frame) and page flipping instead of the copy.
+
 On the 6T `gpu=1` runs steps 10 to 12 too: without them, the first bring-up after Android reset the whole phone (a
 Qualcomm crash dump, 3 times of 3), with them never (3 of 3). Step 12 -- TrustZone handed the zap shader's header
 while it still has Android's -- is the likely reason; not proven.
