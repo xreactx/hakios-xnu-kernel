@@ -413,6 +413,17 @@ On the 6T `gpu=1` runs steps 10 to 12 too: without them, the first bring-up afte
 Qualcomm crash dump, 3 times of 3), with them never (3 of 3). Step 12 -- TrustZone handed the zap shader's header
 while it still has Android's -- is the likely reason; not proven.
 
+**9b. Page flipping** (1 November 2026; `soc_display=845 fb_flip=1 fb_map_mb=30`, in `run.args`). `fb_probe=1` showed
+what the firmware leaves: the panel in command mode (control path 0's top register, bit 17), fed by source pipe
+VIG0 (`0xae05000`) from the splash memory (`0x9d400000`, 2340 x 1080, rows of 4320 bytes). Frames are drawn into
+one of three buffers 10 MB apart in that 36 MB region, then VIG0's address (`+0x14`) is written and its bit in
+control path 0's flush register (`0xae02018`); the controller takes it up at its next frame. Two buffers made
+each frame wait for the last flip (app zooms fell to 30 frames a second); three never wait. `fb_map_mb` has the
+console map the region at boot (a 10 MB mapping made later runs the kernel out of address space). The loader
+points VIG0 back at the first buffer when the kernel returns. (`fb_scan=1` never ran: backboardd asks for no
+vsync. And its old addresses were redwood's: the SDM845's display bus clocks are GCC `0xb00c` and DISPCC
+`0x4004`, INTF1 `0xae6b800`.)
+
 **10. Audio** (started 30 October 2026).
 
 The loudspeaker needs neither the WCD934x codec nor SLIMbus: it is an NXP **TFA9894** smart amplifier on I2C (the
