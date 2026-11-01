@@ -5904,7 +5904,16 @@ ipa_init_driver(void)
 	at += qmi_put_u32(packet + at, 0x14, o + 0x0308);                       /* IPv4 filters */
 	at += qmi_put_u32(packet + at, 0x15, o + 0x0408);                       /* IPv6 filters */
 	at += qmi_put_pair(packet + at, 0x16, o + (v35 ? 0x0bd8 : 0x27d8), v35 ? 0x1024 : 0x800); /* the modem's own region (Android: modem_ofst 0x27d8, 0x800) */
-	at += qmi_put_u32(packet + at, 0x17, 16);                               /* our endpoint for its control messages (AP_MODEM_RX) */
+	{
+		/* our endpoint for its control messages: AP_MODEM_RX, the data path's from the modem (Linux's ctrl_comm_dest_end_pt) --
+		 * 16 on IPA 4.11, 10 on the SDM845's 3.5.1, where a fixed 16 named an endpoint that is not ours */
+		uint32_t to_modem = 2, from_modem = v35 ? 10 : 16;
+
+		if (hakios_ipa_data_ready()) {
+			hakios_ipa_modem_endpoints(&to_modem, &from_modem);
+		}
+		at += qmi_put_u32(packet + at, 0x17, from_modem);
+	}
 	{
 		/*
 		 * TLV 0x18 is "is_ssr_bootup" to Android's driver (skip_uc_load to Linux's): whether the modem is
