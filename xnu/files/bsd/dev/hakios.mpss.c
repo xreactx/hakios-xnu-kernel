@@ -6404,8 +6404,20 @@ wda_send_format(void)
 		return;
 	}
 	wda_sent = true;
+	if (hakios_ipa_qmap_v4()) {
+		/*
+		 * The SDM845's IPA path: QMAPv4 (8) both ways, at most 10 packets or 8 KB per downlink aggregate -- Android's
+		 * netmgr_config.xml for "SDM845" -- the checksum header and trailer made and skipped by hakios.ipa.c
+		 */
+		request[17] = 8;                /* 0x12: uplink aggregation protocol */
+		request[24] = 8;                /* 0x13: downlink */
+		request[31] = 10;               /* 0x15: downlink packets per aggregate */
+		request[38] = 0x00;             /* 0x16: downlink bytes per aggregate, 8192 */
+		request[39] = 0x20;
+	}
 	request[5] = sizeof(request) - 7;
-	tell("mpss: wda: about to set the data format of the embedded port: raw IP in QMAP, no checksum offload\n");
+	tell("mpss: wda: about to set the data format of the embedded port: raw IP in %s\n", hakios_ipa_qmap_v4() ?
+	    "QMAPv4 (QMAP with checksum offload), 10 packets or 8 KB per downlink aggregate" : "QMAP, no checksum offload");
 	qrtr_send(wda_port, wda_node, wda_port_number, request, sizeof(request));
 }
 
