@@ -255,12 +255,23 @@ audio_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 /* the speakers' volume, as iOS sets it (sys/hakios.audio.h): kept for the sink's driver to look at */
 static uint32_t volume_below, volume_generation;
 static bool volume_muted;
+static volatile uint32_t route = HAKIOS_AUDIO_ROUTE_SPEAKER;     /* where it is to be heard (HAKIOS_AUDIO_SET_ROUTE) */
 
 static int
 audio_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flags, __unused struct proc *p)
 {
 	const struct hakios_audio_volume *volume = (const struct hakios_audio_volume *)data;
 
+	if (command == HAKIOS_AUDIO_SET_ROUTE) {
+		uint32_t wanted = *(const uint32_t *)data;
+
+		if (wanted != HAKIOS_AUDIO_ROUTE_SPEAKER && wanted != HAKIOS_AUDIO_ROUTE_RECEIVER) {
+			return EINVAL;
+		}
+		route = wanted;
+		printf("hakios-audio: the route: %s\n", wanted == HAKIOS_AUDIO_ROUTE_RECEIVER ? "the earpiece" : "the speaker");
+		return 0;
+	}
 	if (command != HAKIOS_AUDIO_SET_VOLUME) {
 		return ENOTTY;
 	}
@@ -272,6 +283,12 @@ audio_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flags
 	printf("hakios-audio: the volume: %s%u.%03u dB under the loudest\n", volume->muted ? "muted; " : "", volume->below / 8,
 	    volume->below % 8 * 125);
 	return 0;
+}
+
+uint32_t
+hakios_audio_route(void)
+{
+	return route;
 }
 
 bool

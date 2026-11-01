@@ -424,6 +424,15 @@ static bool mi2s;
 #define SLIMBUS_0_RX                    0x4000
 static bool earpiece;
 
+/*
+ * The earpiece for iOS (boot-arg sound_receiver=1, with sound=4 on the 6T's MI2S port): the stream goes to both
+ * ports at once -- a second device path to SLIMBUS_0_RX, the matrix routing the session to both -- and where iOS
+ * plays (HAKIOS_AUDIO_SET_ROUTE: the plug-in's "Speaker" or "Codec", iOS's speaker or receiver port) decides
+ * only which is switched on: the TFA9894, or the codec's EAR path and the bus's channel to it (hakios.slim.c).
+ */
+static bool receiver, receiver_port_on, receiver_copp_open, amp_receiver;
+static uint32_t receiver_copp;
+
 struct afe_slimbus {
 	uint32_t version;
 	uint16_t device, bits, data_format, channels;
@@ -492,15 +501,15 @@ afe_service_param(const char *what, uint32_t module, uint32_t param, const void 
 	return command(what, APR_SVC_AFE, 0, AFE_SVC_CMD_SET_PARAM, packet, 16 + (uint32_t)sizeof(*p) + size, 0, NULL);
 }
 
-/* A parameter of the port. */
+/* A parameter of a port. */
 static bool
-afe_port_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
+afe_port_param_of(uint16_t of, const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
 {
 	uint8_t packet[16 + sizeof(struct afe_param) + 64];
 	struct afe_param *p = (struct afe_param *)(packet + 16);
 
 	bzero(packet, sizeof(packet));
-	*(uint16_t *)packet = (uint16_t)port;
+	*(uint16_t *)packet = of;
 	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
 	p->module = module;
 	p->param = param;
@@ -509,7 +518,30 @@ afe_port_param(const char *what, uint32_t module, uint32_t param, const void *da
 	return command(what, APR_SVC_AFE, 0, AFE_PORT_CMD_SET_PARAM_V2, packet, 16 + (uint32_t)sizeof(*p) + size, 0, NULL);
 }
 
+static bool
+afe_port_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
+{
+	return afe_port_param_of((uint16_t)port, what, module, param, data, size);
+}
+
 static bool clock_on, group_on, port_on;
+
+/* SLIMBUS_0_RX beside the speaker's port (sound_receiver=1); without it, the speaker alone. */
+static void
+afe_receiver_on(void)
+{
+	struct afe_slimbus slimbus = { .version = 1, .device = 0, .bits = 16, .data_format = 0, .channels = 1,
+		                       .channel_map = { 144 }, .rate = RATE };
+	uint16_t start[2] = { SLIMBUS_0_RX, 0 };
+
+	receiver_port_on = afe_port_param_of(SLIMBUS_0_RX, "the earpiece's port 0x4000: 1 channel of 16 bits at 48 kHz, channel 144",
+	    AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &slimbus, sizeof(slimbus)) &&
+	    command("the earpiece's port 0x4000, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+	if (!receiver_port_on) {
+		say("sound: the earpiece's port did not start: the speaker alone\n");
+		receiver = false;
+	}
+}
 
 static bool
 afe_clock(bool on)
@@ -566,6 +598,9 @@ afe_on(void)
 			return false;
 		}
 		port_on = command("the port, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+		if (port_on && receiver) {
+			afe_receiver_on();
+		}
 		return port_on;
 	}
 	announce("the DSP is asked for the TDM interface's bit clock, the group, the port and its start (AFE)");
@@ -593,9 +628,14 @@ afe_on(void)
 static void
 afe_off(void)
 {
-	uint16_t stop[2] = { (uint16_t)port, 0 };
+	uint16_t stop[2] = { (uint16_t)port, 0 }, receiver_stop[2] = { SLIMBUS_0_RX, 0 };
 	struct afe_group_enable disable = { GROUP, 0 };
 
+	if (receiver_port_on) {
+		command("the earpiece's port, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, receiver_stop, sizeof(receiver_stop), 0,
+		    NULL);
+		receiver_port_on = false;
+	}
 	if (port_on) {
 		command("the port, stopped", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
 		port_on = false;
@@ -1038,6 +1078,24 @@ stream_on(void)
 	copp = answer.words[1] & 0xffff;        /* (the upper half is reserved) */
 	route.copp[0] = (uint16_t)copp;
 	say("sound: the device path is open: COPP %u\n", copp);
+	if (receiver && receiver_port_on) {
+		open.endpoint1 = SLIMBUS_0_RX;
+		open.channels = 1;
+		open.bits = 16;
+		open.map[0] = PCM_CHANNEL_FC;
+		open.map[1] = 0;
+		if (command("a second device path, to the earpiece's port: 1 channel of 16 bits", APR_SVC_ADM, SLIMBUS_0_RX,
+		    ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &answer) && answer.words[0] == 0) {
+			receiver_copp_open = true;
+			receiver_copp = answer.words[1] & 0xffff;
+			route.copps = 2;
+			route.copp[1] = (uint16_t)receiver_copp;
+			say("sound: the earpiece's device path is open: COPP %u; the session goes to both\n", receiver_copp);
+		} else {
+			say("sound: the earpiece's device path: REFUSED: the speaker alone\n");
+			receiver = false;
+		}
+	}
 	if (!command("the stream, opened for writing: 16-bit linear PCM, no processing", APR_SVC_ASM, STREAM_PORT,
 	    ASM_STREAM_CMD_OPEN_WRITE_V3, &write, sizeof(write), 0, NULL)) {
 		return false;
@@ -1062,6 +1120,11 @@ stream_off(void)
 	if (copp_open) {
 		command("the device path, closed", APR_SVC_ADM, (uint16_t)copp, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 0, NULL);
 		copp_open = false;
+	}
+	if (receiver_copp_open) {
+		command("the earpiece's device path, closed", APR_SVC_ADM, (uint16_t)receiver_copp, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, 0,
+		    NULL);
+		receiver_copp_open = false;
 	}
 	if (mapped) {
 		command("our periods, unmapped", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &handle, sizeof(handle), 0, NULL);
@@ -1301,12 +1364,29 @@ gain_of(uint32_t below_eighths)
 static bool
 amp_start(void)
 {
+	/* (where iOS plays decides, as it is when they start) */
+	amp_receiver = receiver && hakios_audio_route() == HAKIOS_AUDIO_ROUTE_RECEIVER;
+	if (amp_receiver) {
+		say("sound: to the earpiece\n");
+		if (hakios_slim_codec_ready(0) && hakios_slim_earpiece(true)) {
+			return true;
+		}
+		/* (the codec is not brought up, or did not take it: the speaker, for the rest of the run) */
+		say("sound: THE EARPIECE DID NOT START: what iOS plays there goes to the speaker from here on\n");
+		hakios_slim_earpiece(false);
+		amp_receiver = receiver = false;
+	}
 	return mi2s ? hakios_tfa9894_start() : hakios_speaker_start();
 }
 
 static bool
 amp_volume(uint32_t below_eighths, uint32_t step_ms)
 {
+	if (amp_receiver) {
+		/* the earpiece: iOS's own volume, without the speaker's margin under Android's level (sound_below) */
+		digital_gain = gain_of(below_eighths > below ? below_eighths - below : 0);
+		return true;
+	}
 	if (mi2s) {
 		digital_gain = gain_of(below_eighths);
 		return true;
@@ -1317,6 +1397,11 @@ amp_volume(uint32_t below_eighths, uint32_t step_ms)
 static void
 amp_stop(void)
 {
+	if (amp_receiver) {
+		hakios_slim_earpiece(false);
+		amp_receiver = false;
+		return;
+	}
 	if (mi2s) {
 		hakios_tfa9894_stop();
 	} else {
@@ -1328,13 +1413,13 @@ amp_stop(void)
 static bool
 amp_healthy(void)
 {
-	return mi2s ? true : hakios_speaker_healthy();
+	return mi2s || amp_receiver ? true : hakios_speaker_healthy();
 }
 
 static uint32_t
 amp_monitor(bool tell)
 {
-	return mi2s ? 0 : hakios_speaker_monitor(tell);
+	return mi2s || amp_receiver ? 0 : hakios_speaker_monitor(tell);
 }
 
 /* A period from the ring, the rest of it silence. */
@@ -1481,6 +1566,14 @@ watch(void)
 			} else if (!given_up) {
 				guard_level(below + extra);
 			}
+		}
+		if (on && receiver && (hakios_audio_route() == HAKIOS_AUDIO_ROUTE_RECEIVER) != amp_receiver) {
+			/* iOS plays elsewhere: what is on is stopped, and started again where it plays */
+			say_when(amp_receiver ? "iOS plays through the speaker now: the earpiece is stopped" :
+			    "iOS plays through the earpiece now: the speaker's amplifier is stopped");
+			guard_off(true);
+			amp_stop();
+			on = false;
 		}
 		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
 			say_when("iOS plays: the amplifiers are started");
@@ -1757,6 +1850,14 @@ hakios_sound_dsp_up(void)
 		}
 	}
 	mi2s = port >= 0x1000 && port <= 0x10ff;
+	{
+		uint32_t wanted = 0;
+
+		receiver = mi2s && level == 4 && PE_parse_boot_argn("sound_receiver", &wanted, sizeof(wanted)) && wanted != 0;
+		if (receiver) {
+			say("sound: sound_receiver=1: the stream goes to the earpiece's port as well; where iOS plays decides which is on\n");
+		}
+	}
 	if (mi2s) {
 		pins = quat_mi2s_pins;          /* (the only MI2S port there is so far: the OnePlus 6T's speaker) */
 		say("sound: another phone's port: MI2S %#x, clock %#x, %u bits; SMMU stream %#x\n", port, clock_id, port_bits,
