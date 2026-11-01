@@ -15,6 +15,8 @@
 #                       works during a run too (from another terminal)
 #   xl recording [F]    fetch the screen recording the last run made (rec_secs=N among XL_CMDLINE) and
 #                       make a video of it (default logs/recording.mp4)
+#   xl hangdump         after a loader that stopped answering (and a forced restart into Android): its log,
+#                       which it left in logdump, into logs/hang-TIME.log -- before any run writes over it
 #   xl sound [F]        fetch the sound the last run recorded (rec_sound=N among XL_CMDLINE: the first N
 #                       seconds of what iOS played) and make a WAV file of it (default logs/sound.wav)
 #   xl camera [P]       fetch the frames the last run's camera left (cam=3 and up among XL_CMDLINE) and make
@@ -174,7 +176,11 @@ run() { # run <oem command> <label>
 			return 1
 		fi
 		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
-		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || { echo "xl: upload failed"; return 1; }
+		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || {
+			echo "xl: upload failed"
+			FB_TIMEOUT=10 fb getvar version >/dev/null 2>&1 ||
+			    echo "xl: THE LOADER DOES NOT ANSWER: restart the phone (power + volume up), let Android come up, then ./xl hangdump first"
+			return 1; }
 	fi
 	# (asked twice: a loader just given a large image may not answer the first time, and then the run went without
 	# its live log, so that a phone that reset said nothing of when -- 31 October)
@@ -257,6 +263,15 @@ recording() { # recording [file.mp4]
 	FB_TIMEOUT=120 fb get_staged logs/recording.raw >/dev/null
 	# (XL_REC_KEEP=1: the recording itself stays in logs/recording.raw, for tools/recording.py --frames)
 	tools/recording.py logs/recording.raw "$out" && { [ -n "$XL_REC_KEEP" ] || rm -f logs/recording.raw; }
+}
+
+hangdump() { # hangdump: what a loader that stopped answering left in logdump, before any run writes over it
+	# (it saves its log there after 2 s without a word from the USB driver; the next run's loader writes its own)
+	local out=logs/hang-$(date +%H%M%S).log
+	flash_read logdump 0 200000 "$out.dump" >/dev/null || return 1
+	tr -d '\0' < "$out.dump" > "$out" && rm -f "$out.dump"
+	echo "xl: the stuck loader's log: $out ($(stat -c %s "$out") bytes); its USB lines:"
+	grep -a "usb: \|ramdisk:" "$out" | tail -15
 }
 
 sound() { # sound [file.wav]
@@ -431,6 +446,7 @@ sound) sound "$2" ;;
 ramdisk) ramdisk "$2" ;;
 ramdisk-flash) ramdisk_flash "$2" "$3" ;;
 flash-read) flash_read "$2" "$3" "$4" "$5" ;;
+hangdump) hangdump ;;
 run) run "oem run $2" "run${2:+-cp$2}" ;;
 selftest) run "oem selftest" selftest ;;
 log) enter && fb oem log >/dev/null && fetch_log logs/loader.log && cat logs/loader.log ;;
