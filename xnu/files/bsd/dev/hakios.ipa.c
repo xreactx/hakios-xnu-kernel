@@ -937,6 +937,14 @@ hakios_ipa_data_setup(void)
 		}
 		PE_parse_boot_argn("modem_ipa_data_trace", &off, sizeof(off));
 		trace = off != 0;
+		off = 0;
+		if (PE_parse_boot_argn("modem_ipa_no_aggr", &off, sizeof(off)) && off != 0) {
+			/* (a test: each packet from the modem in a buffer of its own -- on the 6T aggregated frames came back empty,
+			 * closed on a one-second tick) */
+			modem_rx.aggregate = false;
+			modem_rx.close_eof = false;
+			printf("ipa: modem_ipa_no_aggr: the modem's packets are not aggregated\n");
+		}
 	}
 	if (PAGE_SIZE != RECEIVE_BUFFER) {
 		printf("ipa: pages of %lu bytes, not %u: no data path\n", (unsigned long)PAGE_SIZE, RECEIVE_BUFFER);
