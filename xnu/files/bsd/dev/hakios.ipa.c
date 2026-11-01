@@ -519,7 +519,16 @@ endpoint_program(const struct channel *ch)
 		/* (IPA 3.5.1: the modem's transmit endpoint replicates through the DMA parser, SEQ_REP_TYPE 8 at bits 15:8) */
 		ipa_wr(ENDP_INIT_SEQ(ep), ch->command ? 0 /* DMA */ : 4 /* 2_PASS_SKIP_LAST_UC */ | (v35 ? 8u << 8 : 0));
 	}
-	ipa_wr(ENDP_STATUS(ep), 0);                     /* no status packets */
+	if (ch == &modem_tx) {
+		/*
+		 * Linux's AP_MODEM_TX (both IPA versions): status on, to the modem's own receive endpoint MODEM_AP_RX
+		 * -- 12 on IPA 3.5.1, 14 on 4.11 -- the status before the packet (STATUS_LOCATION 0). Without it the 6T's
+		 * echoes went out and nothing came back but empty 4-byte frames.
+		 */
+		ipa_wr(ENDP_STATUS(ep), 1 /* STATUS_EN */ | (v35 ? 12u : 14u) << 1 /* STATUS_ENDP */);
+	} else {
+		ipa_wr(ENDP_STATUS(ep), 0);             /* no status packets */
+	}
 }
 
 /* The TRE at `index` of the channel's ring, filled and written out; the doorbell is rung separately. */
