@@ -1090,11 +1090,12 @@ rails(uint32_t level)
 }
 
 /*
- * One RPMh resource set by its command-database name (say "lnbclka2", the codec's clock: hakios.slim.c), through
- * the same TCS and under the same lock as the rails above; true once RPMh has said done.
+ * One RPMh resource set by its command-database name (say "lnbclka2", the codec's clock: hakios.slim.c), at that
+ * offset into it (a VRM clock's enable is at 4: Linux's CLK_RPMH_VRM_EN_OFFSET), through the same TCS and under
+ * the same lock as the rails above; true once RPMh has said done.
  */
 bool
-hakios_adsp_rpmh_set(const char *name, uint32_t value)
+hakios_adsp_rpmh_set(const char *name, uint32_t offset, uint32_t value)
 {
 	char id[8] = { 0 };
 	uint32_t address = 0, done = 0, irq_enable;
@@ -1107,7 +1108,7 @@ hakios_adsp_rpmh_set(const char *name, uint32_t value)
 		printf("adsp: rpmh: the command database is not there: %s not set\n", name);
 		return false;
 	}
-	strlcpy(id, name, sizeof(id));
+	strncpy(id, name, sizeof(id));          /* (eight bytes, no terminator: "lnbclka2" fills them) */
 	for (unsigned s = 0; s < 8 && address == 0; s++) {
 		const struct cmd_db_slave *slave = &cmd_db->slave[s];
 		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
@@ -1134,7 +1135,7 @@ hakios_adsp_rpmh_set(const char *name, uint32_t value)
 	wr(rsc.base + RSC_IRQ_ENABLE, irq_enable | 1u << RPMH_TCS);
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0), MSGID_WRITE_WAITED);
-	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0) + 4, address);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0) + 4, address + offset);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0) + 8, value);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_WAIT_FOR_DONE, 1);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 1);
@@ -1150,7 +1151,8 @@ hakios_adsp_rpmh_set(const char *name, uint32_t value)
 		}
 		sleep_us(50);
 	}
-	printf("adsp: rpmh: %s (%#x) = %u: %s after %llu us\n", name, address, value, done ? "DONE" : "NOT SAID DONE", now_us() - began);
+	printf("adsp: rpmh: %s (%#x + %u) = %u: %s after %llu us\n", name, address, offset, value, done ? "DONE" : "NOT SAID DONE",
+	    now_us() - began);
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
