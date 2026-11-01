@@ -28,3 +28,5 @@ gpu=1           # iOS draws with the Adreno 630 (bsd/dev/hakios.adreno.c, Mesa f
 soc_gpu=630     # ... the SDM845's GPU numbers (soc_cmd_db above gives its rails); the UEFI must be without CPRDxe (README step 9)
 adreno_speed=7  # ... at its top level, 710 MHz (1 = 257): the app zooms GPU-bound at 257, 40 % of frames slow -> 28 % (runs 140417, 141106; 49 C)
 fb_scan=1           # the vsync is every second scan of the panel's own (119.93 Hz), not a timer of ours: steadier swipes
+ufs=2 ufs_write=1   # this kernel reads the flash itself; the one place it may write is the store at the end of system_a
+var_store=1         # iOS's data volume (/private/var) kept between boots, in that store (README step 5)
