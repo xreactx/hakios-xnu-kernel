@@ -292,6 +292,7 @@ cell_transmit(mbuf_t packet, size_t length)
 #define PING_COUNT              10
 #define PING_ID                 0x4861                  /* "Ha" */
 static uint32_t ping_wanted, ping_to = 0x08080808, ping_sent, ping_answered;
+static uint32_t ping_data = 32;                 /* the echo's data bytes (cell_ping_size=N, up to 1400) */
 static uint64_t ping_next, ping_at[PING_COUNT];
 
 static uint64_t
@@ -324,9 +325,9 @@ ip_checksum(const uint8_t *p, size_t length)
 static void
 ping_advance(void)
 {
-	uint8_t packet[20 + 8 + 32];
+	static uint8_t packet[20 + 8 + 1400];
 	uint64_t now;
-	uint32_t from;
+	uint32_t from, total = 20 + 8 + ping_data;
 
 	if (ping_wanted == 0) {
 		return;
@@ -348,9 +349,9 @@ ping_advance(void)
 		return;
 	}
 	ping_next = now + 2000000;
-	bzero(packet, sizeof(packet));
+	bzero(packet, total);
 	packet[0] = 0x45;                               /* IPv4, 20 bytes of header */
-	put16(packet + 2, sizeof(packet));
+	put16(packet + 2, total);
 	put16(packet + 4, (uint32_t)ping_sent + 1);     /* identification */
 	packet[8] = 64;                                 /* TTL */
 	packet[9] = 1;                                  /* ICMP */
@@ -360,14 +361,14 @@ ping_advance(void)
 	packet[20] = 8;                                 /* echo request */
 	put16(packet + 24, PING_ID);
 	put16(packet + 26, ping_sent);
-	for (unsigned i = 0; i < 32; i++) {
+	for (unsigned i = 0; i < ping_data; i++) {
 		packet[28 + i] = (uint8_t)('a' + i % 26);
 	}
-	put16(packet + 22, ip_checksum(packet + 20, 8 + 32));
+	put16(packet + 22, ip_checksum(packet + 20, 8 + ping_data));
 	ping_at[ping_sent] = now;
 	printf("cell: ping %u: %u.%u.%u.%u -> %u.%u.%u.%u, %zu bytes onto the IPA: %s\n", ping_sent, from >> 24, (from >> 16) & 0xff,
-	    (from >> 8) & 0xff, from & 0xff, ping_to >> 24, (ping_to >> 16) & 0xff, (ping_to >> 8) & 0xff, ping_to & 0xff, sizeof(packet),
-	    hakios_ipa_transmit(CELL_MUX, packet, sizeof(packet)) ? "sent" : "NOT TAKEN");
+	    (from >> 8) & 0xff, from & 0xff, ping_to >> 24, (ping_to >> 16) & 0xff, (ping_to >> 8) & 0xff, ping_to & 0xff, (size_t)total,
+	    hakios_ipa_transmit(CELL_MUX, packet, total) ? "sent" : "NOT TAKEN");
 	ping_sent++;
 }
 
@@ -477,6 +478,10 @@ hakios_cell_attach(void)
 	cell_trace = t != 0;
 	PE_parse_boot_argn("cell_ping", &ping_wanted, sizeof(ping_wanted));
 	PE_parse_boot_argn("cell_ping_to", &ping_to, sizeof(ping_to));
+	PE_parse_boot_argn("cell_ping_size", &ping_data, sizeof(ping_data));
+	if (ping_data > 1400) {
+		ping_data = 1400;
+	}
 	cell_attached = hakios_net_attach(&cell_link);
 	printf("cell: en%u %s on the IPA's data path%s\n", CELL_UNIT, cell_attached ? "IS ATTACHED" : "IS NOT ATTACHED",
 	    ping_wanted != 0 ? "; pings once the session is up (cell_ping)" : "");
