@@ -292,6 +292,7 @@ cell_transmit(mbuf_t packet, size_t length)
 #define PING_COUNT              10
 #define PING_ID                 0x4861                  /* "Ha" */
 static uint32_t ping_wanted, ping_to = 0x08080808, ping_sent, ping_answered;
+static uint32_t ping_dns;                       /* cell_dns=1: DNS queries to the session's DNS server instead of echoes */
 static uint32_t ping_data = 32;                 /* the echo's data bytes (cell_ping_size=N or cell_ping=N, up to 1400) */
 static uint64_t ping_next, ping_at[PING_COUNT];
 
@@ -350,6 +351,43 @@ ping_advance(void)
 		return;
 	}
 	ping_next = now + 2000000;
+	if (ping_dns) {
+		/* a DNS query (UDP from port 40000 + n to 53) for google.com's address, id PING_ID + n */
+		static const uint8_t name[] = { 6, 'g', 'o', 'o', 'g', 'l', 'e', 3, 'c', 'o', 'm', 0 };
+		uint32_t to, query = 12 + sizeof(name) + 4;
+
+		lck_mtx_lock(&cell_lock);
+		to = session.dns1;
+		lck_mtx_unlock(&cell_lock);
+		total = 20 + 8 + query;
+		bzero(packet, total);
+		packet[0] = 0x45;
+		put16(packet + 2, total);
+		put16(packet + 4, (uint32_t)ping_sent + 1);
+		packet[8] = 64;
+		packet[9] = 17;                         /* UDP */
+		put32(packet + 12, from);
+		put32(packet + 16, to);
+		put16(packet + 10, ip_checksum(packet, 20));
+		put16(packet + 20, 40000 + ping_sent);
+		put16(packet + 22, 53);
+		put16(packet + 24, 8 + query);          /* (the UDP checksum left 0: none) */
+		put16(packet + 28, PING_ID + ping_sent);
+		packet[30] = 0x01;                      /* recursion desired */
+		put16(packet + 32, 1);                  /* one question */
+		memcpy(packet + 40, name, sizeof(name));
+		put16(packet + 40 + sizeof(name), 1);   /* type A */
+		put16(packet + 42 + sizeof(name), 1);   /* class IN */
+		ping_at[ping_sent] = now;
+		printf("cell: DNS query %u: %u.%u.%u.%u -> %u.%u.%u.%u:53 (google.com), %u bytes onto the IPA: %s\n", ping_sent, from >> 24,
+		    (from >> 16) & 0xff, (from >> 8) & 0xff, from & 0xff, to >> 24, (to >> 16) & 0xff, (to >> 8) & 0xff, to & 0xff, total,
+		    hakios_ipa_transmit(CELL_MUX, packet, total) ? "sent" : "NOT TAKEN");
+		ping_sent++;
+		if (ping_sent == PING_COUNT / 2) {
+			hakios_wds_stats();
+		}
+		return;
+	}
 	bzero(packet, total);
 	packet[0] = 0x45;                               /* IPv4, 20 bytes of header */
 	put16(packet + 2, total);
@@ -389,6 +427,14 @@ cell_receive(uint8_t mux, const uint8_t *packet, size_t length)
 	}
 	if (cell_trace) {
 		printf("cell: %zu bytes from the modem on mux %u (IPv%u)\n", length, mux, version);
+	}
+	if (ping_wanted != 0 && version == 4 && length >= 30 && packet[9] == 17 && (packet[20] << 8 | packet[21]) == 53) {
+		uint32_t n = (uint32_t)(packet[28] << 8 | packet[29]) - PING_ID, from = get32(packet + 12);
+
+		ping_answered++;
+		printf("cell: DNS QUERY %u ANSWERED by %u.%u.%u.%u after %llu ms (%zu bytes, %u answers): THE DATA PATH CARRIES PACKETS BOTH WAYS\n",
+		    n, from >> 24, (from >> 16) & 0xff, (from >> 8) & 0xff, from & 0xff, n < PING_COUNT ? (cell_now_us() - ping_at[n]) / 1000 : 0,
+		    length, length >= 36 ? (uint32_t)(packet[34] << 8 | packet[35]) : 0);
 	}
 	if (ping_wanted != 0 && version == 4 && length >= 28 && packet[9] == 1 && packet[20] == 0 && (packet[24] << 8 | packet[25]) == PING_ID) {
 		uint32_t n = (uint32_t)(packet[26] << 8 | packet[27]), from = get32(packet + 12);
@@ -481,6 +527,9 @@ hakios_cell_attach(void)
 	PE_parse_boot_argn("modem_ipa_data_trace", &t, sizeof(t));
 	cell_trace = t != 0;
 	PE_parse_boot_argn("cell_ping", &ping_wanted, sizeof(ping_wanted));
+	if (PE_parse_boot_argn("cell_dns", &ping_dns, sizeof(ping_dns)) && ping_dns != 0) {
+		ping_wanted = 1;                /* (cell_dns=1: the same test with DNS queries) */
+	}
 	PE_parse_boot_argn("cell_ping_to", &ping_to, sizeof(ping_to));
 	PE_parse_boot_argn("cell_ping_size", &ping_data, sizeof(ping_data));
 	if (ping_wanted > 1) {
