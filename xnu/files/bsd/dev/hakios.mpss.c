@@ -5561,7 +5561,12 @@ jsn_string(const char *from, const char *end, const char *key, char *out, size_t
 static void
 servreg_load(void)
 {
-	static const char *const files[] = { "modemr.jsn", "adspr.jsn", "adsps.jsn", "adspua.jsn", "battmgr.jsn", "cdspr.jsn", "wpssr.jsn" };
+	/*
+	 * (redwood's, and the SDM845's: modemuw.jsn is the modem's Wi-Fi domain, msm/modem/wlan_pd -- kernel/elf_loader,
+	 * tms/servreg, wlan/fw -- which the modem starts only once told where kernel/elf_loader is; slpi* the sensors')
+	 */
+	static const char *const files[] = { "modemr.jsn", "adspr.jsn", "adsps.jsn", "adspua.jsn", "battmgr.jsn", "cdspr.jsn", "wpssr.jsn",
+		                             "modemuw.jsn", "slpir.jsn", "slpius.jsn" };
 
 	servreg_maps = 0;
 	for (unsigned f = 0; f < sizeof(files) / sizeof(files[0]); f++) {
