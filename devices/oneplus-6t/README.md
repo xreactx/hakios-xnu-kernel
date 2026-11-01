@@ -600,7 +600,8 @@ Then, with `slim=3` (and `adsp_listen=5`: the DSP's hello once took more than a 
   48 kHz, no underflow); heard (run 170252, 1 November).
 - `mic=3 mic_wcd=1`: the handset microphone (Android's `handset-mic` = AMIC4) -- MIC BIAS1 at 2.7 V, ADC4, decimator
   0, the codec's TX0 on bus channel 128, AFE `SLIMBUS_0_TX` (0x4001), the DSP's stream as redwood's. Levels each
-  second in the log (a quiet room: about -70 dBFS). `mic=4 mic_wcd=1` gives it to iOS (`/dev/hakios-mic`).
+  second in the log (a quiet room: about -70 dBFS). `mic=4 mic_wcd=1` gives it to iOS (`/dev/hakios-mic`): Voice Memos
+  records and plays back (1 November).
 
 Every run needs `xl ramdisk-flash system_a` first: the loader keeps the system image only for one run.
 

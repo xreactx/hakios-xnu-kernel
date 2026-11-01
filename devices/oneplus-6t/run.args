@@ -24,6 +24,9 @@ soc_adsp_mem=0x8c500000
 soc_adsp_mem_size=0x1a00000
 soc_apcs_ipc=0x1799000c
 soc_adsp_cx=1
+adsp_listen=5   # the DSP's hello waited for 5 s, not 1 (it once took longer: run 162746)
+slim=3          # the audio SLIMbus and the WCD934x codec brought up (bsd/dev/hakios.slim.c; README step 10b)
+mic=4 mic_wcd=1 # the handset microphone (AMIC4) for iOS, through SLIMBUS_0_TX (hakios.mic.c): Voice Memos records
 gpu=1           # iOS draws with the Adreno 630 (bsd/dev/hakios.adreno.c, Mesa freedreno; root built GL=1 ADSP=1 REST=1)
 soc_gpu=630     # ... the SDM845's GPU numbers (soc_cmd_db above gives its rails); the UEFI must be without CPRDxe (README step 9)
 adreno_speed=7  # ... at its top level, 710 MHz (1 = 257): the app zooms GPU-bound at 257, 40 % of frames slow -> 28 % (runs 140417, 141106; 49 C)
