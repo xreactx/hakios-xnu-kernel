@@ -224,8 +224,16 @@ run() { # run <oem command> <label>
 		if ! grep -q "== END OF LOG ==" "$log" 2>/dev/null; then
 			bytes=$(sed -n 's/^log: \([0-9]*\) bytes written to logdump.*/\1/p' "$log" 2>/dev/null | sort -n | tail -1)
 			if [ -n "$bytes" ] && [ "$bytes" -gt 0 ] && flash_read logdump 0 "$(printf %x "$bytes")" "$log.dump" >/dev/null; then
-				tr -d '\0' < "$log.dump" > "$log" && rm -f "$log.dump"
+				tr -d '\0' < "$log.dump" | sed '/== END OF LOG ==/q' > "$log" && rm -f "$log.dump"
 				echo "xl: the log read from the log partition instead ($bytes bytes)$(grep -q '== END OF LOG ==' "$log" || echo ', AND IT HAS NO END EITHER')"
+			elif [ -z "$XL_NO_REFETCH" ] && fb reboot >/dev/null && wait_for android 120 >/dev/null && enter >/dev/null &&
+			    flash_read logdump 0 166000 "$log.dump" >/dev/null; then
+				# The OnePlus 6's USB driver (the 6T's): after a reply it never reported sent and that was aborted
+				# during the run, its larger sends stall for the rest of that loader's life -- the log and the log
+				# partition alike came back 12-18 KB long (1 November). A fresh loader reads the partition whole;
+				# and a run needs a fresh loader anyway, so this one is left for the next (XL_NO_REFETCH=1: not done).
+				tr -d '\0' < "$log.dump" | sed '/== END OF LOG ==/q' > "$log" && rm -f "$log.dump"
+				echo "xl: the log read from the log partition through a fresh loader ($(stat -c %s "$log") bytes)$(grep -q '== END OF LOG ==' "$log" || echo ', AND IT HAS NO END')"
 			else
 				echo "xl: THE LOG IS SHORT, and the log partition could not be read either"
 			fi
