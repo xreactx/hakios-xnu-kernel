@@ -857,6 +857,32 @@ hakios_ipa_status(char *to, size_t size)
 	    channel_state(&modem_tx), channel_state(&modem_rx));
 }
 
+/*
+ * Where each channel stands, ours and the hardware's: what we posted (next), what finished (done) and the
+ * events we read, against the channel's read and write pointers (context words 4 and 6) and the event ring's
+ * (word 4: how far the GSI has written events); then the GSI's status and error log. For a path that
+ * carries nothing: whether the GSI took the TREs, wrote events, or stopped on an error.
+ */
+void
+hakios_ipa_dump(const char *why)
+{
+	if (!ready) {
+		printf("ipa: %s: no data path to look at\n", why);
+		return;
+	}
+	lck_mtx_lock(&ipa_lock);
+	for (unsigned n = 0; n < 4; n++) {
+		struct channel *ch = channels[n];
+
+		printf("ipa: %s: %s (channel %u, endpoint %u): state %u; ours: next %u, done %u, events %u, packets %llu, errors %llu; "
+		    "ring %#llx: read %#x write %#x; events %#llx: written to %#x\n", why, ch->name, ch->id, ch->endpoint, channel_state(ch),
+		    ch->next, ch->done, ch->events, ch->packets, ch->errors, ch->tre_ring.phys, gsi_rd(CH_CNTXT(ch->id, 4)),
+		    gsi_rd(CH_CNTXT(ch->id, 6)), ch->event_ring.phys, gsi_rd(EV_CNTXT(ch->ring_id, 4)));
+	}
+	lck_mtx_unlock(&ipa_lock);
+	gsi_error(why);
+}
+
 /* ---- setting up ---------------------------------------------------------------------------------- */
 
 bool

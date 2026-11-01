@@ -328,7 +328,16 @@ ping_advance(void)
 	uint64_t now;
 	uint32_t from;
 
-	if (ping_wanted == 0 || ping_sent >= PING_COUNT) {
+	if (ping_wanted == 0) {
+		return;
+	}
+	if (ping_sent >= PING_COUNT) {
+		/* once, four seconds after the last: where the channels stand */
+		if (ping_sent == PING_COUNT && cell_now_us() > ping_next + 2000000) {
+			ping_sent++;
+			printf("cell: pings done: %u of %u answered\n", ping_answered, PING_COUNT);
+			hakios_ipa_dump("after the pings");
+		}
 		return;
 	}
 	lck_mtx_lock(&cell_lock);
