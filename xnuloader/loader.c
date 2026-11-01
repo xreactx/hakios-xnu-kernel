@@ -3047,6 +3047,28 @@ choose_window(const struct payload_info *pi)
 	win_size = best_size;
 	return 1;
 }
+/*
+ * The OnePlus 6T: a kernel with fb_flip=1 leaves the display controller's pipe VIG0 reading its second buffer;
+ * pointed back at the first (the splash memory the screen here is drawn into), and its flush bit in control
+ * path 0 -- only if the display's register clocks are on (the kernel turns them on; with them off the
+ * controller's registers must not be touched: gcc_disp_ahb_clk 0x10b00c, disp_cc_mdss_ahb_clk 0xaf04004).
+ */
+static void
+display_restore(void)
+{
+	volatile uint32_t *gcc = (volatile uint32_t *)0x0010b00cUL, *dispcc = (volatile uint32_t *)0x0af04004UL;
+	volatile uint32_t *vig0_addr = (volatile uint32_t *)0x0ae05014UL, *ctl0_flush = (volatile uint32_t *)0x0ae02018UL;
+
+	if (PLAT == NULL || !str_eq(PLAT->name, "fajita") || SCREEN.base != 0x9D400000ULL || !(*gcc & 1) || !(*dispcc & 1) || (*dispcc & 0x80000000u)) {
+		return;
+	}
+	if (*vig0_addr != (uint32_t)SCREEN.base) {
+		print("display: the pipe read %x: back to %x\n", (uint64_t)*vig0_addr, SCREEN.base);
+		*vig0_addr = (uint32_t)SCREEN.base;
+		*ctl0_flush = 1;
+	}
+}
+
 
 /*
  * Load and run the kernel from the payload. Returns when the kernel comes
@@ -3716,6 +3738,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		klog_len = 0;
 	} else {
 		print("kernel returned: log at %x, %d bytes\n", (uint64_t)(uintptr_t)klog, klog_len);
+		display_restore();
 		if (reason == 2) {
 			print("STOPPED AT CHECKPOINT %d\n", loader_ctx[CTX_ESR]);
 			set_result("checkpoint", loader_ctx[CTX_ESR], 0);

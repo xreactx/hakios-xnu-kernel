@@ -31,6 +31,7 @@ sound_receiver=1 # the earpiece for iOS's receiver route (hakios.sound.c; the pl
 gpu=1           # iOS draws with the Adreno 630 (bsd/dev/hakios.adreno.c, Mesa freedreno; root built GL=1 ADSP=1 REST=1)
 soc_gpu=630     # ... the SDM845's GPU numbers (soc_cmd_db above gives its rails); the UEFI must be without CPRDxe (README step 9)
 adreno_speed=7  # ... at its top level, 710 MHz (1 = 257): the app zooms GPU-bound at 257, 40 % of frames slow -> 28 % (runs 140417, 141106; 49 C)
-fb_scan=1           # the vsync is every second scan of the panel's own (119.93 Hz), not a timer of ours: steadier swipes
+soc_display=845     # the display's clocks and controller at the SDM845's addresses (MiniIOMobileFramebuffer.cpp)
+fb_flip=1 fb_map_mb=30  # three buffers in the splash memory, the panel's pipe flipped between them: no half frames (README step 9b)
 ufs=2 ufs_write=1   # this kernel reads the flash itself; the one place it may write is the store at the end of system_a
 var_store=1         # iOS's data volume (/private/var) kept between boots, in that store (README step 5)
