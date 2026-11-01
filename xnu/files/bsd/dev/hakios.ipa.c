@@ -55,6 +55,31 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
 
+/*
+ * Every line goes to the loader's log directly as well (as hakios.buttons.c's): the kernel's own messages
+ * reach that log only at the end of a run, from its message buffer, whose start later lines overwrite --
+ * a set-up during the modem's step 7 left no line at all there (the 6T, 1 November).
+ */
+extern void loader_log_putc(char c);
+
+static int say(const char *format, ...) __printflike(1, 2);
+
+static int
+say(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	return printf("%s", line);
+}
+#define printf say
+
 static LCK_GRP_DECLARE(ipa_lock_group, "hakios-ipa");
 static LCK_MTX_DECLARE(ipa_lock, &ipa_lock_group);
 
