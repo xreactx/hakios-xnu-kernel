@@ -516,6 +516,26 @@ hakios_cell_session(bool up, uint32_t address, uint32_t mask, uint32_t gateway, 
 	}
 }
 
+/*
+ * cell_fake=1 (a test of iOS's side alone): en1 attached at start without the modem or the IPA, its "session" made up
+ * -- 10.64.0.2, router 10.64.0.1, DNS 1.1.1.1 -- and its link up, so that configd's DHCP on it, and the answer from
+ * here, show whether iOS takes en1 as a network interface. Its IP packets go nowhere (no data path).
+ */
+void
+hakios_cell_fake(void)
+{
+	uint32_t fake = 0;
+
+	if (!PE_parse_boot_argn("cell_fake", &fake, sizeof(fake)) || fake == 0 || cell_attached) {
+		return;
+	}
+	cell_trace = true;
+	cell_attached = hakios_net_attach(&cell_link);
+	printf("cell: cell_fake=1: en%u %s without the modem; a made-up session follows\n", CELL_UNIT,
+	    cell_attached ? "IS ATTACHED" : "IS NOT ATTACHED");
+	hakios_cell_session(true, 0x0a400002, 0xffffff00, 0x0a400001, 0x01010101, 0, 1500);
+}
+
 void
 hakios_cell_attach(void)
 {
