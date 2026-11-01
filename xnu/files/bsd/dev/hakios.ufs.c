@@ -79,6 +79,21 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 #define UFS_DARWIN_FIRST   25374720ULL                 /* its first LBA on the unit, as the GPT has it */
 #define UFS_DARWIN_BLOCKS  5242875ULL
 
+/*
+ * The OnePlus 6T has no partition of the port's own: its store is the end of system_a, the system slot
+ * Android does not boot from, behind the system image flashed there from the computer (blocks 0..629081):
+ * from block 629248 to its end, 402 MiB (xnuloader/loader.c, BLOCK_SYSTEM_A_*, the same bounds and the
+ * partition's GUIDs besides; userland/build.sh refuses an image that would reach that block).
+ */
+static const struct ufs_target {
+	const char *name;
+	uint64_t first_lba, blocks, write_first;
+} ufs_targets[] = {
+	{ "darwin", UFS_DARWIN_FIRST, UFS_DARWIN_BLOCKS, UFS_WRITE_FIRST },
+	{ "system_a", 85824, 732160, 629248 },
+};
+static uint64_t ufs_write_first = ~0ull;        /* the chosen target's first block a write may reach */
+
 struct loader_block_part {
 	char name[36];
 	uint32_t block_size;
@@ -219,6 +234,15 @@ SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, &u
     "microseconds spent waiting for core 0's answers");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_copy_us, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_copy_us,
     "microseconds spent copying out of the loader's buffer");
+/* where iOS's data volume may be kept this run, for userland/src/var_store.c: none ("") without ufs_write=1 */
+static char ufs_var_part[36];
+static uint64_t ufs_var_first, ufs_var_end;     /* bytes into that partition: the first a write may reach, and its end */
+SYSCTL_STRING(_kern_hakios, OID_AUTO, var_part, CTLFLAG_RD | CTLFLAG_LOCKED, ufs_var_part, sizeof(ufs_var_part),
+    "the partition the data volume is kept in (its /dev/rufs_ name), or nothing");
+SYSCTL_QUAD(_kern_hakios, OID_AUTO, var_first, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_var_first,
+    "the first byte of var_part a write may reach");
+SYSCTL_QUAD(_kern_hakios, OID_AUTO, var_end, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_var_end,
+    "var_part's size in bytes");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_writes,
     "requests written into darwin and read back by the loader");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_write_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_bytes,
@@ -576,7 +600,7 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 	if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
 		return EINVAL;          /* whole blocks only: nothing is read before a write */
 	}
-	if (offset / nbs < UFS_WRITE_FIRST || offset > ufs_part_bytes(part) ||
+	if (offset / nbs < ufs_write_first || offset > ufs_part_bytes(part) ||
 	    len > ufs_part_bytes(part) - offset) {
 		/* the iOS volume, the cryptexes, and anything past the partition's end: never */
 		ufs_write_refused++;
@@ -1535,18 +1559,26 @@ hakios_ufs_init(void)
 	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
 		uint32_t offered = ufs_page->write_part_plus_one;
 
-		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
+		if (offered == 0 || offered > ufs_parts) {
 			printf("ufs: the loader offers no partition to write into (ufs_write=1 on its command "
 			    "line too, and a loader that knows about writes)\n");
 		}
 		for (uint32_t i = 0; offered != 0 && i < ufs_parts; i++) {
+			const struct ufs_target *t = NULL;
 			const char *why = NULL;
 
-			if (strncmp((const char *)ufs_page->part[i].name, "darwin", 7) != 0) {
+			for (unsigned k = 0; k < sizeof(ufs_targets) / sizeof(ufs_targets[0]); k++) {
+				if (strncmp((const char *)ufs_page->part[i].name, ufs_targets[k].name, sizeof(ufs_page->part[i].name)) == 0) {
+					t = &ufs_targets[k];
+				}
+			}
+			if (t == NULL) {
 				continue;
 			}
 			if (i != offered - 1) {
 				why = "the loader offers another partition";
+			} else if (ufs_page->write_first != t->write_first) {
+				why = "the loader would write from another block";
 			} else if (ufs_page->part[i].flags & BLOCK_PART_UNIT) {
 				why = "it is a whole logical unit, not the partition";
 			} else if (ufs_page->part[i].unit != 0) {
@@ -1554,25 +1586,29 @@ hakios_ufs_init(void)
 				 * has compared with the loader's reads; the device path this firmware gives
 				 * says no logical unit number at all, so part[].lun is 0xff for every unit */
 				why = "it is not on the first logical unit";
-			} else if (ufs_page->part[i].start_lba != UFS_DARWIN_FIRST) {
+			} else if (ufs_page->part[i].start_lba != t->first_lba) {
 				why = "it does not begin where it did";
-			} else if (ufs_page->part[i].blocks != UFS_DARWIN_BLOCKS) {
+			} else if (ufs_page->part[i].blocks != t->blocks) {
 				why = "it is not the size it was";
 			} else if (ufs_page->part[i].block_size != 4096) {
 				why = "its blocks are not 4096 bytes";
 			}
 			if (why != NULL) {
-				printf("ufs: darwin: no write will be asked for: %s\n", why);
+				printf("ufs: %s: no write will be asked for: %s\n", t->name, why);
 				continue;
 			}
 			ufs_write_part = (int)i;
+			ufs_write_first = t->write_first;
+			strlcpy(ufs_var_part, t->name, sizeof(ufs_var_part));
+			ufs_var_first = t->write_first * 4096;
+			ufs_var_end = t->blocks * 4096;
 		}
 		if (ufs_write_part >= 0) {
-			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
-			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
-			    (UFS_DARWIN_BLOCKS - UFS_WRITE_FIRST) * 4096 >> 20);
+			printf("ufs: /dev/rufs_%s takes writes, whole blocks from %llu on (%llu MB of it); "
+			    "everything else of the storage is read only\n", (const char *)ufs_page->part[ufs_write_part].name,
+			    ufs_write_first, (ufs_page->part[ufs_write_part].blocks - ufs_write_first) * 4096 >> 20);
 		} else {
-			printf("ufs: nothing takes writes: darwin is not among the partitions\n");
+			printf("ufs: nothing takes writes: neither darwin nor system_a is among the partitions as set up\n");
 		}
 	}
 

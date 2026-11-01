@@ -666,6 +666,14 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
 	python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
+	# the OnePlus 6T keeps iOS's data volume at the end of system_a, from its block 629248 on (bsd/dev/hakios.ufs.c,
+	# xnuloader/loader.c): an image that would reach that block is not one to flash there
+	if [ "${DEVICE:-}" = oneplus-6t ] && [ "$(stat -c %s system.apfs)" -gt $((629248 * 4096)) ]; then
+		echo "build.sh: system.apfs is $(stat -c %s system.apfs) bytes: it would reach the data volume's store at the end of" \
+		    "system_a (from $((629248 * 4096))); not to be flashed there" >&2
+		mv system.apfs system.apfs.too-big
+		exit 1
+	fi
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh system.apfs System=sysroot,manifest=$IOS/system.manifest
 	rm -rf sysroot
 fi
