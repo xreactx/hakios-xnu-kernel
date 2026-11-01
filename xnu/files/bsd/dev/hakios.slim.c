@@ -214,6 +214,11 @@ slim_qmi_request(const char *what, int msg_id, size_t largest, const struct qmi_
 #define SLIM_MSG_MT_DEST_REFERRED_USER  0x2
 #define SLIM_MSG_MT_SRC_REFERRED_USER   0x6
 #define SLIM_MSG_MC_REPORT_PRESENT      0x1
+#define SLIM_MSG_MC_REQUEST_VALUE       0x60
+#define SLIM_MSG_MC_REPLY_VALUE         0x64
+#define SLIM_MSG_MC_CHANGE_VALUE        0x68
+#define SLIM_USR_MC_ADDR_QUERY          0xd
+#define SLIM_USR_MC_ADDR_REPLY          0xe
 #define SLIM_USR_MC_MASTER_CAPABILITY   0x0
 #define SLIM_USR_MC_REPORT_SATELLITE    0x1
 #define SLIM_LA_MGR                     0xff
@@ -366,6 +371,111 @@ ngd_bringup(void)
 #define WCD_RESET_GPIO          64
 #define CFG_OUTPUT              (1u << 9)
 
+static uint8_t slim_tid = 1;
+
+/* A message sent, then the reply of that MT and MC with that TID (at byte 3) waited for (1 s); its length, or 0. */
+static unsigned
+ngd_transact(const uint8_t *message, unsigned length, unsigned mt, unsigned mc, uint8_t tid, uint8_t *reply)
+{
+	if (!ngd_send(message, length)) {
+		return 0;
+	}
+	for (int ms = 0; ms < 1000; ms++) {
+		unsigned got = ngd_receive(reply);
+
+		if (got >= 4 && (reply[0] >> 5) == mt && (reply[1] & 0x7f) == mc && reply[3] == tid) {
+			return got;
+		}
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+	printf("slim: ngd: no reply (MT %u MC %#x TID %u) in 1 s\n", mt, mc, tid);
+	return 0;
+}
+
+/* Linux's qcom_slim_ngd_get_laddr(): the manager asked which logical address the device of that EA has; 0 if none. */
+static uint8_t
+codec_laddr(const uint8_t ea[6], const char *what)
+{
+	uint8_t tid = slim_tid++, message[10], reply[40];
+	uint32_t first = SLIM_MSG_ASM_FIRST_WORD(10, SLIM_MSG_MT_DEST_REFERRED_USER, SLIM_USR_MC_ADDR_QUERY, 0, SLIM_LA_MGR);
+	unsigned got;
+
+	message[0] = (uint8_t)first;
+	message[1] = (uint8_t)(first >> 8);
+	message[2] = (uint8_t)(first >> 16);
+	message[3] = tid;
+	memcpy(message + 4, ea, 6);
+	got = ngd_transact(message, 10, SLIM_MSG_MT_SRC_REFERRED_USER, SLIM_USR_MC_ADDR_REPLY, tid, reply);
+	if (got < 11) {
+		printf("slim: codec: the manager does not say where the %s is\n", what);
+		return 0;
+	}
+	if (memcmp(reply + 4, "\0\0\0\0\0\0", 6) == 0) {
+		printf("slim: codec: the manager knows no %s (EA %02x %02x %02x %02x %02x %02x)\n", what, ea[0], ea[1], ea[2], ea[3], ea[4],
+		    ea[5]);
+		return 0;
+	}
+	printf("slim: codec: THE %s IS AT LOGICAL ADDRESS %#x\n", what, reply[10]);
+	return reply[10];
+}
+
+/* One value element of a device written (CHANGE_VALUE: no reply); true when the NGD has sent it. */
+static bool
+codec_write(uint8_t la, uint32_t element, uint8_t value)
+{
+	uint16_t ec = (uint16_t)(0x8 | (element & 0xfff) << 4);        /* one byte (slice code 0), byte-addressed */
+	uint32_t first = SLIM_MSG_ASM_FIRST_WORD(6, SLIM_MSG_MT_CORE, SLIM_MSG_MC_CHANGE_VALUE, 0, la);
+	uint8_t message[6] = { (uint8_t)first, (uint8_t)(first >> 8), (uint8_t)(first >> 16), (uint8_t)ec, (uint8_t)(ec >> 8), value };
+
+	return ngd_send(message, 6);
+}
+
+/* One value element read (REQUEST_VALUE, REPLY_VALUE); -1 if no answer. */
+static int
+codec_read(uint8_t la, uint32_t element)
+{
+	uint8_t tid = slim_tid++, reply[40];
+	uint16_t ec = (uint16_t)(0x8 | (element & 0xfff) << 4);
+	uint32_t first = SLIM_MSG_ASM_FIRST_WORD(6, SLIM_MSG_MT_CORE, SLIM_MSG_MC_REQUEST_VALUE, 0, la);
+	uint8_t message[6] = { (uint8_t)first, (uint8_t)(first >> 8), (uint8_t)(first >> 16), tid, (uint8_t)ec, (uint8_t)(ec >> 8) };
+
+	if (ngd_transact(message, 6, SLIM_MSG_MT_CORE, SLIM_MSG_MC_REPLY_VALUE, tid, reply) < 5) {
+		return -1;
+	}
+	return reply[4];
+}
+
+/*
+ * The codec's registers (Linux: drivers/mfd/wcd934x.c, its regmap over SLIMbus): 16-bit addresses through a window
+ * -- the page (address >> 8) into the selector at value element 0x800, the register at 0x800 + its low byte. Its
+ * identity first, as wcd934x_bring_up() reads it: CHIP_ID bytes 0..3 (0x21..0x24).
+ */
+static void
+codec_talk(void)
+{
+	static const uint8_t pgd_ea[6] = { 0x00, 0x01, 0x50, 0x02, 0x17, 0x02 }, ifd_ea[6] = { 0x00, 0x00, 0x50, 0x02, 0x17, 0x02 };
+	uint8_t pgd = codec_laddr(pgd_ea, "codec's generic device"), id[4];
+	int value;
+
+	codec_laddr(ifd_ea, "codec's interface");
+	if (pgd == 0) {
+		return;
+	}
+	if (!codec_write(pgd, 0x800, 0)) {
+		printf("slim: codec: page 0 not selected\n");
+		return;
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		if ((value = codec_read(pgd, 0x800 + 0x21 + i)) < 0) {
+			printf("slim: codec: CHIP_ID byte %u: no answer\n", i);
+			return;
+		}
+		id[i] = (uint8_t)value;
+	}
+	printf("slim: codec: THE WCD934x ANSWERS: chip id major %#x, minor %#x (bytes %02x %02x %02x %02x)\n", id[2] | id[3] << 8,
+	    id[0] | id[1] << 8, id[0], id[1], id[2], id[3]);
+}
+
 static void
 codec_up(void)
 {
@@ -409,7 +519,8 @@ codec_up(void)
 		}
 		delay_for_interval(1, NSEC_PER_MSEC);
 	}
-	printf("slim: codec: %u reports of presence in 2 s%s\n", present, present ? "" : " (the master may keep them to itself: next, ask it)");
+	printf("slim: codec: %u reports of presence in 2 s%s\n", present, present ? "" : " (the master keeps them: asked below)");
+	codec_talk();
 }
 
 /* ---- the thread ---------------------------------------------------------------------------------------------- */
