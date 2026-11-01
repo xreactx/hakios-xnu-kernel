@@ -272,7 +272,9 @@ sound() { # sound [file.wav]
 		    len=$(python3 -c 'import sys; h = open(sys.argv[1], "rb").read(16); print(int.from_bytes(h[8:], "little") if h[:8] == b"HAKSOUND" else 0)' logs/sound.head)
 		rm -f logs/sound.head
 		[ -n "$len" ] && [ "$len" -gt 0 ] || { echo "xl: the last run left no sound recording (boot-arg rec_sound=N)"; return 1; }
-		flash_read logdump 2001000 "$(printf %x "$len")" logs/sound.raw >/dev/null || return 1
+		# (in whole blocks of 4 KB, as the loader reads them; then cut to the recording's length)
+		flash_read logdump 2001000 "$(printf %x $(( (len + 4095) / 4096 * 4096 )))" logs/sound.raw >/dev/null || return 1
+		truncate -s "$len" logs/sound.raw
 		echo "xl: the recording read from logdump ($len bytes)"
 	fi
 	tools/sound.py logs/sound.raw "$out" && rm -f logs/sound.raw
