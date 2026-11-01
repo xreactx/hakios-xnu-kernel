@@ -943,7 +943,8 @@ hakios_ipa_data_setup(void)
 			 * closed on a one-second tick) */
 			modem_rx.aggregate = false;
 			modem_rx.close_eof = false;
-			printf("ipa: modem_ipa_no_aggr: the modem's packets are not aggregated\n");
+			trace = true;           /* (and traced: both fit XNU's command line only together) */
+			printf("ipa: modem_ipa_no_aggr: the modem's packets are not aggregated, and each is traced\n");
 		}
 	}
 	if (PAGE_SIZE != RECEIVE_BUFFER) {
