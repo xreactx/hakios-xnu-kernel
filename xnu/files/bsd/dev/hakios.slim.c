@@ -13,7 +13,8 @@
  * what the DSP answers. Next: the NGD itself (its message queues, the codec's REPORT_PRESENT, a logical
  * address), then the codec's reset (TLMM GPIO 64), its master clock (RPMh LN_BB_CLK2) and its registers.
  *
- * Boot-arg slim=1: the QMI part alone; slim=2: the NGD as well. Without it nothing here runs.
+ * Boot-arg slim=1: the QMI part alone; slim=2: the NGD as well; slim=3: the codec's clock and reset too.
+ * Without it nothing here runs.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -28,6 +29,7 @@
 
 extern const struct hakios_qrtr_ops *hakios_adsp_qrtr(void);           /* bsd/dev/hakios.adsp.c */
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern bool hakios_adsp_rpmh_set(const char *name, uint32_t value);   /* bsd/dev/hakios.adsp.c */
 
 /* Every line goes to the loader's log directly as well (as hakios.buttons.c's): this runs early in a boot. */
 extern void loader_log_putc(char c);
@@ -348,11 +350,66 @@ ngd_bringup(void)
 	}
 	printf("slim: ngd: after the wait: cfg %#x status %#x int stat %#x%s\n", ngd_rd(NGD_CFG), ngd_rd(NGD_STATUS),
 	    ngd_rd(NGD_INT_STAT), answered ? "" : "; NO CAPABILITY CAME");
-	/* (the codec's REPORT_PRESENT needs it out of reset and clocked: the step after this) */
-	for (int ms = 0; ms < 500; ms++) {
-		ngd_receive(message);
+}
+
+/* ---- the codec: its clock, its reset, and what it says on the bus ------------------------------------------- */
+
+/*
+ * The WCD934x (dt: tavil_codec, qcom,tavil-slim-pgd): its supplies are all pm8998_s4, on always; its master clock
+ * audio_ext_clk_lnbb, the PMIC's LN_BB_CLK2 (RPMh "lnbclka2", 19.2 MHz, which the codec divides to 9.6); its reset
+ * TLMM GPIO 64 (north tile), low to hold it -- Linux's wcd934x.c drives it low, waits 20 ms, high, 20 ms. Out of
+ * reset and clocked it reports itself present on the bus, two devices: its interface (EA 00 00 50 02 17 02) and
+ * its generic device (00 01 50 02 17 02), whose registers are the codec's.
+ */
+#define TLMM_PHYS               0x03400000UL
+#define TILE_NORTH              0x500000UL
+#define WCD_RESET_GPIO          64
+#define CFG_OUTPUT              (1u << 9)
+
+static void
+codec_up(void)
+{
+	volatile uint32_t *pin = (volatile uint32_t *)ml_io_map(TLMM_PHYS + TILE_NORTH + 0x1000UL * WCD_RESET_GPIO, 0x1000);
+	uint8_t message[40];
+	unsigned present = 0;
+
+	if (pin == NULL) {
+		printf("slim: codec: its reset pin cannot be mapped\n");
+		return;
+	}
+	printf("slim: codec: its reset, gpio%u: cfg %#x, io %#x (bit 1: driven high, bit 0: reads)\n", WCD_RESET_GPIO, pin[0], pin[1]);
+	if (!hakios_adsp_rpmh_set("lnbclka2", 1)) {
+		printf("slim: codec: its clock is not on: it is not let out of reset\n");
+		return;
+	}
+	pin[1] = 0;                                     /* low: held in reset */
+	pin[0] = CFG_OUTPUT;                            /* function 0 (a GPIO), no pull, 2 mA, an output */
+	__asm__ volatile ("dsb sy" ::: "memory");
+	delay_for_interval(20, NSEC_PER_MSEC);
+	pin[1] = 2;                                     /* high: out of reset */
+	__asm__ volatile ("dsb sy" ::: "memory");
+	delay_for_interval(20, NSEC_PER_MSEC);
+	printf("slim: codec: OUT OF RESET (gpio%u cfg %#x io %#x), clocked; listening on the bus\n", WCD_RESET_GPIO, pin[0], pin[1]);
+	for (int ms = 0; ms < 2000; ms++) {
+		unsigned length = ngd_receive(message);
+
+		if (length >= 8 && (message[0] >> 5) == SLIM_MSG_MT_CORE && (message[1] & 0x7f) == SLIM_MSG_MC_REPORT_PRESENT) {
+			present++;
+			printf("slim: codec: A DEVICE REPORTS PRESENT: enumeration address %02x %02x %02x %02x %02x %02x\n",
+			    message[length - 6], message[length - 5], message[length - 4], message[length - 3], message[length - 2],
+			    message[length - 1]);
+		}
+		{
+			uint32_t stat = ngd_rd(NGD_INT_STAT) & ~(NGD_INT_RX_MSG_RCVD | NGD_INT_TX_MSG_SENT);
+
+			if (stat != 0) {
+				printf("slim: ngd: int stat %#x\n", stat);
+				ngd_wr(NGD_INT_CLR, stat);
+			}
+		}
 		delay_for_interval(1, NSEC_PER_MSEC);
 	}
+	printf("slim: codec: %u reports of presence in 2 s%s\n", present, present ? "" : " (the master may keep them to itself: next, ask it)");
 }
 
 /* ---- the thread ---------------------------------------------------------------------------------------------- */
@@ -410,6 +467,9 @@ slim_thread(__unused void *parameter, __unused wait_result_t result)
 		PE_parse_boot_argn("slim", &level, sizeof(level));
 		if (level >= 2) {
 			ngd_bringup();
+		}
+		if (level >= 3 && slim_ngd != NULL && (ngd_rd(NGD_STATUS) & NGD_LADDR)) {
+			codec_up();
 		}
 	}
 	return;                                 /* (the handle stays: the bus is to be powered down through it one day) */

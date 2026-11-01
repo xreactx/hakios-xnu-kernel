@@ -1089,6 +1089,76 @@ rails(uint32_t level)
 	return done != 0;
 }
 
+/*
+ * One RPMh resource set by its command-database name (say "lnbclka2", the codec's clock: hakios.slim.c), through
+ * the same TCS and under the same lock as the rails above; true once RPMh has said done.
+ */
+bool
+hakios_adsp_rpmh_set(const char *name, uint32_t value)
+{
+	char id[8] = { 0 };
+	uint32_t address = 0, done = 0, irq_enable;
+	uint64_t began;
+
+	if (cmd_db == NULL) {
+		cmd_db = (const struct cmd_db_header *)ml_io_map_unmappable(cmd_db_phys, CMD_DB_SIZE, VM_WIMG_WCOMB);
+	}
+	if (!(cmd_db->magic[0] == 0xdb && cmd_db->magic[1] == 0x30 && cmd_db->magic[2] == 0x03 && cmd_db->magic[3] == 0x0c)) {
+		printf("adsp: rpmh: the command database is not there: %s not set\n", name);
+		return false;
+	}
+	strlcpy(id, name, sizeof(id));
+	for (unsigned s = 0; s < 8 && address == 0; s++) {
+		const struct cmd_db_slave *slave = &cmd_db->slave[s];
+		const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
+
+		for (unsigned i = 0; slave->id != 0 && slave->count <= 512 && i < slave->count; i++) {
+			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
+				address = entry[i].address;
+				break;
+			}
+		}
+	}
+	if (address == 0) {
+		printf("adsp: rpmh: there is no \"%s\"\n", name);
+		return false;
+	}
+	need(&rsc);
+	lck_mtx_lock(&hakios_rsc_lock);
+	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
+		printf("adsp: rpmh: TCS %u is busy: %s not set\n", RPMH_TCS, name);
+		lck_mtx_unlock(&hakios_rsc_lock);
+		return false;
+	}
+	irq_enable = rd(rsc.base + RSC_IRQ_ENABLE);
+	wr(rsc.base + RSC_IRQ_ENABLE, irq_enable | 1u << RPMH_TCS);
+	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0), MSGID_WRITE_WAITED);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0) + 4, address);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0) + 8, value);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_WAIT_FOR_DONE, 1);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 1);
+	settle();
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~TCS_TRIGGER);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_ACTIVE_MODE);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_TRIGGER);
+	began = now_us();
+	while (now_us() - began < 100000) {
+		done = rd(rsc.base + RSC_IRQ_STATUS) & (1u << RPMH_TCS);
+		if (done) {
+			break;
+		}
+		sleep_us(50);
+	}
+	printf("adsp: rpmh: %s (%#x) = %u: %s after %llu us\n", name, address, value, done ? "DONE" : "NOT SAID DONE", now_us() - began);
+	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
+	wr(rsc.base + RSC_IRQ_ENABLE, irq_enable);
+	lck_mtx_unlock(&hakios_rsc_lock);
+	return done != 0;
+}
+
 /* ---- step 1: the shared memory --------------------------------------------------------------------- */
 
 static bool
