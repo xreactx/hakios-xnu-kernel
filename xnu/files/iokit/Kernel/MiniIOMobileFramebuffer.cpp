@@ -1249,6 +1249,39 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define SCAN_INTF_LINE_COUNT    0x0b0
 
 static volatile uint32_t * gScanIntf;
+
+/*
+ * Boot-arg fb_probe=1: once the display's register clocks run, what the firmware left in its display
+ * controller (the 6T's tree: qcom,mdss_mdp@ae00000, qcom,sde-sspp-off, qcom,sde-ctl-off) -- each source
+ * pipe's size, address, stride and format, each control path's layers, top and flush. Only reads.
+ */
+#define SCAN_MDP                0x0ae00000
+static TUNABLE(uint32_t, gProbe, "fb_probe", 0);
+
+static void
+scanProbe(void)
+{
+	static const uint32_t sspp[8] = { 0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000 };
+	static const char * const names[8] = { "vig0", "vig1", "vig2", "vig3", "dma0", "dma1", "dma2", "dma3" };
+	volatile uint32_t * mdp = (volatile uint32_t *) ml_io_map(SCAN_MDP, 0x30000);
+
+	if (mdp == NULL) {
+		hakios_tl("fb_probe: the display controller cannot be mapped\n");
+		return;
+	}
+	for (unsigned i = 0; i < 8; i++) {
+		volatile uint32_t * p = mdp + sspp[i] / 4;
+
+		hakios_tl("fb_probe: pipe %s (%#x): size %#x address %#x stride %#x format %#x\n", names[i],
+		    SCAN_MDP + sspp[i], p[0x00 / 4], p[0x14 / 4], p[0x24 / 4], p[0x30 / 4]);
+	}
+	for (unsigned i = 0; i < 5; i++) {
+		volatile uint32_t * c = mdp + (0x2000 + 0x200 * i) / 4;
+
+		hakios_tl("fb_probe: control %u (%#x): layer0 %#x layer1 %#x top %#x flush %#x\n", i,
+		    SCAN_MDP + 0x2000 + 0x200 * i, c[0x00 / 4], c[0x04 / 4], c[0x14 / 4], c[0x18 / 4]);
+	}
+}
 static uint32_t gScanLines;                             /* lines a scan */
 static uint64_t gScanLineAbs;                           /* one line in mach_absolute_time units, << 16 */
 static int gScanState;                                  /* 0 not tried, 1 ready, -1 not to be had */
@@ -1279,6 +1312,7 @@ scanReady(void)
 		return gScanState > 0;
 	}
 	gScanState = -1;
+	hakios_tl("fb_scan: the display's counters asked for\n");
 	gcc = (volatile uint32_t *) ml_io_map(SCAN_GCC + SCAN_GCC_DISP_AHB_CBCR, 4);
 	dispcc = (volatile uint32_t *) ml_io_map(SCAN_DISPCC + SCAN_DISPCC_MDSS_AHB_CBCR, 4);
 	gScanIntf = (volatile uint32_t *) ml_io_map(SCAN_INTF, 0x100);
@@ -1318,6 +1352,10 @@ scanReady(void)
 		    100000000000ull / scan % 100);
 	}
 	gScanState = 1;
+	hakios_tl("fb_scan: the refreshes are the panel's: %u lines a scan\n", gScanLines);
+	if (gProbe) {
+		scanProbe();
+	}
 	return true;
 }
 
