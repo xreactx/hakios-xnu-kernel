@@ -56,6 +56,17 @@ unsigned lx_os_option(const char *name);
 int	 lx_os_firmware(const char *name, const void **data, unsigned long *size);
 /* the processor that runs the radio's firmware: started, and up when this returns; 0 or an errno */
 int	 lx_os_rproc_boot(void);
+/*
+ * The OnePlus 6T: a region of its Wi-Fi firmware's memory handed to the firmware -- the modem's MSA, the Wi-Fi,
+ * and unless secure its copy engines -- or back to us, through the hypervisor (ath10k's qcom_scm_assign_mem()).
+ * 0, or an errno.
+ */
+int	 lx_os_wlan_memory(unsigned long long address, unsigned long size, int secure, int to_firmware);
+/*
+ * The OnePlus 6T: the radio's interrupts are lines of the GIC, not messages: vector v is the SPI whose GIC
+ * number is first + v. Instead of lx_os_irq_msi(). 1, or 0 (no interrupts).
+ */
+int	 lx_os_irq_lines(unsigned first);
 /* the radio's own address (six bytes), if the machine has one for it: 1, or 0 and nothing written */
 int	 lx_os_radio_address(unsigned char *address);
 /*

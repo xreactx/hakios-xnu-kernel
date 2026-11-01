@@ -405,6 +405,13 @@ if ls ../fw-modem/ipa_fws.mdt >/dev/null 2>&1; then
 	mkdir -p root/fw
 	cp ../fw-modem/ipa_fws.mdt ../fw-modem/ipa_fws.b[0-9][0-9] root/fw/
 fi
+# ... and, for the OnePlus 6T's ath10k (bsd/dev/hakios.wifi6t.c), the table of its firmware's features that
+# Linux keeps in linux-firmware (ath10k/WCN3990/hw1.0/firmware-5.bin, 60 bytes; put into ../fw-wifi under the
+# name below): the firmware itself is the modem's, and its board's data the modem's image's bdwlan.bin
+if [ -f ../fw-wifi/ath10k-wcn3990-firmware-5.bin ]; then
+	mkdir -p root/fw
+	cp ../fw-wifi/ath10k-wcn3990-firmware-5.bin root/fw/
+fi
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (bsd/dev/hakios.wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)

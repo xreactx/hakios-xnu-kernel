@@ -46,7 +46,7 @@ S=$B11/freebsd/sys
 # --- compile: the driver's files built so far, the common ones, and the glue
 DRIVER="core mac wmi wmi-tlv htt htt_rx htt_tx htc ce hw txrx p2p qmi qmi_wlfw_v01 snoc debug"
 COMMON="regd main"
-GLUE=""
+GLUE="src/lx_base.c src/lx_80211.c src/lx_wpa.c ath10k/lx_snoc.c ath10k/lx_kpi.c ath10k/lx_plain.c"
 CC="clang -target arm64-apple-ios16.5"
 LD=$ROOT/xnu-deps/host/bin/ld64
 CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fno-strict-aliasing
@@ -81,5 +81,35 @@ for f in obj/*.err; do
 done
 [ -z "$bad" ] || exit 1
 [ "$1" = compile ] && { echo "mk-ath10k.sh: all compiled"; exit 0; }
-echo "mk-ath10k.sh: the glue and the object are not written yet" >&2
-exit 1
+OBJECTS=$(for f in $DRIVER; do echo obj/ath10k_$f.o; done; for f in $COMMON; do echo obj/ath_$f.o; done;
+	for f in $GLUE; do echo obj/lx_$(basename "$f" .c).o; done)
+
+# --- tie it all into one object, as tools/mk-ath11k.sh does: what it still wants is a call of the kernel's,
+# a function of a part of the driver not built yet (a stub each, that says its name and answers 0), or a mistake.
+KERNEL="memcmp memcpy memmove memset strcmp strncmp strlen strchr strrchr strlcpy strlcat bzero
+	snprintf vsnprintf __stack_chk_fail __stack_chk_guard"
+$LD -r -arch arm64 $OBJECTS -o out/all.o 2> out/ld.err || { cat out/ld.err; exit 1; }
+llvm-nm -u --format=just-symbols out/all.o | sed 's/^_//' | sort > out/undefined.txt
+: > out/stubs.txt
+: > out/stubs.s
+missing=
+for s in $(cat out/undefined.txt); do
+	case " $(echo $KERNEL) " in *" $s "*) continue ;; esac
+	case $s in
+	lx_os_*|qmi_*|hakios_qmi_*|section\$*) continue ;;
+	ath10k_*|__ath10k_*|ath_*) ;;
+	*) echo "mk-ath10k.sh: nothing defines $s" >&2; missing=1; continue ;;
+	esac
+	echo $s >> out/stubs.txt
+	printf '\t.globl _%s\n_%s:\n\tadrp x0, 1f@PAGE\n\tadd x0, x0, 1f@PAGEOFF\n\tb _lx_stub\n\t.cstring\n1:\t.asciz "%s"\n\t.text\n\t.p2align 2\n' \
+		$s $s $s >> out/stubs.s
+done
+[ -z "$missing" ] || exit 1
+$CC -c out/stubs.s -o out/stubs.o
+printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n' > out/exported.txt
+$LD -r -arch arm64 -exported_symbols_list out/exported.txt out/all.o out/stubs.o -o out/ath10k.o 2> out/ld.err ||
+	{ cat out/ld.err; exit 1; }
+rm -f out/all.o
+echo "mk-ath10k.sh: out/ath10k.o: $(llvm-size out/ath10k.o | awk 'NR == 2 { print $1 + $2 }') bytes of code and data from" \
+	"$(echo $DRIVER | wc -w) of the driver's files; $(wc -l < out/stubs.txt) functions of the others are stubs (out/stubs.txt);" \
+	"asks the kernel for $(llvm-nm -u --format=just-symbols out/ath10k.o | grep -vc 'section\$') names"
