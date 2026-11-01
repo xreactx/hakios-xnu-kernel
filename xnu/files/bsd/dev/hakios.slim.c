@@ -225,6 +225,7 @@ slim_qmi_request(const char *what, int msg_id, size_t largest, const struct qmi_
 #define SLIM_USR_MC_DEF_ACT_CHAN        0x21
 #define SLIM_USR_MC_RECONFIG_NOW        0x24
 #define SLIM_USR_MC_GENERIC_ACK         0x25
+#define SLIM_USR_MC_CONNECT_SRC         0x2c
 #define SLIM_USR_MC_CONNECT_SINK        0x2d
 #define SLIM_USR_MC_DISCONNECT_PORT     0x2e
 #define SLIM_LA_MGR                     0xff
@@ -606,6 +607,9 @@ static const struct codec_step ear_clock[] = {
 	{ 0x06c7, 0xf0, 0x00, 100 },    /* VNEG: Linux's 0x0a under the mask 0xf0 */
 	{ 0x0608, 0x80, 0x80, 500 },    /* buck (VPOS) on */
 	{ 0x060a, 0x80, 0x80, 0 },      /* ANA_EAR: the EAR PA on */
+}, clock_off[] = {
+	{ 0x0711, 0x81, 0x00, 0 },      /* the master clock off */
+	{ 0x0601, 0xc0, 0x00, 0 },      /* the bias off */
 }, ear_off[] = {
 	{ 0x060a, 0x80, 0x00, 0 },      /* the EAR PA off */
 	{ 0x0b42, 0x40, 0x00, 0 },      /* class-H off */
@@ -615,9 +619,56 @@ static const struct codec_step ear_clock[] = {
 	{ 0x0b53, 0x01, 0x00, 0 },
 	{ 0x0b41, 0x20, 0x00, 0 },
 	{ 0x0608, 0x01, 0x00, 0 },
-	{ 0x0711, 0x81, 0x00, 0 },      /* the master clock off */
-	{ 0x0601, 0xc0, 0x00, 0 },      /* the bias off */
 };
+
+/*
+ * The handset microphone, as Android's "handset-mic" path has it (mixer_paths_tavil.xml: amic4) and Linux's DAPM
+ * powers it: MIC BIAS1 (the tree's routing: AMIC4 from MIC BIAS1; qcom,cdc-micbias1-mv 2700: (2700 - 1000) / 50),
+ * ADC4 with its TX hold (wcd934x_codec_enable_adc()), AMIC4_5 SEL = AMIC4, AMIC MUX0 = ADC4, ADC MUX0 = AMIC (and
+ * the decimator's input an ADC, wcd934x_dec_enum_put()), CDC_IF TX0 MUX = DEC0, decimator 0 at 48 kHz
+ * (wcd934x_set_decimator_rate()) enabled, its high-pass at 150 Hz and its gain written again (wcd934x_codec_enable_dec()).
+ */
+static const struct codec_step mic_path[] = {
+	{ 0x0622, 0x3f, 0x22, 0 },      /* ANA_MICB1: 2.7 V */
+	{ 0x0622, 0xc0, 0x40, 1000 },   /* MIC BIAS1 on */
+	{ 0x0a31, 0x0f, 0x04, 0 },      /* CDC_TX0_TX_PATH_CTL: 48 kHz */
+	{ 0x0d3a, 0x03, 0x02, 0 },      /* CDC_IF_ROUTER_TX_MUX_CFG0: TX0 = DEC0 */
+	{ 0x0727, 0x80, 0x00, 0 },      /* TX_NEW_AMIC_4_5_SEL: AMIC4 */
+	{ 0x0d1d, 0x07, 0x04, 0 },      /* CDC_TX_INP_MUX_ADC_MUX0_CFG0: AMIC MUX0 = ADC4 */
+	{ 0x0a32, 0x80, 0x00, 0 },      /* CDC_TX0_TX_PATH_CFG0: the decimator's input an ADC */
+	{ 0x0d1e, 0x03, 0x01, 0 },      /* CDC_TX_INP_MUX_ADC_MUX0_CFG1: ADC MUX0 = AMIC */
+	{ 0x0611, 0x20, 0x20, 0 },      /* ANA_AMIC4: the TX hold */
+	{ 0x0611, 0x80, 0x80, 0 },      /* ADC4 on */
+	{ 0x0a32, 0x06, 0x00, 0 },      /* the decimator's power level: the default */
+	{ 0x0a31, 0x20, 0x20, 0 },      /* decimator 0 on */
+	{ 0x0a32, 0x60, 0x40, 0 },      /* its high-pass: 150 Hz */
+	{ 0x0a39, 0x02, 0x02, 1000 },   /* CDC_TX0_TX_PATH_SEC2: the cut-off's change asked for */
+	{ 0x0a39, 0x02, 0x00, 0 },
+	{ 0x0a34, 0x00, 0x00, 0 },      /* CDC_TX0_TX_VOL_CTL: written again */
+}, mic_off[] = {
+	{ 0x0a31, 0x20, 0x00, 0 },      /* decimator 0 off */
+	{ 0x0a31, 0x10, 0x00, 0 },
+	{ 0x0611, 0x80, 0x00, 0 },      /* ADC4 off */
+	{ 0x0622, 0xc0, 0x00, 0 },      /* MIC BIAS1 off */
+};
+
+static LCK_GRP_DECLARE(codec_lock_group, "hakios-slim");
+static LCK_MTX_DECLARE(codec_lock, &codec_lock_group);  /* the bus and the codec: the earpiece's thread, the microphone's */
+static unsigned clock_users;
+
+static bool
+codec_clock(bool on)
+{
+	bool ok = true;
+
+	if (on && clock_users++ == 0) {
+		ok = codec_steps("the master clock", ear_clock, sizeof(ear_clock) / sizeof(ear_clock[0]));
+		printf("slim: codec: the master clock %s; efuse %#x\n", ok ? "ON" : "NOT ON", codec_reg_read(0x0039));
+	} else if (!on && clock_users > 0 && --clock_users == 0) {
+		ok = codec_steps("the master clock off", clock_off, sizeof(clock_off) / sizeof(clock_off[0]));
+	}
+	return ok;
+}
 
 /* A user message to the manager (Linux's NGD rewrites the core ones so) and its GENERIC_ACK; payload ends where told. */
 static bool
@@ -691,6 +742,86 @@ ear_channel(bool on)
 	return ngd_ask_manager("reconfigure now", SLIM_USR_MC_RECONFIG_NOW, payload, 2, tid);
 }
 
+#define MIC_PORT_TX     0               /* the codec's TX0: its port 0 */
+#define MIC_CHANNEL     128             /* the machine driver's first TX channel (sdm845.c) */
+
+/* The channel from the codec's port 0 to the DSP's SLIMBUS_0_TX: as ear_channel(), the port a source. */
+static bool
+mic_channel(bool on)
+{
+	uint8_t tid, payload[8];
+
+	if (!on) {
+		tid = slim_tid++;
+		payload[0] = codec_pgd;
+		payload[1] = MIC_PORT_TX;
+		payload[2] = tid;
+		return ngd_ask_manager("port 0 disconnected", SLIM_USR_MC_DISCONNECT_PORT, payload, 3, tid);
+	}
+	if (!codec_ifd_write(0x100 + 4 * MIC_PORT_TX, 0x01) ||  /* SLIM_PGD_TX_PORT_MULTI_CHNL_0(0): TX0 */
+	    !codec_ifd_write(0x101 + 4 * MIC_PORT_TX, 0x00) ||  /* SLIM_PGD_TX_PORT_MULTI_CHNL_1(0) */
+	    !codec_ifd_write(0x50 + MIC_PORT_TX, 0x05)) {       /* SLIM_PGD_TX_PORT_CFG(0): watermark 12 bytes, enabled */
+		printf("slim: stream: the interface device's port 0: NOT SET\n");
+		return false;
+	}
+	tid = slim_tid++;
+	payload[0] = codec_pgd;
+	payload[1] = MIC_PORT_TX;
+	payload[2] = MIC_CHANNEL;
+	payload[3] = tid;
+	if (!ngd_ask_manager("port 0 a source of channel 128", SLIM_USR_MC_CONNECT_SRC, payload, 4, tid)) {
+		return false;
+	}
+	tid = slim_tid++;
+	payload[0] = codec_pgd;
+	payload[1] = 16 >> 2 | 1 << 5;
+	payload[2] = 2 << 4 | 0;
+	payload[3] = 3 | 0x80;
+	payload[4] = tid;
+	payload[5] = MIC_CHANNEL;
+	if (!ngd_ask_manager("channel 128 defined and activated", SLIM_USR_MC_DEF_ACT_CHAN, payload, 6, tid)) {
+		return false;
+	}
+	tid = slim_tid++;
+	payload[0] = tid;
+	payload[1] = codec_pgd;
+	return ngd_ask_manager("reconfigure now", SLIM_USR_MC_RECONFIG_NOW, payload, 2, tid);
+}
+
+/* hakios.mic.c, the AFE's SLIMBUS_0_TX started (on) or about to stop (off): the codec's microphone path and the channel. */
+bool
+hakios_slim_mic(bool on)
+{
+	bool ok;
+
+	if (!codec_ready) {
+		return false;
+	}
+	lck_mtx_lock(&codec_lock);
+	ngd_quiet = true;
+	if (on) {
+		ok = codec_clock(true) && codec_steps("the microphone's path", mic_path, sizeof(mic_path) / sizeof(mic_path[0]));
+		printf("slim: codec: the microphone's path %s: micb1 %#x amic4 %#x tx0 ctl %#x cfg0 %#x vol %#x, adc mux %#x %#x, if tx %#x\n",
+		    ok ? "UP" : "NOT UP", codec_reg_read(0x0622), codec_reg_read(0x0611), codec_reg_read(0x0a31), codec_reg_read(0x0a32),
+		    codec_reg_read(0x0a34), codec_reg_read(0x0d1d), codec_reg_read(0x0d1e), codec_reg_read(0x0d3a));
+		ngd_quiet = false;
+		ok = ok && mic_channel(true);
+		printf("slim: THE MICROPHONE %s\n", ok ? "FEEDS THE DSP: AMIC4 -> ADC4 -> DEC0 -> TX0 -> channel 128 -> SLIMBUS_0_TX" :
+		    "DOES NOT FEED THE DSP");
+		lck_mtx_unlock(&codec_lock);
+		return ok;
+	}
+	ngd_quiet = false;
+	ok = mic_channel(false);
+	ngd_quiet = true;
+	ok = codec_steps("the microphone off", mic_off, sizeof(mic_off) / sizeof(mic_off[0])) && ok;
+	ok = codec_clock(false) && ok;
+	ngd_quiet = false;
+	printf("slim: the microphone %s\n", ok ? "OFF" : "NOT ALL OFF");
+	lck_mtx_unlock(&codec_lock);
+	return ok;
+}
+
 /* hakios.sound.c: the codec brought up, waited for. */
 bool
 hakios_slim_codec_ready(uint32_t ms)
@@ -710,10 +841,10 @@ hakios_slim_earpiece(bool on)
 	if (!codec_ready) {
 		return false;
 	}
+	lck_mtx_lock(&codec_lock);
 	ngd_quiet = true;
 	if (on) {
-		ok = codec_steps("the master clock", ear_clock, sizeof(ear_clock) / sizeof(ear_clock[0]));
-		printf("slim: codec: the master clock %s; efuse %#x\n", ok ? "ON" : "NOT ON", codec_reg_read(0x0039));
+		ok = codec_clock(true);
 		ok = ok && codec_steps("the earpiece's path", ear_path, sizeof(ear_path) / sizeof(ear_path[0]));
 		/* (Linux's main path: the digital volume written again once the interpolator runs) */
 		ok = ok && codec_update(0x0b45, 0, 0);
@@ -723,14 +854,17 @@ hakios_slim_earpiece(bool on)
 		ngd_quiet = false;
 		ok = ok && ear_channel(true);
 		printf("slim: THE EARPIECE %s\n", ok ? "IS FED: SLIMBUS_0_RX -> channel 144 -> RX0 -> INT0 -> EAR" : "IS NOT FED");
+		lck_mtx_unlock(&codec_lock);
 		return ok;
 	}
 	ngd_quiet = false;
 	ok = ear_channel(false);
 	ngd_quiet = true;
 	ok = codec_steps("the earpiece off", ear_off, sizeof(ear_off) / sizeof(ear_off[0])) && ok;
+	ok = codec_clock(false) && ok;
 	ngd_quiet = false;
 	printf("slim: the earpiece %s\n", ok ? "OFF" : "NOT ALL OFF");
+	lck_mtx_unlock(&codec_lock);
 	return ok;
 }
 

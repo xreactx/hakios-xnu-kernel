@@ -1234,7 +1234,16 @@ va_mic_off(void)
 #define AFE_PORT_CMD_SET_PARAM_V2               0x000100efu
 #define AFE_MODULE_AUDIO_DEV_INTERFACE          0x0001020cu
 #define AFE_PARAM_ID_CODEC_DMA_CONFIG           0x000102b8u
-#define MIC_PORT                                0xb037          /* TX_CDC_DMA_TX_3 */
+#define MIC_PORT                                ((uint16_t)mic_port)    /* TX_CDC_DMA_TX_3; the 6T's SLIMBUS_0_TX */
+#define AFE_PARAM_ID_SLIMBUS_CONFIG             0x00010212u
+
+/*
+ * The OnePlus 6T's handset microphone (boot-arg mic_wcd=1): none of the above (redwood's macros, SoundWire, clocks
+ * and pins), but the WCD934x's AMIC4 over the audio SLIMbus (hakios.slim.c, which slim=3 brings up) into the AFE's
+ * SLIMBUS_0_TX, 0x4001: one channel of 16 bits at 48 kHz on the bus's channel 128 (Linux: q6afe_slim_port_prepare(),
+ * sdm845.c's channel map; Android: "handset-mic" = amic4). The DSP's stream and path are the same.
+ */
+static uint32_t mic_port = 0xb037, wcd;
 #define ADM_CMD_DEVICE_OPEN_V5                  0x00010326u
 #define ADM_CMDRSP_DEVICE_OPEN_V5               0x00010329u
 #define ADM_CMD_DEVICE_CLOSE_V5                 0x00010327u
@@ -1408,6 +1417,21 @@ dsp_port_on(void)
 	} __attribute__((packed)) config = { 1, MIC_RATE, 16, 0, 1, 1u << 1 };
 	uint16_t start[2] = { MIC_PORT, 0 };
 
+	if (wcd) {
+		struct {
+			uint32_t version;
+			uint16_t device, bits, data_format, channels;
+			uint8_t channel_map[8];
+			uint32_t rate;
+		} __attribute__((packed)) slimbus = { 1, 0, 16, 0, 1, { 128 }, MIC_RATE };
+
+		if (!afe_port_param(AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &slimbus, sizeof(slimbus),
+		    "the port SLIMBUS_0_TX (0x4001): SLIMbus device 1, 1 channel of 16 bits at 48 kHz, channel 128")) {
+			return false;
+		}
+		mic_port_on = command("the port 0x4001, started", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+		return mic_port_on;
+	}
 	if (!afe_port_param(AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_CODEC_DMA_CONFIG, &config, sizeof(config),
 	    "the port TX_CDC_DMA_TX_3 (0xb037): 1 channel of 16 bits at 48 kHz, decimator 1")) {
 		return false;
@@ -1432,7 +1456,7 @@ dsp_off(void)
 		mic_copp_open = false;
 	}
 	if (mic_port_on) {
-		(void)command("the port 0xb037, stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
+		(void)command(wcd ? "the port 0x4001, stopped" : "the port 0xb037, stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
 		mic_port_on = false;
 	}
 	if (mic_mapped) {
@@ -1583,10 +1607,10 @@ listen(bool for_ios)
 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &now);
 		elapsed_ms = now / NSEC_PER_MSEC;
 		if (!unmuted && elapsed_ms >= 200) {            /* TX_MACRO_AMIC_UNMUTE_DELAY_MS */
-			unmuted = dec1_unmute();
+			unmuted = wcd || dec1_unmute();         /* (the WCD934x's decimator is not muted: Linux's DAPM) */
 		}
 		if (!settled && elapsed_ms >= 300) {            /* TX_MACRO_AMIC_HPF_DELAY_MS */
-			settled = dec1_settled();
+			settled = wcd || dec1_settled();
 		}
 		if (tap && elapsed_ms >= 2000 && elapsed_ms < 3000) {
 			hakios_haptic_pretend(20000);
@@ -1679,6 +1703,13 @@ listen(bool for_ios)
 static void
 undo(void)
 {
+	if (wcd) {
+		if (mic_port_on) {
+			hakios_slim_mic(false);
+		}
+		dsp_off();
+		return;
+	}
 	dsp_off();
 	dec1_off();
 	va_mic_off();
@@ -1693,6 +1724,14 @@ undo(void)
 static bool
 path_up(void)
 {
+	if (wcd) {
+		/* the DSP's port started first, then the codec's path and the bus's channel (Linux: prepare, then trigger) */
+		if (!hakios_slim_codec_ready(30000)) {
+			say("mic: the codec is not brought up in 30 s (slim=3 among the boot-args?)\n");
+			return false;
+		}
+		return level < 3 || (dsp_path_on() && dsp_port_on() && hakios_slim_mic(true));
+	}
 	if (!clocks_on()) {
 		say("mic: the clocks were not all given: the blocks are not touched\n");
 		return false;
@@ -1826,6 +1865,11 @@ hakios_mic_dsp_up(void)
 	PE_parse_boot_argn("mic_main", &main_timing, sizeof(main_timing));
 	PE_parse_boot_argn("mic_test", &test_bits, sizeof(test_bits));
 	PE_parse_boot_argn("mic_tap", &tap, sizeof(tap));
+	if (PE_parse_boot_argn("mic_wcd", &wcd, sizeof(wcd)) && wcd) {
+		mic_port = 0x4001;
+		level = level < 3 ? 3 : level;
+		say("mic: mic_wcd=1: the 6T's handset microphone, AMIC4 of the WCD934x, through SLIMBUS_0_TX\n");
+	}
 	mic_secs = mic_secs < 1 ? 1 : mic_secs > 600 ? 600 : mic_secs;
 	running = true;
 	if (kernel_thread_start(mic_thread, NULL, &thread) != KERN_SUCCESS) {
