@@ -1772,8 +1772,8 @@ hakios_sound_dsp_up(void)
 		gain = HAKIOS_GUARD_MAX_GAIN;
 	}
 	hakios_guard_configure(true, gain);
-	if (level >= 2 && level <= 3 && seconds > 3) {
-		seconds = 3;            /* the test tone: three seconds at most */
+	if (level >= 2 && level <= 3 && seconds > (earpiece ? 20u : 3u)) {
+		seconds = earpiece ? 20 : 3;    /* the test tone: three seconds at most (the earpiece's, quiet as it is: twenty) */
 	}
 	running = true;
 	if (kernel_thread_start(sound_thread, NULL, &thread) != KERN_SUCCESS) {
