@@ -741,8 +741,33 @@ receive_event(struct channel *ch, const struct event *e, void *context)
 	dma_sync((vm_offset_t)buffer, length);
 	ch->bytes += length;
 	if (trace) {
-		printf("ipa: %s: slot %u: %u bytes (code %u): %02x %02x %02x %02x %02x %02x %02x %02x ...\n", ch->name, slot, length, e->code,
-		    buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7]);
+		const uint32_t *raw = (const uint32_t *)e;
+		uint32_t first = 0, whole = ch->buffer_size;
+
+		printf("ipa: %s: slot %u: %u bytes (code %u): %02x %02x %02x %02x %02x %02x %02x %02x ...; the event %08x %08x %08x %08x\n",
+		    ch->name, slot, length, e->code, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
+		    raw[0], raw[1], raw[2], raw[3]);
+		/* (the whole buffer looked through: whether what came landed elsewhere in it than its start) */
+		dma_sync((vm_offset_t)buffer, whole);
+		while (first < whole && buffer[first] == 0) {
+			first++;
+		}
+		if (first < whole) {
+			uint32_t last = whole;
+
+			while (last > first && buffer[last - 1] == 0) {
+				last--;
+			}
+			if (first > whole - 16) {
+				first = whole - 16;     /* (the sixteen bytes shown stay inside the buffer) */
+			}
+			printf("ipa: %s: slot %u: non-zero from byte %u to %u: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			    ch->name, slot, first, last, buffer[first], buffer[first + 1], buffer[first + 2], buffer[first + 3], buffer[first + 4],
+			    buffer[first + 5], buffer[first + 6], buffer[first + 7], buffer[first + 8], buffer[first + 9], buffer[first + 10],
+			    buffer[first + 11], buffer[first + 12], buffer[first + 13], buffer[first + 14], buffer[first + 15]);
+		} else {
+			printf("ipa: %s: slot %u: all %u bytes of the buffer are zero\n", ch->name, slot, whole);
+		}
 	}
 	if (ch->qmap) {
 		for (uint32_t at = 0; at + 4 <= length;) {
