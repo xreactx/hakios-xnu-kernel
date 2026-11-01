@@ -162,14 +162,14 @@ run() { # run <oem command> <label>
 				esac
 			done
 		fi
-		# XNU's boot-args hold 607 characters (BOOT_LINE_LENGTH 608), and the loader cuts the line there without
+		# XNU's boot-args hold 1023 characters (BOOT_LINE_LENGTH 1024 in this port's kernel and loader; Apple's 608), and the loader cuts the line there without
 		# a word: on 31 October that cut soc_apcs_ipc=0x1799000c in the middle, the audio DSP rang a doorbell at
 		# 0x179, and the phone reset into a crash dump four times. The loader puts up to 120 of its own in front
 		# (debug=0x8 serial=3, rd=md0, cpus=1, hv_wdt_pet=1, ufs_shared_pa=..., battery_shared_pa=...): a line that may not fit is refused.
 		local line="loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args"
-		if [ $(( ${#line} + 120 )) -gt 607 ]; then
-			echo "xl: the command line is ${#line} characters, and the loader adds up to 120: more than XNU's 607." >&2
-			echo "xl: it would lose: ${line:$(( 607 - 120 ))}" >&2
+		if [ $(( ${#line} + 120 )) -gt 1023 ]; then
+			echo "xl: the command line is ${#line} characters, and the loader adds up to 120: more than XNU's 1023." >&2
+			echo "xl: it would lose: ${line:$(( 1023 - 120 ))}" >&2
 			echo "xl: leave out what this run does not need (XL_DROP=\"NAME ...\" for devices/${DEVICE:-poco-x5-pro}/run.args)" >&2
 			return 1
 		fi

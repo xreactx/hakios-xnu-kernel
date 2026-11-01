@@ -150,7 +150,9 @@ image's 629082 blocks) to its end, 402 MiB, two slots of 201 MiB written in turn
 only after checking `system_a`'s name, both GUIDs, first and last LBA, unit and block size, and only from that
 block on, reading each write back; the kernel (`hakios.ufs.c`) keeps the same bounds and tells `var_store` the
 place (`kern.hakios.var_part`, `var_first`, `var_end`). `build.sh` refuses a 6T `system.apfs` that would reach
-the store. With `ufs=2 ufs_write=1 var_store=1` (the line must fit: `XL_DROP="battery pmi_haptics slider"`):
+the store. `ufs=2 ufs_write=1 var_store=1` are in `run.args` (every run loads the volume at boot and saves it
+at the end; the kernel's and the loader's command line is 1024 bytes now, Apple's 608 having been too small for
+the 6T's own boot-args):
 the first run saved `/private/var` (138 MB), the next put it back at boot (6411 directories, 2492 files) and
 saved into the other slot (165 MB). Flashing a new image into `system_a` leaves the store as it is. The volume
 already fills 80 % of a slot: past it a save fails and the older slot is kept.
@@ -615,9 +617,8 @@ coming back -- echoes (`cell_ping=1`, `=N` for size) and DNS queries to the sess
 and Android on this phone gets no data from the same SIM either (its APN `nxtgenphone`; `data.lycamobile.com` is
 refused), though the SIM works in another phone: an APN or network-side question, left for later. Still to do on
 our side: en1 is attached but iOS's configd never configures it (it has no IOKit object). Keep `thermal` and
-`bootcpu` in run.args for modem runs: without them the modem stays offline. A run (the line must fit XNU's 607
-characters: xl now refuses one that does not):
-607 characters: xl now refuses one that does not):
+`bootcpu` in run.args for modem runs: without them the modem stays offline. A run (the line must fit XNU's 1023
+characters: xl refuses one that does not):
 
 ```sh
 XL_DROP="soc_sound_port soc_sound_clock soc_sound_bits soc_audio_stream soc_adsp_mem soc_adsp_mem_size soc_adsp_cx soc_gpu adreno_speed battery pmi_haptics slider" \

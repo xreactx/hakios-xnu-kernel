@@ -48,7 +48,7 @@ struct boot_video {
 	uint64_t v_baseAddr, v_display, v_rowBytes, v_width, v_height, v_depth;
 };
 
-#define BOOT_LINE_LENGTH 608
+#define BOOT_LINE_LENGTH 1024         /* this port's kernel's (Apple's is 608): the 6T's own boot-args alone came near that */
 
 struct boot_args {
 	uint16_t revision;

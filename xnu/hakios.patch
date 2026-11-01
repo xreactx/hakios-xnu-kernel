@@ -3200,6 +3200,19 @@ index c84b2100bc19..aaad5cd2e8c6 100644
  #define MAX_CPU_CLUSTERS               1
  
  #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+diff --git a/pexpert/pexpert/arm64/boot.h b/pexpert/pexpert/arm64/boot.h
+index 2c2186ffbca5..0dacde2b8c47 100644
+--- a/pexpert/pexpert/arm64/boot.h
++++ b/pexpert/pexpert/arm64/boot.h
+@@ -23,7 +23,7 @@
+  * This value matches iBoot's IBOOT_MAX_ENV_VAR_DATA_SIZE.
+  * There are no iBoot headers so have to duplicate it here for now.
+  */
+-#define BOOT_LINE_LENGTH        608
++#define BOOT_LINE_LENGTH        1024            /* HakiOS: 608 in Apple's; our loader fills it (xnuloader/loader.c) */
+ 
+ /*
+  * Video information..
 diff --git a/security/mac_vfs_subr.c b/security/mac_vfs_subr.c
 index 97028c06bb92..0daad830d0c0 100644
 --- a/security/mac_vfs_subr.c
