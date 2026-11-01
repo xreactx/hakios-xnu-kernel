@@ -23,6 +23,7 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <sys/hakios.audio.h>
 #include <sys/hakios.qrtr.h>
 #define HZ                      1000
 #include <sys/hakios.qmi.h>
@@ -221,6 +222,11 @@ slim_qmi_request(const char *what, int msg_id, size_t largest, const struct qmi_
 #define SLIM_USR_MC_ADDR_REPLY          0xe
 #define SLIM_USR_MC_MASTER_CAPABILITY   0x0
 #define SLIM_USR_MC_REPORT_SATELLITE    0x1
+#define SLIM_USR_MC_DEF_ACT_CHAN        0x21
+#define SLIM_USR_MC_RECONFIG_NOW        0x24
+#define SLIM_USR_MC_GENERIC_ACK         0x25
+#define SLIM_USR_MC_CONNECT_SINK        0x2d
+#define SLIM_USR_MC_DISCONNECT_PORT     0x2e
 #define SLIM_LA_MGR                     0xff
 #define SLIM_MSG_ASM_FIRST_WORD(l, mt, mc, dt, ad) ((uint32_t)(l) | (uint32_t)(mt) << 5 | (uint32_t)(mc) << 8 | \
 	                                            (uint32_t)(dt) << 15 | (uint32_t)(ad) << 16)
@@ -230,6 +236,7 @@ slim_qmi_request(const char *what, int msg_id, size_t largest, const struct qmi_
 #define SAT_MSG_PROT                    0x1
 
 static volatile uint32_t *slim_ctrl, *slim_ngd;
+static bool ngd_quiet;          /* the codec's register traffic: only what goes wrong logged */
 
 static inline uint32_t
 ngd_rd(uint32_t offset)
@@ -263,6 +270,9 @@ ngd_receive(uint8_t *message)
 	if (length > 40) {
 		length = 40;
 	}
+	if (ngd_quiet) {
+		return length;
+	}
 	printf("slim: ngd: received %u bytes, MT %u MC %#x:", length, message[0] >> 5, message[1] & 0x7f);
 	for (unsigned i = 0; i < length; i++) {
 		printf(" %02x", message[i]);
@@ -290,6 +300,9 @@ ngd_send(const uint8_t *message, unsigned length)
 		delay_for_interval(1, NSEC_PER_MSEC);
 	}
 	ngd_wr(NGD_INT_CLR, stat & (NGD_INT_TX_MSG_SENT | NGD_INT_TX_NACKED_2 | NGD_INT_MSG_TX_INVAL));
+	if (ngd_quiet && (stat & NGD_INT_TX_MSG_SENT)) {
+		return true;
+	}
 	printf("slim: ngd: %u bytes sent: %s (int stat %#x)\n", length, (stat & NGD_INT_TX_MSG_SENT) ? "SENT" :
 	    (stat & NGD_INT_TX_NACKED_2) ? "NACKED" : (stat & NGD_INT_MSG_TX_INVAL) ? "INVALID" : "NO ANSWER", stat);
 	return (stat & NGD_INT_TX_MSG_SENT) != 0;
@@ -446,8 +459,9 @@ codec_read(uint8_t la, uint32_t element)
 }
 
 /* The codec's registers by their 16-bit addresses: the page selected when it changes, then the window. */
-static uint8_t codec_pgd;
+static uint8_t codec_pgd, codec_ifd;
 static int codec_page = -1;
+static volatile bool codec_ready;       /* brought up: the earpiece can be asked for (hakios.sound.c) */
 
 static bool
 codec_page_select(unsigned reg)
@@ -511,6 +525,215 @@ codec_bring_up(void)
 	return true;
 }
 
+/* Bits of a register changed, the rest kept. */
+static bool
+codec_update(unsigned reg, uint8_t mask, uint8_t value)
+{
+	int old = codec_reg_read(reg);
+
+	if (old < 0 || !codec_reg_write(reg, (uint8_t)(((unsigned)old & ~(unsigned)mask) | (value & mask)))) {
+		printf("slim: codec: register %#06x (mask %#x to %#x): NOT CHANGED\n", reg, mask, value);
+		return false;
+	}
+	return true;
+}
+
+/* A register of the interface device (Linux's if_regmap: windows of 0x400 at 0x800, the selector at 0x800). */
+static bool
+codec_ifd_write(unsigned reg, uint8_t value)
+{
+	return codec_write(codec_ifd, 0x800, (uint8_t)(reg / 0x400)) && codec_write(codec_ifd, 0x800 + reg % 0x400, value);
+}
+
+struct codec_step {
+	uint16_t reg;
+	uint8_t mask, value;
+	uint16_t settle_us;
+};
+
+static bool
+codec_steps(const char *what, const struct codec_step *steps, unsigned count)
+{
+	for (unsigned i = 0; i < count; i++) {
+		if (!codec_update(steps[i].reg, steps[i].mask, steps[i].value)) {
+			printf("slim: codec: %s: STOPPED at step %u\n", what, i);
+			return false;
+		}
+		if (steps[i].settle_us) {
+			delay_for_interval(steps[i].settle_us, NSEC_PER_USEC);
+		}
+	}
+	return true;
+}
+
+/*
+ * The earpiece's path in the codec, as Linux's DAPM powers it for SLIM RX0 -> RX INT0 -> EAR (sound/soc/codecs/
+ * wcd934x.c, wcd-clsh-v2.c), in that order: the master clock and analog bias (wcd934x_enable_ana_bias_and_sysclk(),
+ * the 19.2 MHz MCLK halved to the 9.6 MHz the machine driver asks for), the efuse sensed (wcd934x_comp_init()), the
+ * supplies (RX_BIAS, INT0_CLK, DSMDEM0_CLK), the muxes (INT0_1 MIX1 INP0 = RX0, DEM = CLSH_DSM_OUT with its look-ahead
+ * delay), the EAR DAC's class-H (wcd_clsh_state_ear(), CLS_H_NORMAL), and the EAR PA.
+ */
+static const struct codec_step ear_clock[] = {
+	{ 0x0003, 0x03, 0x01, 0 },      /* CODEC_RPM_CLK_MCLK_CFG: 9.6 MHz */
+	{ 0x0601, 0x80, 0x80, 0 },      /* ANA_BIAS: on */
+	{ 0x0601, 0x40, 0x40, 1000 },   /* pre-charge, 1 ms */
+	{ 0x0601, 0x40, 0x00, 0 },
+	{ 0x0601, 0x20, 0x00, 0 },
+	{ 0x0711, 0x80, 0x80, 0 },      /* CLK_SYS_MCLK_PRG: the external clock's buffer */
+	{ 0x0711, 0x30, 0x10, 0 },      /* divided by 2 */
+	{ 0x0711, 0x02, 0x00, 0 },      /* the source: the external clock */
+	{ 0x0711, 0x01, 0x01, 0 },      /* on */
+	{ 0x0d42, 0x01, 0x01, 0 },      /* CDC_CLK_RST_CTRL_FS_CNT_CONTROL */
+	{ 0x0d41, 0x01, 0x01, 0 },      /* CDC_CLK_RST_CTRL_MCLK_CONTROL */
+	{ 0x0002, 0x03, 0x00, 15 },     /* CODEC_RPM_CLK_GATE: ungated */
+	{ 0x0603, 0x80, 0x80, 110 },    /* ANA_RCO: the bandgap for SIDO */
+	{ 0x0025, 0x1e, 0x10, 0 },      /* CHIP_TIER_CTRL_EFUSE_CTL: sense state */
+	{ 0x0025, 0x01, 0x01, 5000 },   /* sensing, 5 ms */
+}, ear_path[] = {
+	{ 0x0608, 0x01, 0x01, 0 },      /* ANA_RX_SUPPLIES: RX_BIAS */
+	{ 0x0b41, 0x20, 0x20, 0 },      /* CDC_RX0_RX_PATH_CTL: INT0's clock */
+	{ 0x0b53, 0x01, 0x01, 0 },      /* CDC_RX0_RX_PATH_DSMDEM_CTL: DSMDEM0's clock */
+	{ 0x0d01, 0x0f, 0x05, 0 },      /* CDC_RX_INP_MUX_RX_INT0_CFG0: INP0 = RX0 */
+	{ 0x0b42, 0x08, 0x08, 0 },      /* CDC_RX0_RX_PATH_CFG0: the look-ahead delay (CLSH_DSM_OUT) */
+	{ 0x0b49, 0x01, 0x01, 0 },      /* CDC_RX0_RX_PATH_SEC0: DEM = CLSH_DSM_OUT */
+	{ 0x073a, 0x02, 0x00, 0 },      /* HPH_NEW_INT_HPH_TIMER1: no auto-chop while powering up */
+	{ 0x0c01, 0x01, 0x01, 0 },      /* CDC_CLSH_CRC: class-H's clock */
+	{ 0x0b42, 0x40, 0x40, 0 },      /* CDC_RX0_RX_PATH_CFG0: class-H on */
+	{ 0x0608, 0x08, 0x00, 0 },      /* ANA_RX_SUPPLIES: buck, normal power */
+	{ 0x0608, 0x04, 0x00, 0 },      /* flyback, normal power */
+	{ 0x0608, 0x40, 0x40, 600 },    /* flyback (VNEG) on */
+	{ 0x06c7, 0x0f, 0x0a, 0 },      /* RX_BIAS_FLYB_BUFF: VPOS 5 uA x 10 */
+	{ 0x06c7, 0xf0, 0x00, 100 },    /* VNEG: Linux's 0x0a under the mask 0xf0 */
+	{ 0x0608, 0x80, 0x80, 500 },    /* buck (VPOS) on */
+	{ 0x060a, 0x80, 0x80, 0 },      /* ANA_EAR: the EAR PA on */
+}, ear_off[] = {
+	{ 0x060a, 0x80, 0x00, 0 },      /* the EAR PA off */
+	{ 0x0b42, 0x40, 0x00, 0 },      /* class-H off */
+	{ 0x0c01, 0x01, 0x00, 0 },
+	{ 0x0608, 0x80, 0x00, 500 },    /* buck off */
+	{ 0x0608, 0x40, 0x00, 600 },    /* flyback off */
+	{ 0x0b53, 0x01, 0x00, 0 },
+	{ 0x0b41, 0x20, 0x00, 0 },
+	{ 0x0608, 0x01, 0x00, 0 },
+	{ 0x0711, 0x81, 0x00, 0 },      /* the master clock off */
+	{ 0x0601, 0xc0, 0x00, 0 },      /* the bias off */
+};
+
+/* A user message to the manager (Linux's NGD rewrites the core ones so) and its GENERIC_ACK; payload ends where told. */
+static bool
+ngd_ask_manager(const char *what, uint8_t mc, uint8_t *payload, unsigned length, uint8_t tid)
+{
+	uint8_t message[40], reply[40];
+	uint32_t first = SLIM_MSG_ASM_FIRST_WORD(3 + length, SLIM_MSG_MT_DEST_REFERRED_USER, mc, 0, SLIM_LA_MGR);
+	unsigned got;
+
+	message[0] = (uint8_t)first;
+	message[1] = (uint8_t)(first >> 8);
+	message[2] = (uint8_t)(first >> 16);
+	memcpy(message + 3, payload, length);
+	got = ngd_transact(message, 3 + length, SLIM_MSG_MT_SRC_REFERRED_USER, SLIM_USR_MC_GENERIC_ACK, tid, reply);
+	printf("slim: stream: %s: %s", what, got ? "ACKNOWLEDGED (" : "NO ACKNOWLEDGEMENT\n");
+	for (unsigned i = 4; got && i < got; i++) {
+		printf("%s%02x", i == 4 ? "" : " ", reply[i]);
+	}
+	printf(got ? ")\n" : "");
+	return got != 0;
+}
+
+#define EAR_PORT        16              /* the codec's RX0: its port 16 (WCD934X_RX_START + 0) */
+#define EAR_CHANNEL     144             /* the machine driver's first RX channel (sdm845.c) */
+
+/*
+ * The channel from the DSP's SLIMBUS_0_RX to the codec's port 16 (Linux: the codec's hw_params and trigger,
+ * slim_stream_prepare() and qcom_slim_ngd_enable_stream()): the port's slot in the interface device, then the
+ * manager asked to connect it as a sink of channel 144 and to define and activate that channel -- 16 bits (4
+ * slots), 48 kHz as 3 x 2^2 of the 4 kHz superframe rate (coefficient 3, exponent 2), isochronous, fixed --
+ * and to reconfigure now.
+ */
+static bool
+ear_channel(bool on)
+{
+	uint8_t tid, payload[8];
+
+	if (!on) {
+		tid = slim_tid++;
+		payload[0] = codec_pgd;
+		payload[1] = EAR_PORT;
+		payload[2] = tid;
+		return ngd_ask_manager("port 16 disconnected", SLIM_USR_MC_DISCONNECT_PORT, payload, 3, tid);
+	}
+	if (!codec_ifd_write(0x140 + 4 * EAR_PORT, 0x01) ||   /* SLIM_PGD_RX_PORT_MULTI_CHNL_0(16): RX0 */
+	    !codec_ifd_write(0x30 + EAR_PORT, 0x05)) {         /* SLIM_PGD_RX_PORT_CFG(16): watermark 12 bytes, enabled */
+		printf("slim: stream: the interface device's port 16: NOT SET\n");
+		return false;
+	}
+	tid = slim_tid++;
+	payload[0] = codec_pgd;
+	payload[1] = EAR_PORT;
+	payload[2] = EAR_CHANNEL;
+	payload[3] = tid;
+	if (!ngd_ask_manager("port 16 a sink of channel 144", SLIM_USR_MC_CONNECT_SINK, payload, 4, tid)) {
+		return false;
+	}
+	tid = slim_tid++;
+	payload[0] = codec_pgd;
+	payload[1] = 16 >> 2 | 1 << 5;          /* 16 bits; coefficient 3 */
+	payload[2] = 2 << 4 | 0;                /* exponent 2; isochronous */
+	payload[3] = 3 | 0x80;                  /* 48 kHz (presence rate 3); fixed content */
+	payload[4] = tid;
+	payload[5] = EAR_CHANNEL;
+	if (!ngd_ask_manager("channel 144 defined and activated", SLIM_USR_MC_DEF_ACT_CHAN, payload, 6, tid)) {
+		return false;
+	}
+	tid = slim_tid++;
+	payload[0] = tid;
+	payload[1] = codec_pgd;
+	return ngd_ask_manager("reconfigure now", SLIM_USR_MC_RECONFIG_NOW, payload, 2, tid);
+}
+
+/* hakios.sound.c: the codec brought up, waited for. */
+bool
+hakios_slim_codec_ready(uint32_t ms)
+{
+	for (uint32_t i = 0; i < ms / 10 && !codec_ready; i++) {
+		delay_for_interval(10, NSEC_PER_MSEC);
+	}
+	return codec_ready;
+}
+
+/* hakios.sound.c, the AFE's SLIMBUS_0_RX started (on) or about to stop (off): the codec's path and the channel. */
+bool
+hakios_slim_earpiece(bool on)
+{
+	bool ok;
+
+	if (!codec_ready) {
+		return false;
+	}
+	ngd_quiet = true;
+	if (on) {
+		ok = codec_steps("the master clock", ear_clock, sizeof(ear_clock) / sizeof(ear_clock[0]));
+		printf("slim: codec: the master clock %s; efuse %#x\n", ok ? "ON" : "NOT ON", codec_reg_read(0x0039));
+		ok = ok && codec_steps("the earpiece's path", ear_path, sizeof(ear_path) / sizeof(ear_path[0]));
+		/* (Linux's main path: the digital volume written again once the interpolator runs) */
+		ok = ok && codec_update(0x0b45, 0, 0);
+		printf("slim: codec: the earpiece's path %s: rx0 ctl %#x cfg0 %#x vol %#x sec0 %#x, supplies %#x, ear %#x, int0 mux %#x\n",
+		    ok ? "UP" : "NOT UP", codec_reg_read(0x0b41), codec_reg_read(0x0b42), codec_reg_read(0x0b45), codec_reg_read(0x0b49),
+		    codec_reg_read(0x0608), codec_reg_read(0x060a), codec_reg_read(0x0d01));
+		ngd_quiet = false;
+		ok = ok && ear_channel(true);
+		printf("slim: THE EARPIECE %s\n", ok ? "IS FED: SLIMBUS_0_RX -> channel 144 -> RX0 -> INT0 -> EAR" : "IS NOT FED");
+		return ok;
+	}
+	ngd_quiet = false;
+	ok = ear_channel(false);
+	ngd_quiet = true;
+	ok = codec_steps("the earpiece off", ear_off, sizeof(ear_off) / sizeof(ear_off[0])) && ok;
+	ngd_quiet = false;
+	printf("slim: the earpiece %s\n", ok ? "OFF" : "NOT ALL OFF");
+	return ok;
+}
+
 /*
  * The codec's registers (Linux: drivers/mfd/wcd934x.c, its regmap over SLIMbus): 16-bit addresses through a window
  * -- the page (address >> 8) into the selector at value element 0x800, the register at 0x800 + its low byte. Its
@@ -523,7 +746,7 @@ codec_talk(void)
 	uint8_t pgd = codec_laddr(pgd_ea, "codec's generic device"), id[4];
 	int value;
 
-	codec_laddr(ifd_ea, "codec's interface");
+	codec_ifd = codec_laddr(ifd_ea, "codec's interface");
 	if (pgd == 0) {
 		return;
 	}
@@ -542,7 +765,7 @@ codec_talk(void)
 	    id[0] | id[1] << 8, id[0], id[1], id[2], id[3]);
 	codec_pgd = pgd;
 	codec_page = 0;
-	codec_bring_up();
+	codec_ready = codec_bring_up() && codec_ifd != 0;
 }
 
 static void

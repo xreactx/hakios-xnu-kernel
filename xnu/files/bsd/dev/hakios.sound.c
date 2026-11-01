@@ -415,6 +415,22 @@ command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const
 static uint32_t port = PORT, clock_id = CLOCK_PRI_TDM_IBIT, port_bits = PORT_BITS;
 static bool mi2s;
 
+/*
+ * The OnePlus 6T's earpiece (boot-arg sound_earpiece=N, over sound and soc_sound_port): SLIMBUS_0_RX, 0x4000, to
+ * the WCD934x codec (hakios.slim.c, which slim=3 brings up): one channel of 16 bits at 48 kHz on the bus's channel
+ * 144, no pins and no clock of ours (Linux: q6afe_slim_port_prepare(), sdm845.c's channel map).
+ */
+#define AFE_PARAM_ID_SLIMBUS_CONFIG     0x00010212u
+#define SLIMBUS_0_RX                    0x4000
+static bool earpiece;
+
+struct afe_slimbus {
+	uint32_t version;
+	uint16_t device, bits, data_format, channels;
+	uint8_t channel_map[8];
+	uint32_t rate;
+} __attribute__((packed));
+
 struct afe_i2s {
 	uint32_t version;
 	uint16_t bits, lines, stereo, ws_source;
@@ -523,6 +539,18 @@ afe_on(void)
 		                            .offsets = { 0, 4, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff } };
 	uint16_t start[2] = { (uint16_t)port, 0 };
 
+	if (earpiece) {
+		struct afe_slimbus slimbus = { .version = 1, .device = 0, .bits = 16, .data_format = 0, .channels = 1,
+			                       .channel_map = { 144 }, .rate = RATE };
+
+		announce("the DSP is asked for SLIMBUS_0_RX: one channel of 16 bits at 48 kHz on the bus's channel 144, and its start (AFE)");
+		if (!afe_port_param("the port 0x4000: SLIMbus device 1, 1 channel of 16 bits at 48 kHz, channel 144",
+		    AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &slimbus, sizeof(slimbus))) {
+			return false;
+		}
+		port_on = command("the port 0x4000, started", APR_SVC_AFE, 0, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+		return port_on;
+	}
 	if (mi2s) {
 		struct afe_i2s i2s = { .version = 1, .bits = (uint16_t)port_bits, .lines = I2S_SD1, .stereo = I2S_STEREO,
 			               .ws_source = I2S_WS_INTERNAL, .rate = RATE, .data_format = 0 };
@@ -905,6 +933,7 @@ hakios_audio_dsp_memory_put(void)
 #define WRITE_TOKEN                             0x80000000u     /* | the period: what a write's "done" carries back */
 #define PCM_CHANNEL_FL                          1
 #define PCM_CHANNEL_FR                          2
+#define PCM_CHANNEL_FC                          3
 
 static volatile bool stopping;          /* the run is ending: whatever plays stops */
 static bool mapped, copp_open, stream_open;
@@ -977,6 +1006,17 @@ stream_on(void)
 	} __attribute__((packed)) format = { 20, 2, 16, RATE, 1, 0, { PCM_CHANNEL_FL, PCM_CHANNEL_FR } };
 	uint32_t run[3] = { 0, 0, 0 };
 	struct hakios_apr_answer answer;
+	char what[100];
+
+	if (earpiece) {
+		/* one channel of 16 bits, the port's own (Linux's q6adm for a mono back end: the front centre) */
+		open.channels = 1;
+		open.bits = 16;
+		open.map[0] = PCM_CHANNEL_FC;
+		open.map[1] = 0;
+	}
+	snprintf(what, sizeof(what), "a device path to the port: playback, no processing, %u channel%s of %u bits at 48 kHz",
+	    open.channels, open.channels == 1 ? "" : "s", open.bits);
 
 	announce("the DSP is given our periods (ASM), a device path to the port (ADM) and a stream routed to it (ASM)");
 	if (!command("our periods, mapped for the DSP", APR_SVC_ASM, 0, ASM_CMD_SHARED_MEM_MAP_REGIONS, &map, sizeof(map),
@@ -986,7 +1026,7 @@ stream_on(void)
 	mapped = true;
 	map_handle = answer.words[0];
 	say("sound: our %u KB at %#llx are the DSP's handle %#x\n", BUFFER_BYTES / 1024, buffer_address, map_handle);
-	if (!command("a device path to the port: playback, no processing, 2 channels of 24 bits at 48 kHz", APR_SVC_ADM, (uint16_t)port,
+	if (!command(what, APR_SVC_ADM, (uint16_t)port,
 	    ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), ADM_CMDRSP_DEVICE_OPEN_V5, &answer)) {
 		return false;
 	}
@@ -1144,7 +1184,7 @@ play(uint32_t ms, bool amplifiers)
 
 		say("sound: %u periods written, %u given back (%u with an error), %u underflows, in %llu ms: the DSP took %llu frames a "
 		    "second%s\n", sent, done, write_errors, underflows, us / 1000, us ? frames * 1000000 / us : 0,
-		    amplifiers ? "" : level >= 3 && mi2s ? " (through the 6T's amplifier)" : " (the amplifiers off: nothing to hear)");
+		    amplifiers ? "" : level >= 3 && mi2s ? " (through the 6T's amplifier)" : level >= 3 && earpiece ? " (through the earpiece)" : " (the amplifiers off: nothing to hear)");
 		if (amplifiers) {
 			say("sound: the amplifiers' status looked at %u times while it played\n", healthy_looks);
 		}
@@ -1552,7 +1592,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		if (!hakios_tfa9894_prepare()) {
 			goto out;
 		}
-	} else if (level >= 3) {
+	} else if (level >= 3 && !earpiece) {
 		acf = hakios_adsp_fw_file("aw882xx_acf.bin", &acf_size);
 		if (acf == NULL) {
 			say("sound: no /fw/aw882xx_acf.bin: put the phone's /vendor/etc/aw882xx_acf.bin into fw-audio/ and run SYSTEM=1 "
@@ -1570,22 +1610,48 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		ok = false;
 		hakios_adsp_apr_events(events);
 	}
-	announce("the interface's pins to it, as Android's active state has them");
-	pins_on();
-	if (!afe_on()) {
-		goto out;
+	if (earpiece) {
+		/* (the bus is the DSP's: no pins, no clock of ours; the codec is brought up by hakios.slim.c) */
+		if (!hakios_slim_codec_ready(30000)) {
+			say("sound: the codec is not brought up in 30 s (slim=3 among the boot-args?)\n");
+			goto out;
+		}
+		if (!afe_on()) {
+			goto out;
+		}
+	} else {
+		announce("the interface's pins to it, as Android's active state has them");
+		pins_on();
+		if (!afe_on()) {
+			goto out;
+		}
+		sleep_ms(20);
+		pin_activity(0, &changes, &ones);
+		pin_activity(1, &sync_changes, &sync_ones);
+		say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE BIT CLOCK AND FRAME SYNC RUN at the pins" :
+		    "THE PINS DO NOT SHOW A RUNNING BIT CLOCK");
 	}
-	sleep_ms(20);
-	pin_activity(0, &changes, &ones);
-	pin_activity(1, &sync_changes, &sync_ones);
-	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE BIT CLOCK AND FRAME SYNC RUN at the pins" :
-	    "THE PINS DO NOT SHOW A RUNNING BIT CLOCK");
 	if (level == 1) {
 		sleep_ms(seconds * 1000);
 		ok = true;
 		goto out;
 	}
 	if (!stream_on()) {
+		goto out;
+	}
+	if (earpiece && level >= 3) {
+		/* the port runs (the stream as well): the codec's path and the bus's channel to it */
+		announce("the codec's earpiece path and the SLIMbus channel to it");
+		if (!hakios_slim_earpiece(true)) {
+			hakios_slim_earpiece(false);
+			goto out;
+		}
+		say("sound: THE TONE PLAYS NOW for %u s: 1 kHz at -20 dBFS, through the 6T's earpiece\n", seconds);
+		say_when("the tone begins");
+		ok = play(seconds * 1000, false);
+		say_when("the tone has ended");
+		hakios_slim_earpiece(false);
+		space_faults();
 		goto out;
 	}
 	if (level == 4) {
@@ -1679,6 +1745,17 @@ hakios_sound_dsp_up(void)
 	PE_parse_boot_argn("soc_sound_clock", &clock_id, sizeof(clock_id));
 	PE_parse_boot_argn("soc_sound_bits", &port_bits, sizeof(port_bits));
 	PE_parse_boot_argn("soc_audio_stream", &audio_stream, sizeof(audio_stream));
+	{
+		uint32_t ear = 0;
+
+		if (PE_parse_boot_argn("sound_earpiece", &ear, sizeof(ear)) && ear != 0) {
+			earpiece = true;
+			port = SLIMBUS_0_RX;
+			port_bits = 16;
+			level = ear > 3 ? 3 : ear;      /* (what iOS plays, there, is for later) */
+			say("sound: sound_earpiece=%u: the earpiece, through SLIMBUS_0_RX and the WCD934x, at level %u\n", ear, level);
+		}
+	}
 	mi2s = port >= 0x1000 && port <= 0x10ff;
 	if (mi2s) {
 		pins = quat_mi2s_pins;          /* (the only MI2S port there is so far: the OnePlus 6T's speaker) */
