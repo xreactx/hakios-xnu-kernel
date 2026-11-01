@@ -17,6 +17,7 @@
  * The interface gets a /24 around its address with the router at its .1 (or .2): any router will
  * do, since every packet goes to the modem anyway.
  */
+#include <kern/clock.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -28,6 +29,30 @@
 
 #define CELL_UNIT               1
 #define CELL_MUX                1               /* the QMAP mux id the session is bound to (WDS Bind Mux Data Port) */
+
+/*
+ * Every line goes to the loader's log directly as well (as hakios.buttons.c's): the kernel's own messages
+ * reach that log only at the end of a run, from a message buffer whose start later lines overwrite.
+ */
+extern void loader_log_putc(char c);
+
+static int say(const char *format, ...) __printflike(1, 2);
+
+static int
+say(const char *format, ...)
+{
+	char line[400];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	return printf("%s", line);
+}
+#define printf say
 
 static const uint8_t cell_mac[6] = { 0x02, 0x68, 0x61, 0x6b, 0x69, 0x01 };      /* locally administered: "haki", 1 */
 static const uint8_t router_mac[6] = { 0x02, 0x68, 0x61, 0x6b, 0x69, 0xfe };
@@ -257,6 +282,86 @@ cell_transmit(mbuf_t packet, size_t length)
 	return ok;
 }
 
+/*
+ * cell_ping=1: the data path tried without iOS -- once the session is up, ten ICMP echoes from the session's
+ * address to 8.8.8.8 (cell_ping_to=0xAABBCCDD: elsewhere), two seconds apart, straight onto the IPA from the
+ * interface's thread, and each answer logged with its round trip. An answer is the IPA and the modem
+ * carrying a packet both ways; none, with "sent" lines, is the way out or back failing; no "sent" line at
+ * all, the interface (and with it its thread) not attached.
+ */
+#define PING_COUNT              10
+#define PING_ID                 0x4861                  /* "Ha" */
+static uint32_t ping_wanted, ping_to = 0x08080808, ping_sent, ping_answered;
+static uint64_t ping_next, ping_at[PING_COUNT];
+
+static uint64_t
+cell_now_us(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000;
+}
+
+static uint16_t
+ip_checksum(const uint8_t *p, size_t length)
+{
+	uint32_t sum = 0;
+
+	for (size_t i = 0; i + 1 < length; i += 2) {
+		sum += (uint32_t)p[i] << 8 | p[i + 1];
+	}
+	if (length & 1) {
+		sum += (uint32_t)p[length - 1] << 8;
+	}
+	while (sum >> 16) {
+		sum = (sum & 0xffff) + (sum >> 16);
+	}
+	return (uint16_t)~sum;
+}
+
+/* From the interface's thread: the next echo, if one is due. */
+static void
+ping_advance(void)
+{
+	uint8_t packet[20 + 8 + 32];
+	uint64_t now;
+	uint32_t from;
+
+	if (ping_wanted == 0 || ping_sent >= PING_COUNT) {
+		return;
+	}
+	lck_mtx_lock(&cell_lock);
+	from = session.up ? session.address : 0;
+	lck_mtx_unlock(&cell_lock);
+	now = cell_now_us();
+	if (from == 0 || now < ping_next) {
+		return;
+	}
+	ping_next = now + 2000000;
+	bzero(packet, sizeof(packet));
+	packet[0] = 0x45;                               /* IPv4, 20 bytes of header */
+	put16(packet + 2, sizeof(packet));
+	put16(packet + 4, (uint32_t)ping_sent + 1);     /* identification */
+	packet[8] = 64;                                 /* TTL */
+	packet[9] = 1;                                  /* ICMP */
+	put32(packet + 12, from);
+	put32(packet + 16, ping_to);
+	put16(packet + 10, ip_checksum(packet, 20));
+	packet[20] = 8;                                 /* echo request */
+	put16(packet + 24, PING_ID);
+	put16(packet + 26, ping_sent);
+	for (unsigned i = 0; i < 32; i++) {
+		packet[28 + i] = (uint8_t)('a' + i % 26);
+	}
+	put16(packet + 22, ip_checksum(packet + 20, 8 + 32));
+	ping_at[ping_sent] = now;
+	printf("cell: ping %u: %u.%u.%u.%u -> %u.%u.%u.%u, %zu bytes onto the IPA: %s\n", ping_sent, from >> 24, (from >> 16) & 0xff,
+	    (from >> 8) & 0xff, from & 0xff, ping_to >> 24, (ping_to >> 16) & 0xff, (ping_to >> 8) & 0xff, ping_to & 0xff, sizeof(packet),
+	    hakios_ipa_transmit(CELL_MUX, packet, sizeof(packet)) ? "sent" : "NOT TAKEN");
+	ping_sent++;
+}
+
 /* A packet from the modem: an Ethernet frame from the router made around it. */
 static void
 cell_receive(uint8_t mux, const uint8_t *packet, size_t length)
@@ -271,6 +376,14 @@ cell_receive(uint8_t mux, const uint8_t *packet, size_t length)
 	if (cell_trace) {
 		printf("cell: %zu bytes from the modem on mux %u (IPv%u)\n", length, mux, version);
 	}
+	if (ping_wanted != 0 && version == 4 && length >= 28 && packet[9] == 1 && packet[20] == 0 && (packet[24] << 8 | packet[25]) == PING_ID) {
+		uint32_t n = (uint32_t)(packet[26] << 8 | packet[27]), from = get32(packet + 12);
+
+		ping_answered++;
+		printf("cell: PING %u ANSWERED by %u.%u.%u.%u after %llu ms (TTL %u): THE DATA PATH CARRIES PACKETS BOTH WAYS (%u of %u answered)\n",
+		    n, from >> 24, (from >> 16) & 0xff, (from >> 8) & 0xff, from & 0xff, n < PING_COUNT ? (cell_now_us() - ping_at[n]) / 1000 : 0,
+		    packet[8], ping_answered, ping_sent);
+	}
 	memcpy(frame, cell_mac, 6);
 	memcpy(frame + 6, router_mac, 6);
 	put16(frame + 12, version == 4 ? 0x0800 : 0x86dd);
@@ -284,6 +397,8 @@ cell_poll(void)
 {
 	static unsigned ticks;
 	unsigned got = hakios_ipa_poll(cell_receive);
+
+	ping_advance();
 
 	if (++ticks % 30000 == 0 && (cell_count.to_modem != 0 || cell_count.from_modem != 0 || cell_count.dropped_out != 0)) {
 		char line[256];
@@ -351,7 +466,11 @@ hakios_cell_attach(void)
 	}
 	PE_parse_boot_argn("modem_ipa_data_trace", &t, sizeof(t));
 	cell_trace = t != 0;
+	PE_parse_boot_argn("cell_ping", &ping_wanted, sizeof(ping_wanted));
+	PE_parse_boot_argn("cell_ping_to", &ping_to, sizeof(ping_to));
 	cell_attached = hakios_net_attach(&cell_link);
+	printf("cell: en%u %s on the IPA's data path%s\n", CELL_UNIT, cell_attached ? "IS ATTACHED" : "IS NOT ATTACHED",
+	    ping_wanted != 0 ? "; pings once the session is up (cell_ping)" : "");
 	if (cell_attached && session.up) {
 		hakios_net_link_state_unit(CELL_UNIT, true);
 	}
