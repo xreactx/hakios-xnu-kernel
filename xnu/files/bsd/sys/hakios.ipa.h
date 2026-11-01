@@ -56,5 +56,10 @@ void hakios_cell_session(bool up, uint32_t address, uint32_t mask, uint32_t gate
 /* Make en1 on the IPA's data path once hakios_ipa_data_setup() has succeeded. */
 void hakios_cell_attach(void);
 
+/* ---- hakios.mpss.c, for the interface's tests ---- */
+
+/* Ask the modem for the data session's packet counts (QMI WDS); the answer goes to the log. */
+void hakios_wds_stats(void);
+
 #endif /* KERNEL */
 #endif /* _SYS_HAKIOS_IPA_H_ */

@@ -338,6 +338,7 @@ ping_advance(void)
 			ping_sent++;
 			printf("cell: pings done: %u of %u answered\n", ping_answered, PING_COUNT);
 			hakios_ipa_dump("after the pings");
+			hakios_wds_stats();
 		}
 		return;
 	}
@@ -370,6 +371,9 @@ ping_advance(void)
 	    (from >> 8) & 0xff, from & 0xff, ping_to >> 24, (ping_to >> 16) & 0xff, (ping_to >> 8) & 0xff, ping_to & 0xff, (size_t)total,
 	    hakios_ipa_transmit(CELL_MUX, packet, total) ? "sent" : "NOT TAKEN");
 	ping_sent++;
+	if (ping_sent == PING_COUNT / 2) {
+		hakios_wds_stats();     /* (the modem's own counts half-way: whether our echoes reach the network) */
+	}
 }
 
 /* A packet from the modem: an Ethernet frame from the router made around it. */

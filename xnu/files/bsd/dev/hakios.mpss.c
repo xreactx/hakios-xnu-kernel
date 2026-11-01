@@ -6371,6 +6371,7 @@ static bool keep;                       /* (defined below: the DSP and the link 
 #define WDS_GET_CURRENT_SETTINGS 0x002d
 #define WDS_BIND_MUX_DATA_PORT  0x00a2
 #define WDS_SET_IP_FAMILY       0x004d
+#define WDS_GET_PACKET_STATISTICS 0x0024
 #define QMI_WDA                 0x1a
 #define WDA_SET_DATA_FORMAT     0x0020
 #define QMI_DPM                 0x2f            /* Data Port Mapper */
@@ -6541,6 +6542,21 @@ ip4_string(char *to, size_t size, uint32_t address)
 	snprintf(to, size, "%u.%u.%u.%u", address >> 24, (address >> 16) & 0xff, (address >> 8) & 0xff, address & 0xff);
 }
 
+/* The modem's packet counts of the data session, asked for (the answer logged by wds_receive()); from any thread. */
+void
+hakios_wds_stats(void)
+{
+	/* TLV 0x01, what to count: sent, received, their errors and overflows, bytes both ways, drops both ways */
+	uint8_t request[7 + 7] = { 0, 0x47, 0, WDS_GET_PACKET_STATISTICS & 0xff, WDS_GET_PACKET_STATISTICS >> 8, 7, 0, 0x01, 4, 0, 0xff,
+		0x03, 0, 0 };
+
+	if (wds_port == NULL || wds_port_number == 0) {
+		printf("mpss: wds: no WDS client to ask for the packet counts\n");
+		return;
+	}
+	qrtr_send(wds_port, wds_node, wds_port_number, request, sizeof(request));
+}
+
 static void
 wds_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
 {
@@ -6594,6 +6610,33 @@ wds_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 		}
 		wds_last_try = now_us();        /* give the session a moment after the bind */
 		wds_advance();
+	} else if (m[0] == 2 && message == WDS_GET_PACKET_STATISTICS) {
+		/* the session's packets as the modem counts them: what it sent to the network, got from it, and dropped */
+		static const struct {
+			uint8_t type;
+			const char *name;
+		} counts[] = {
+			{ 0x10, "sent" }, { 0x11, "received" }, { 0x12, "send errors" }, { 0x13, "receive errors" },
+			{ 0x14, "send overflows" }, { 0x15, "receive overflows" }, { 0x1d, "send drops" }, { 0x1e, "receive drops" },
+		};
+		char line[300];
+		size_t used = 0;
+
+		for (unsigned i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+			if ((v = qmi_tlv(m, length, counts[i].type, &size)) != NULL && size >= 4) {
+				used += (size_t)snprintf(line + used, sizeof(line) - used, "%s %u, ", counts[i].name,
+				    (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24));
+			}
+		}
+		if ((v = qmi_tlv(m, length, 0x19, &size)) != NULL && size >= 8) {
+			used += (size_t)snprintf(line + used, sizeof(line) - used, "bytes sent %u, ", (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24));
+		}
+		if ((v = qmi_tlv(m, length, 0x1a, &size)) != NULL && size >= 8) {
+			used += (size_t)snprintf(line + used, sizeof(line) - used, "bytes received %u, ", (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24));
+		}
+		v = qmi_tlv(m, length, 2, &size);
+		tell("mpss: wds: THE MODEM'S PACKET COUNTS for the session: %s(result %u, error %u)\n", used ? line : "none given ",
+		    v != NULL && size >= 4 ? (uint32_t)(v[0] | v[1] << 8) : ~0u, v != NULL && size >= 4 ? (uint32_t)(v[2] | v[3] << 8) : ~0u);
 	} else if (m[0] == 2 && message == WDS_SET_IP_FAMILY) {
 		uint32_t result = ~0u, error = ~0u;
 
