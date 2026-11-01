@@ -35,6 +35,7 @@
 #include <sys/systm.h>
 
 extern void HakiosWLANStart(const char *interface, const uint8_t *address);  /* iokit/Kernel/hakios.wlan.cpp */
+extern void HakiosEthernetStart(const char *interface, const uint8_t *address);  /* the same file: not a radio */
 
 static LCK_GRP_DECLARE(net_lck_grp, "hakios-net");
 
@@ -412,6 +413,8 @@ hakios_net_attach(const struct hakios_net_link *link)
 	} else {
 		printf("net: en%u attached on %s, address %02x:%02x:%02x:%02x:%02x:%02x, link %s\n", unit, link->name, address[0],
 		    address[1], address[2], address[3], address[4], address[5], n->up ? "up" : "down");
+		/* (and in the registry, as an Ethernet interface: what configd lists, gives a service and asks DHCP for) */
+		HakiosEthernetStart(uniqueid + 7, address);
 	}
 	if (kernel_thread_start(net_thread, n, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
