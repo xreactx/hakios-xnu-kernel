@@ -468,6 +468,7 @@ lx_start(void)
 		return (ENXIO);
 	}
 	radio.dev.of_node = &node;
+	radio.dev.dma_priv = &radio;		/* (LinuxKPI's dma_set_mask() wants one; lx_base.c's DMA needs none) */
 	radio.dev.kobj.name = "wifi";
 	lx_tell("lx: ath10k's snoc driver probes the radio (%s, registers %#llx, interrupts SPI 414..425, MSA %#llx)\n", compatible,
 	    RADIO_REGISTERS, RADIO_MSA);
