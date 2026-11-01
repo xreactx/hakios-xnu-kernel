@@ -915,6 +915,39 @@ hakios_ipa_dump(const char *why)
 	}
 	lck_mtx_unlock(&ipa_lock);
 	gsi_error(why);
+	if (v35) {
+		/*
+		 * IPA 3.5.1: what the modem has written into the local memory ("ipa-shared", the registers' base + 0x7000),
+		 * read only -- the headers (0x688, 0x140 bytes; Android's modem routes its downlink to endpoint 10 with the
+		 * header at offset 56 there), the IPv4 route tables (0x488 hashed, 0x508 not: an 8-byte entry each, the first
+		 * 8 the modem's), and the start of the modem's own region (0xbd8)
+		 */
+		static vm_offset_t local;
+		static const struct {
+			const char *name;
+			uint32_t offset, size;
+		} parts[] = {
+			{ "headers", 0x688, 0x140 }, { "IPv4 routes (hashed)", 0x488, 0x78 }, { "IPv4 routes", 0x508, 0x78 },
+			{ "the modem's region", 0xbd8, 0x200 },
+		};
+
+		if (local == 0) {
+			local = ml_io_map(ipa_regs_phys + 0x7000, 0x2000);
+		}
+		for (unsigned i = 0; local != 0 && i < sizeof(parts) / sizeof(parts[0]); i++) {
+			for (uint32_t at = parts[i].offset; at < parts[i].offset + parts[i].size; at += 32) {
+				uint32_t w[8];
+
+				for (unsigned k = 0; k < 8; k++) {
+					w[k] = *(volatile uint32_t *)(local + mem_offset + at + 4 * k);
+				}
+				if ((w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) != 0) {
+					printf("ipa: %s: %s +%#x (%#x): %08x %08x %08x %08x %08x %08x %08x %08x\n", why, parts[i].name,
+					    at - parts[i].offset, at, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+				}
+			}
+		}
+	}
 }
 
 /* ---- setting up ---------------------------------------------------------------------------------- */
