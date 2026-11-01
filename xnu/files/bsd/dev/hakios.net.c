@@ -36,6 +36,7 @@
 
 extern void HakiosWLANStart(const char *interface, const uint8_t *address);  /* iokit/Kernel/hakios.wlan.cpp */
 extern void HakiosEthernetStart(const char *interface, const uint8_t *address);  /* the same file: not a radio */
+extern void hakios_cell_fake(void);             /* bsd/dev/hakios.cell.c: cell_fake=1 */
 
 static LCK_GRP_DECLARE(net_lck_grp, "hakios-net");
 
@@ -428,4 +429,5 @@ hakios_net_init(void)
 	PE_parse_boot_argn("net_trace", &net_trace, sizeof(net_trace));
 	PE_parse_boot_argn("net_names", &net_names, sizeof(net_names));
 	hakios_virtio_net_init();
+	hakios_cell_fake();
 }
