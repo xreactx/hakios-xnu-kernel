@@ -584,6 +584,26 @@ built `ADSP=1 REST=1 userland/build.sh` (the DSP's firmware and the amplifier's 
 says so and the rest of the system starts as before). A plain run (234407) brings the DSP up at 30 s and the sound's
 path after it. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
 
+**10b. The WCD934x: earpiece and handset microphone** (1 November 2026). `hakios.slim.c`, with `slim=N`:
+
+- `slim=1`: the DSP's SLIMbus QMI service (0x301): instance 0 with the DSP the master, the bus powered.
+- `slim=2`: the NGD (`0x171c0000`, NGD 1 at +0x1000, v0x201) in register mode; the master's capability answered,
+  our logical address given.
+- `slim=3`: the codec's clock (RPMh `lnbclka2`, 19.2 MHz) and reset (GPIO 64); the manager asked for its logical
+  addresses (generic device `0xcf`, interface `0xce` this time); chip id major 0x108 minor 0x1 (Tavil); Linux's
+  `wcd934x_bring_up()`.
+
+Then, with `slim=3` (and `adsp_listen=5`: the DSP's hello once took more than a second):
+
+- `sound_earpiece=3`: a test tone through the earpiece -- AFE `SLIMBUS_0_RX` (0x4000), one 16-bit channel on bus
+  channel 144, the codec's RX0 -> INT0 -> EAR with class-H, as Linux's DAPM powers it. Runs clean (the DSP takes
+  48 kHz, no underflow); **not yet heard** by anyone.
+- `mic=3 mic_wcd=1`: the handset microphone (Android's `handset-mic` = AMIC4) -- MIC BIAS1 at 2.7 V, ADC4, decimator
+  0, the codec's TX0 on bus channel 128, AFE `SLIMBUS_0_TX` (0x4001), the DSP's stream as redwood's. Levels each
+  second in the log (a quiet room: about -70 dBFS). `mic=4 mic_wcd=1` gives it to iOS (`/dev/hakios-mic`).
+
+Every run needs `xl ramdisk-flash system_a` first: the loader keeps the system image only for one run.
+
 **11. Then** Wi-Fi; cellular last.
 
 **12. The modem** (started 31 October 2026). Backed up first, read only through the loader (`xl flash-read`, from a
