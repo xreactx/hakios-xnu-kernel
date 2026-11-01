@@ -154,6 +154,16 @@ static TUNABLE(uint32_t, gFilter, "fb_filter", 1);
 static TUNABLE(uint32_t, gRefreshHz, "fb_hz", kFBRefreshHz);
 static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
 /*
+ * Boot-arg fb_scan=1 (the OnePlus 6T): the refreshes are the panel's own. The firmware left the SoC's
+ * display controller sending the framebuffer to the panel over and over -- 119.93 times a second on the
+ * 6T (hakios.adreno.c, display_probe()) -- and a timer of ours at 60 Hz beside it drifts against those
+ * scans: a frame copied in lands on whichever comes next, three scans after the one before, then one (the
+ * frames' 22 and 11 ms steps, 1 November). With fb_scan=1 the vsync is the start of every second scan, as
+ * the interface's frame and line counters say (Linux's dpu_hw_intf.c: INTF_FRAME_COUNT, INTF_LINE_COUNT).
+ * Reading them takes two bus clocks, turned on once as display_probe() turns them on (one bit each).
+ */
+static TUNABLE(uint32_t, gScan, "fb_scan", 0);
+/*
  * Boot-arg fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see
  * drawRows()). Three by default: a frame is in the panel's memory 3 ms after its turn instead of 9
  * to 10 (the phone, 15 October; fb_threads=1 is how it was).
@@ -1226,6 +1236,115 @@ IOMobileFramebufferUserClient::vsyncFired(thread_call_param_t self, thread_call_
 	((IOMobileFramebufferUserClient *) self)->vsync();
 }
 
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+#define SCAN_GCC                0x00100000              /* GCC: its display bus clock (gcc_disp_ahb_clk) */
+#define SCAN_GCC_DISP_AHB_CBCR  0x27004
+#define SCAN_DISPCC             0x0af00000              /* the display's clock controller: its register bus clock */
+#define SCAN_DISPCC_MDSS_AHB_CBCR 0x1050
+#define SCAN_INTF               0x0ae36000              /* intf1, the DSI interface the panel hangs on */
+#define SCAN_INTF_HSYNC_CTL     0x008                   /* clocks a line << 16 */
+#define SCAN_INTF_VSYNC_PERIOD  0x00c                   /* clocks a frame */
+#define SCAN_INTF_FRAME_COUNT   0x0ac
+#define SCAN_INTF_LINE_COUNT    0x0b0
+
+static volatile uint32_t * gScanIntf;
+static uint32_t gScanLines;                             /* lines a scan */
+static uint64_t gScanLineAbs;                           /* one line in mach_absolute_time units, << 16 */
+static int gScanState;                                  /* 0 not tried, 1 ready, -1 not to be had */
+
+/* The interface's frame and line counters together, and when they were read. */
+static void
+scanRead(uint32_t * frame, uint32_t * line, uint64_t * when)
+{
+	uint32_t f;
+
+	do {
+		f = gScanIntf[SCAN_INTF_FRAME_COUNT / 4];
+		*line = gScanIntf[SCAN_INTF_LINE_COUNT / 4];
+		*when = mach_absolute_time();
+	} while (gScanIntf[SCAN_INTF_FRAME_COUNT / 4] != f);
+	*frame = f;
+}
+
+/* Once: the clocks, the registers, the lines a scan, and how long one lasts by our clock. */
+static bool
+scanReady(void)
+{
+	volatile uint32_t * gcc, * dispcc;
+	uint32_t line, f0, l0, f1, l1;
+	uint64_t t0, t1, lines, wait;
+
+	if (gScanState != 0) {
+		return gScanState > 0;
+	}
+	gScanState = -1;
+	gcc = (volatile uint32_t *) ml_io_map(SCAN_GCC + SCAN_GCC_DISP_AHB_CBCR, 4);
+	dispcc = (volatile uint32_t *) ml_io_map(SCAN_DISPCC + SCAN_DISPCC_MDSS_AHB_CBCR, 4);
+	gScanIntf = (volatile uint32_t *) ml_io_map(SCAN_INTF, 0x100);
+	if (gcc == NULL || dispcc == NULL || gScanIntf == NULL) {
+		IOLog("MiniIOMobileFramebuffer: fb_scan: the display's registers cannot be mapped: our own refresh clock\n");
+		return false;
+	}
+	*gcc |= 1;                                      /* (the firmware leaves it off; Linux keeps it on) */
+	IODelay(10000);
+	*dispcc |= 1;
+	IODelay(10000);
+	if (*dispcc & 0x80000000u) {
+		IOLog("MiniIOMobileFramebuffer: fb_scan: the display block's register clock does not run (%#x): our own refresh "
+		    "clock\n", *dispcc);
+		return false;
+	}
+	line = gScanIntf[SCAN_INTF_HSYNC_CTL / 4] >> 16;
+	gScanLines = line != 0 ? gScanIntf[SCAN_INTF_VSYNC_PERIOD / 4] / line : 0;
+	scanRead(&f0, &l0, &t0);
+	nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &wait);
+	clock_delay_until(t0 + wait);
+	scanRead(&f1, &l1, &t1);
+	lines = (uint64_t)(f1 - f0) * gScanLines + l1 - l0;
+	if (gScanLines < 100 || lines == 0 || l0 >= gScanLines || l1 >= gScanLines) {
+		IOLog("MiniIOMobileFramebuffer: fb_scan: the counters make no sense (%u lines a scan; frame %u line %u, then %u %u): our "
+		    "own refresh clock\n", gScanLines, f0, l0, f1, l1);
+		return false;
+	}
+	gScanLineAbs = ((t1 - t0) << 16) / lines;
+	{
+		uint64_t scan, ns;
+
+		absolutetime_to_nanoseconds((gScanLineAbs * gScanLines) >> 16, &ns);
+		scan = ns;
+		IOLog("MiniIOMobileFramebuffer: fb_scan: THE REFRESHES ARE THE PANEL'S: %u lines a scan, %llu.%03llu ms each (%llu.%02llu a "
+		    "second); a vsync every second scan\n", gScanLines, scan / 1000000, scan / 1000 % 1000, 1000000000ull / scan,
+		    100000000000ull / scan % 100);
+	}
+	gScanState = 1;
+	return true;
+}
+
+/* The start of the first even-numbered scan at least `after` (mach_absolute_time); 0 if the counters cannot be had. */
+static uint64_t
+scanNext(uint64_t after)
+{
+	uint32_t frame, line;
+	uint64_t now, start, scan;
+
+	if (!scanReady()) {
+		return 0;
+	}
+	scanRead(&frame, &line, &now);
+	scan = (gScanLineAbs * gScanLines) >> 16;
+	start = now + ((gScanLineAbs * (gScanLines - line)) >> 16);     /* scan frame + 1 begins */
+	frame++;
+	if (frame & 1) {
+		start += scan;
+		frame++;
+	}
+	while (start < after) {
+		start += 2 * scan;
+	}
+	return start;
+}
+
 /* With the lock held. */
 void
 IOMobileFramebufferUserClient::armVSync(void)
@@ -1234,6 +1353,16 @@ IOMobileFramebufferUserClient::armVSync(void)
 
 	/* one refresh after the last, not after whenever we got round to this: the rate does not drift */
 	nanoseconds_to_absolutetime(NSEC_PER_SEC / refreshHz(), &period);
+	if (gScan != 0) {
+		/* (fb_scan=1: the next start of an even scan, at least half a period after the last vsync) */
+		uint64_t next = scanNext(fVSyncTime != 0 && fVSyncTime + period / 2 > now ? fVSyncTime + period / 2 : now);
+
+		if (next != 0) {
+			fVSyncTime = next;
+			thread_call_enter_delayed(fVSyncCall, fVSyncTime);
+			return;
+		}
+	}
 	fVSyncTime += period;
 	if (fVSyncTime <= now || fVSyncTime > now + 2 * period) {
 		fVSyncTime = now + period;
