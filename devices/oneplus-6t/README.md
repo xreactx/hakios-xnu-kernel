@@ -603,6 +603,12 @@ Then, with `slim=3` (and `adsp_listen=5`: the DSP's hello once took more than a 
   second in the log (a quiet room: about -70 dBFS). `mic=4 mic_wcd=1` gives it to iOS (`/dev/hakios-mic`): Voice Memos
   records and plays back (1 November).
 
+- `sound_receiver=1` (with `sound=4`): the earpiece for iOS. The plug-in's "Codec" device has an output and a mute
+  control on its element 3, from which VirtualAudio makes the "Built-In Receiver" port (`Device_Codec_Aspen`:
+  `'mute' 'outp' 3`; 4 would be a speaker, 5 hearing aid compliance). The DSP's session goes to QUAT MI2S and
+  SLIMBUS_0_RX at once; the plug-in says which device plays (`HAKIOS_AUDIO_SET_ROUTE`) and the kernel switches the
+  TFA9894 or the codec's EAR path on. A call's audio session reaches it: `RC_JOBS=rc.jobs.receiver` (run 175327).
+
 Every run needs `xl ramdisk-flash system_a` first: the loader keeps the system image only for one run.
 
 **11. Then** Wi-Fi; cellular last.
