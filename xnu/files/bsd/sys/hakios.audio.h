@@ -78,7 +78,8 @@ void hakios_tfa9894_stop(void);        /* muted and powered down */
 void hakios_tfa9894_quiesce(void);     /* the same without sleeping, and its reset pin as found: the run's end, a panic */
 /* The OnePlus 6T's earpiece (bsd/dev/hakios.slim.c): the WCD934x codec over the audio SLIMbus. */
 bool hakios_slim_codec_ready(uint32_t ms);     /* the codec brought up (slim=3), waited for up to ms */
-bool hakios_slim_earpiece(bool on);    /* the codec's EAR path and the bus's channel to it, up (once the AFE port runs) or down */
+bool hakios_slim_earpiece(bool on);
+bool hakios_slim_mic(bool on);         /* the codec's handset microphone (AMIC4) and the bus's channel from it, up or down */    /* the codec's EAR path and the bus's channel to it, up (once the AFE port runs) or down */
 /* the amplifiers' own temperature and battery voltage read (every second while they play): the reduction they call for */
 uint32_t hakios_speaker_monitor(bool tell);
 
