@@ -5789,7 +5789,25 @@ ipa_host_receive(__unused void *context, uint32_t node, uint32_t port, const voi
 		printf("mpss: ipa: the modem says its IPA driver is up\n");
 		ipa_init_complete();
 		break;
-	case IPA_QMI_INSTALL_FILTER_RULE: {
+	case IPA_QMI_INSTALL_FILTER_RULE:
+	case IPA_QMI_CONFIG:
+		if (apcs_ipc != 0 && !option("modem_ipa_answer_rules")) {
+			/*
+			 * The SDM845: as Linux's driver, which has working data there -- its IPA service answers neither the
+			 * modem's filter rules (0x23) nor its configuration request (0x27). Answered with success and the ids,
+			 * the modem took the rules for installed, and each of our packets came back as an empty frame (the
+			 * 6T, 1 November). modem_ipa_answer_rules=1: answered as before.
+			 */
+			printf("mpss: ipa: the modem's request %#x (%s) left unanswered, as Linux leaves it\n", message,
+			    message == IPA_QMI_CONFIG ? "configuration" : "install filter rules");
+			break;
+		}
+		if (message == IPA_QMI_CONFIG) {
+			ipa_qmi_result(ipa_host_port, node, port, QMI_RESPONSE, transaction, message);
+			printf("mpss: ipa: the modem's request %#x (configuration) answered with success\n", message);
+			break;
+		}
+		{
 		/*
 		 * The modem's uplink filter rules, to be installed in the IPA by the application processor. Android
 		 * answers with the rules' ids echoed (TLV 0x11: a count and the ids), which is what is done here; the
@@ -5833,8 +5851,7 @@ ipa_host_receive(__unused void *context, uint32_t node, uint32_t port, const voi
 		qrtr_send(ipa_host_port, node, port, answer, at);
 		printf("mpss: ipa: the modem's %u filter rules taken (not installed), their ids answered\n", count);
 		break;
-	}
-	case IPA_QMI_CONFIG:
+		}
 	case IPA_QMI_FILTER_INSTALLED_NOTIF:
 	default:
 		/*
