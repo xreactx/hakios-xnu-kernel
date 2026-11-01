@@ -31,6 +31,7 @@
 #include <libkern/c++/OSNumber.h>
 
 extern "C" void HakiosWLANStart(const char * interface, const uint8_t * address);
+extern "C" void HakiosEthernetStart(const char * interface, const uint8_t * address);
 
 class IO80211Controller : public IOService
 {
@@ -45,6 +46,26 @@ class IONetworkInterface : public IOService
 };
 
 OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
+
+/*
+ * The same for an interface that is not a radio (the modem's en1, bsd/dev/hakios.cell.c): SCNetworkInterface
+ * calls an IFT_ETHER interface whose controller is none of the special kinds (802.11, Thunderbolt, Bluetooth,
+ * a USB tether) an Ethernet one, as it would a USB Ethernet adapter, and configd gives it a service and asks
+ * DHCP -- which hakios.cell.c answers with the data session's settings.
+ */
+class IOEthernetController : public IOService
+{
+	OSDeclareDefaultStructors(IOEthernetController);
+};
+
+OSDefineMetaClassAndStructors(IOEthernetController, IOService);
+
+class IOEthernetInterface : public IONetworkInterface
+{
+	OSDeclareDefaultStructors(IOEthernetInterface);
+};
+
+OSDefineMetaClassAndStructors(IOEthernetInterface, IONetworkInterface);
 
 class HakiosWLAN : public IONetworkInterface
 {
@@ -132,6 +153,54 @@ HakiosWLANStart(const char * interface, const uint8_t * address)
 		IOLog("HakiosWLAN: the service did not start\n");
 	} else {
 		wlan->release();
+	}
+	controller->release();
+}
+
+/* Once, when an interface that is not a radio exists (en1, the modem's): an Ethernet controller and its interface. */
+void
+HakiosEthernetStart(const char * interface, const uint8_t * address)
+{
+	IOService * platform = IOService::getPlatform();
+	IOEthernetController * controller = OSTypeAlloc(IOEthernetController);
+	IOEthernetInterface * ether = OSTypeAlloc(IOEthernetInterface);
+	OSData * mac;
+	OSNumber * number;
+
+	if (platform == NULL || controller == NULL || ether == NULL || !controller->init() || !ether->init()) {
+		OSSafeReleaseNULL(controller);
+		OSSafeReleaseNULL(ether);
+		IOLog("HakiosEthernet: cannot create the services for %s\n", interface);
+		return;
+	}
+	if ((mac = OSData::withBytes(address, 6)) != NULL) {
+		controller->setProperty("IOMACAddress", mac);
+		mac->release();
+	}
+	controller->setProperty("IOBuiltin", true);
+	if ((controller = (IOEthernetController *) publish(controller, platform, "HakiosEthernetController")) == NULL) {
+		ether->release();
+		IOLog("HakiosEthernet: the controller of %s did not start\n", interface);
+		return;
+	}
+	ether->setProperty("IOInterfaceName", interface);
+	ether->setProperty("BSD Name", interface);
+	ether->setProperty("IOInterfaceNamePrefix", "en");
+	if ((number = OSNumber::withNumber(6ULL, 32)) != NULL) {        /* IFT_ETHER */
+		ether->setProperty("IOInterfaceType", number);
+		number->release();
+	}
+	if ((number = OSNumber::withNumber((unsigned long long) (interface[2] - '0'), 32)) != NULL) {
+		ether->setProperty("IOInterfaceUnit", number);
+		number->release();
+	}
+	ether->setProperty("IOBuiltin", true);
+	ether->setProperty("IOPrimaryInterface", false);
+	if (publish(ether, controller, "HakiosEthernet") == NULL) {
+		IOLog("HakiosEthernet: the service of %s did not start\n", interface);
+	} else {
+		IOLog("HakiosEthernet: %s is in the registry as an Ethernet interface\n", interface);
+		ether->release();
 	}
 	controller->release();
 }
