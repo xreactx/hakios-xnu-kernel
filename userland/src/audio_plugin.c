@@ -29,7 +29,9 @@
  *   "Codec"     one input of one channel: on an iPhone, the audio codec that the built-in
  *               microphones are on, of which the virtual audio device makes the built-in microphone
  *               port; its samples come from the kernel, /dev/hakios-mic (the phone's main
- *               microphone, boot-arg mic=4), which listens only while this input runs (see codec_read())
+ *               microphone, boot-arg mic=4), which listens only while this input runs (see codec_read());
+ *               and one output of two channels, the receiver -- the earpiece (see RECEIVER_ELEMENT and
+ *               route_write())
  *
  * CoreAudio's own null device ("Null_Device", described in the framework's Info.plist, playing
  * into nowhere) stays as it is: it is the only device the virtual audio device takes while it
@@ -177,6 +179,7 @@ enum {
 	kAudioServerPlugInIOOperationReadInput = 'read', kAudioServerPlugInIOOperationWriteMix = 'rite',
 
 	kAudioLevelControlClassID = 'levl', kAudioVolumeControlClassID = 'vlme',
+	kAudioBooleanControlClassID = 'togl', kAudioMuteControlClassID = 'mute', kAudioBooleanControlPropertyValue = 'bcvl',
 	kAudioControlPropertyScope = 'cscp', kAudioControlPropertyElement = 'celm',
 	kAudioLevelControlPropertyScalarValue = 'lcsv', kAudioLevelControlPropertyDecibelValue = 'lcdv',
 	kAudioLevelControlPropertyDecibelRange = 'lcdr', kAudioLevelControlPropertyConvertScalarToDecibels = 'lcsd',
@@ -194,10 +197,11 @@ enum {
 	OBJECT_SPEAKER, OBJECT_SPEAKER_OUTPUT, OBJECT_SPEAKER_INPUT,
 	OBJECT_HAWKING, OBJECT_HAWKING_INPUT,
 	OBJECT_ACTUATOR, OBJECT_ACTUATOR_OUTPUT,
-	OBJECT_CODEC, OBJECT_CODEC_INPUT,
+	OBJECT_CODEC, OBJECT_CODEC_OUTPUT, OBJECT_CODEC_INPUT,
 	OBJECT_SPEAKER_VOLUME,          /* the speaker output's volume control */
 	OBJECT_CODEC_SOURCE,            /* the codec input's data source control: its microphones */
-	OBJECT_LAST = OBJECT_CODEC_SOURCE
+	OBJECT_CODEC_RECEIVER,          /* the codec output's mute control on element 3: its receiver (the earpiece) */
+	OBJECT_LAST = OBJECT_CODEC_RECEIVER
 };
 
 #define VOLUME_RANGE_DB         48.0    /* from the loudest the kernel allows down to the quietest step above 0 */
@@ -218,7 +222,8 @@ static struct device devices[] = {
 	  .output_channels = HAKIOS_AUDIO_CHANNELS, .input_channels = 2 },
 	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
 	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1 },
-	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = 1 },
+	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .output = OBJECT_CODEC_OUTPUT, .input = OBJECT_CODEC_INPUT,
+	  .output_channels = HAKIOS_AUDIO_CHANNELS, .input_channels = 1 },
 };
 #define DEVICES                 (sizeof(devices) / sizeof(devices[0]))
 
@@ -231,6 +236,15 @@ static struct device devices[] = {
  * is one microphone here, at the bottom: 'imic', the iPhone's internal (bottom) one.
  */
 #define MIC_SOURCE              'imic'
+
+/*
+ * The codec's output, for the receiver. The virtual audio device makes the codec's output ports from mute
+ * controls on its output's elements (Device_Codec_Aspen.cpp: AudioObjectHasProperty('mute', 'outp', n) --
+ * 4 the built-in speaker, 3 the built-in receiver, 5 hearing aid compliance): one on element 3 gives it the
+ * "Built-In Receiver" port, through which it plays calls and whatever is held to the ear. What is played
+ * there goes to /dev/hakios-audio like the speaker's, and the kernel is told where it is to be heard.
+ */
+#define RECEIVER_ELEMENT        3
 #define MANUFACTURER            CFSTR("redwood")
 /* how often a device says where its clock is, in frames: also the largest I/O buffer the HAL will use */
 #define TIMESTAMP_PERIOD        16384
@@ -242,6 +256,8 @@ static Float64 ticks_per_frame;
 static UInt64 written, refused;         /* frames since the speaker's I/O started */
 static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
 static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
+static UInt32 receiver_muted;           /* the receiver's mute control */
+static AudioObjectID playing = OBJECT_SPEAKER_OUTPUT;  /* the output whose samples go to the kernel: see route_write() */
 
 static void
 say(const char *format, ...)
@@ -448,6 +464,32 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 		}
 		return v;
 	}
+	if (object == OBJECT_CODEC_RECEIVER) {
+		switch (selector) {
+		case kAudioObjectPropertyBaseClass:
+			WORD(kAudioBooleanControlClassID);
+			break;
+		case kAudioObjectPropertyClass:
+			WORD(kAudioMuteControlClassID);
+			break;
+		case kAudioObjectPropertyOwner:
+			WORD(OBJECT_CODEC);
+			break;
+		case kAudioObjectPropertyOwnedObjects:
+			v.empty = true;
+			break;
+		case kAudioControlPropertyScope:
+			WORD(kAudioObjectPropertyScopeOutput);
+			break;
+		case kAudioControlPropertyElement:
+			WORD(RECEIVER_ELEMENT);
+			break;
+		case kAudioBooleanControlPropertyValue:
+			WORD(receiver_muted);
+			break;
+		}
+		return v;
+	}
 	if (object == OBJECT_CODEC_SOURCE) {
 		switch (selector) {
 		case kAudioObjectPropertyBaseClass:
@@ -553,7 +595,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		case kAudioDevicePropertyDeviceCanBeDefaultDevice:
 		case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
-			WORD(d->output != 0);
+			WORD(d->output != 0 && d->object != OBJECT_CODEC);      /* (the receiver is chosen by route, not by default) */
 			break;
 		case kAudioDevicePropertyDeviceIsRunning:
 			WORD(d->running != 0);
@@ -573,6 +615,9 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeOutput) {
 				LIST(OBJECT_CODEC_SOURCE);
 			}
+			if (selector == kAudioObjectPropertyOwnedObjects && d->object == OBJECT_CODEC && scope != kAudioObjectPropertyScopeInput) {
+				LIST(OBJECT_CODEC_RECEIVER);
+			}
 			v.empty = v.size == 0;
 			break;
 		case kAudioObjectPropertyControlList:
@@ -581,6 +626,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			}
 			if (d->object == OBJECT_CODEC) {
 				LIST(OBJECT_CODEC_SOURCE);
+				LIST(OBJECT_CODEC_RECEIVER);
 			}
 			v.empty = v.size == 0;
 			break;
@@ -700,6 +746,8 @@ is_property_settable(AudioServerPlugInDriverRef driver, AudioObjectID object, pi
 		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
 	} else if (object == OBJECT_CODEC_SOURCE) {
 		*settable = address->mSelector == kAudioSelectorControlPropertyCurrentItem;
+	} else if (object == OBJECT_CODEC_RECEIVER) {
+		*settable = address->mSelector == kAudioBooleanControlPropertyValue;
 	} else if (object == OBJECT_PLUGIN) {
 		*settable = false;
 	} else if (object == d->object) {
@@ -797,6 +845,21 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		}
 		return 0;
 	}
+	if (object == OBJECT_CODEC_RECEIVER) {
+		AudioObjectPropertyAddress changed = { kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal, 0 };
+
+		if (size != sizeof(UInt32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		pthread_mutex_lock(&lock);
+		receiver_muted = *(const UInt32 *)data != 0;
+		pthread_mutex_unlock(&lock);
+		say("hakios: audio: the receiver is %s\n", receiver_muted ? "muted" : "unmuted");
+		if (host != NULL) {
+			host->PropertiesChanged(host, OBJECT_CODEC_RECEIVER, 1, &changed);
+		}
+		return 0;
+	}
 	if (object == OBJECT_CODEC_SOURCE) {
 		/* the one microphone there is */
 		return size == sizeof(UInt32) ? (*(const UInt32 *)data == MIC_SOURCE ? 0 : kAudioHardwareIllegalOperationError) :
@@ -835,9 +898,12 @@ static int mic = -1;
 static UInt64 mic_frames, mic_heard, mic_short;
 static int mic_peak;
 
+static Boolean mic_tried;               /* opened (or tried) since the codec's I/O started */
+
 static void
 codec_open(void)
 {
+	mic_tried = true;
 	mic = open("/dev/hakios-mic", O_RDONLY | O_NONBLOCK);
 	mic_frames = mic_heard = mic_short = 0;
 	mic_peak = 0;
@@ -854,6 +920,7 @@ codec_close(void)
 		close(mic);
 	}
 	mic = -1;
+	mic_tried = false;
 }
 
 static void
@@ -895,9 +962,6 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 			written = refused = 0;
 			say("hakios: audio: playing\n");
 		}
-		if (d->object == OBJECT_CODEC) {
-			codec_open();
-		}
 	}
 	pthread_mutex_unlock(&lock);
 	return 0;
@@ -913,9 +977,10 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 	}
 	pthread_mutex_lock(&lock);
 	if (d->running != 0 && --d->running == 0) {
-		if (d->object == OBJECT_CODEC) {
+		if (d->object == OBJECT_CODEC && mic >= 0) {
 			codec_close();
-		} else if (d->output != 0) {
+		}
+		if (d->output != 0) {
 			say("hakios: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / HAKIOS_AUDIO_RATE,
 			    written % HAKIOS_AUDIO_RATE * 100 / HAKIOS_AUDIO_RATE, refused, HAKIOS_AUDIO_DEVICE);
 		}
@@ -998,6 +1063,42 @@ actuator_write(const int16_t *samples, UInt32 frames)
 	}
 }
 
+/*
+ * The speaker's and the receiver's outputs both play into /dev/hakios-audio, but only one at a time: the one
+ * that last wrote anything but silence (the other's writes are dropped). When that changes, the kernel is
+ * told where it is now to be heard (HAKIOS_AUDIO_SET_ROUTE), and switches the speaker's amplifier or the
+ * earpiece on accordingly.
+ */
+static void
+route_write(AudioObjectID stream, const int16_t *samples, UInt32 frames)
+{
+	Boolean sound = false;
+
+	for (UInt32 i = 0; i < frames * HAKIOS_AUDIO_CHANNELS && !sound; i++) {
+		sound = samples[i] != 0;
+	}
+	if (sound && stream != playing) {
+		uint32_t route = stream == OBJECT_CODEC_OUTPUT ? HAKIOS_AUDIO_ROUTE_RECEIVER : HAKIOS_AUDIO_ROUTE_SPEAKER;
+
+		pthread_mutex_lock(&lock);
+		playing = stream;
+		if (sink < 0 || ioctl(sink, HAKIOS_AUDIO_SET_ROUTE, &route) < 0) {
+			say("hakios: audio: the route could not be given to the kernel (%s)\n", strerror(errno));
+		} else {
+			say("hakios: audio: plays through the %s\n", route == HAKIOS_AUDIO_ROUTE_RECEIVER ? "receiver" : "speaker");
+		}
+		pthread_mutex_unlock(&lock);
+	}
+	if (stream != playing) {
+		return;
+	}
+	/* the kernel takes it all or leaves it: this thread must not wait */
+	if (sink < 0 || write(sink, samples, (size_t)frames * HAKIOS_AUDIO_FRAME) < 0) {
+		refused += frames;
+	}
+	written += frames;
+}
+
 static OSStatus
 do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object, AudioObjectID stream,
     __unused UInt32 client, UInt32 operation, UInt32 frames, __unused const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
@@ -1009,6 +1110,12 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 		return kAudioHardwareBadObjectError;
 	}
 	if (operation == kAudioServerPlugInIOOperationReadInput && stream == OBJECT_CODEC_INPUT) {
+		/* (the codec runs for its output too -- the receiver -- and the microphone listens only when its input is read) */
+		if (mic < 0 && !mic_tried) {
+			pthread_mutex_lock(&lock);
+			codec_open();
+			pthread_mutex_unlock(&lock);
+		}
 		codec_read(buffer, frames);
 	} else if (operation == kAudioServerPlugInIOOperationReadInput) {
 		/* the speaker's and Hawking's inputs: silence */
@@ -1016,11 +1123,7 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
 		actuator_write(buffer, frames);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
-		/* the kernel takes it all or leaves it: this thread must not wait */
-		if (sink < 0 || write(sink, buffer, (size_t)frames * HAKIOS_AUDIO_FRAME) < 0) {
-			refused += frames;
-		}
-		written += frames;
+		route_write(stream, buffer, frames);
 	}
 	return 0;
 }

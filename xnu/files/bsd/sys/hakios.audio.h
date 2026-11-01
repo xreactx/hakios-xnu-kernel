@@ -37,6 +37,14 @@ struct hakios_audio_volume {
 };
 #define HAKIOS_AUDIO_SET_VOLUME _IOW('r', 1, struct hakios_audio_volume)
 
+/*
+ * ioctl(HAKIOS_AUDIO_SET_ROUTE): where what is written is to be heard -- the speaker, or the earpiece (iOS's
+ * "Built-In Receiver", the plug-in's device "Codec"). The plug-in says it when the device that plays changes.
+ */
+#define HAKIOS_AUDIO_ROUTE_SPEAKER      0
+#define HAKIOS_AUDIO_ROUTE_RECEIVER     1
+#define HAKIOS_AUDIO_SET_ROUTE  _IOW('r', 2, uint32_t)
+
 #ifdef KERNEL
 #include <stdbool.h>
 
@@ -47,6 +55,8 @@ struct hakios_audio_volume {
 typedef uint32_t (*hakios_audio_sink_t)(const int16_t *frames, uint32_t count);
 
 void hakios_audio_set_sink(const char *name, hakios_audio_sink_t sink);
+/* The route the plug-in has said last (HAKIOS_AUDIO_SET_ROUTE); the speaker until it says one. */
+uint32_t hakios_audio_route(void);
 /* The volume iOS has set last (HAKIOS_AUDIO_SET_VOLUME): false if it has set none; *generation counts the settings. */
 bool hakios_audio_volume(uint32_t *below, bool *muted, uint32_t *generation);
 void hakios_audio_init(void);

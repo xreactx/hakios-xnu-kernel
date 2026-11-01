@@ -37,6 +37,14 @@ struct hakios_audio_volume {
 };
 #define HAKIOS_AUDIO_SET_VOLUME _IOW('r', 1, struct hakios_audio_volume)
 
+/*
+ * ioctl(HAKIOS_AUDIO_SET_ROUTE): where what is written is to be heard -- the speaker, or the earpiece (iOS's
+ * "Built-In Receiver", the plug-in's device "Codec"). The plug-in says it when the device that plays changes.
+ */
+#define HAKIOS_AUDIO_ROUTE_SPEAKER      0
+#define HAKIOS_AUDIO_ROUTE_RECEIVER     1
+#define HAKIOS_AUDIO_SET_ROUTE  _IOW('r', 2, uint32_t)
+
 #ifdef KERNEL
 #include <stdbool.h>
 
@@ -47,11 +55,20 @@ struct hakios_audio_volume {
 typedef uint32_t (*hakios_audio_sink_t)(const int16_t *frames, uint32_t count);
 
 void hakios_audio_set_sink(const char *name, hakios_audio_sink_t sink);
+/* The route the plug-in has said last (HAKIOS_AUDIO_SET_ROUTE); the speaker until it says one. */
+uint32_t hakios_audio_route(void);
 /* The volume iOS has set last (HAKIOS_AUDIO_SET_VOLUME): false if it has set none; *generation counts the settings. */
 bool hakios_audio_volume(uint32_t *below, bool *muted, uint32_t *generation);
 void hakios_audio_init(void);
 void hakios_virtio_sound_init(void);   /* boot-arg virtio_sound=1: QEMU's virtio sound device */
 void hakios_speaker_init(void);        /* boot-arg speaker_probe=N: a look at the phone's speaker amplifiers */
+void hakios_haptic_init(void);         /* boot-arg haptic=N: the phone's vibration motor (bsd/dev/hakios.haptic.c) */
+void hakios_haptic_quiesce(void);      /* its chip back into reset: at the run's end and on a panic's way out */
+void hakios_haptic_pretend(uint32_t peak); /* a test's stand-in for iOS's waveform: as if a write of this loudness came */
+void hakios_torch_init(void);          /* boot-arg torch=N: the phone's flashlight (bsd/dev/hakios.torch.c) */
+void hakios_torch_quiesce(void);       /* the light off: at the run's end and on a panic's way out */
+void hakios_camera_init(void);         /* boot-arg cam=N: the phone's cameras (bsd/dev/hakios.camera.c) */
+void hakios_camera_quiesce(void);      /* whatever of them was switched on, off: at the run's end and on a panic's way out */
 
 /*
  * The phone's speakers (bsd/dev/hakios.speaker.c): its two Awinic amplifiers, set up as
@@ -63,6 +80,43 @@ bool hakios_speaker_volume(uint32_t below, uint32_t step_ms); /* below Android's
 bool hakios_speaker_healthy(void);     /* no fault reported; on one, both are powered down at once */
 void hakios_speaker_stop(void);        /* faded out, muted, powered down, in Android's order */
 void hakios_speaker_quiesce(void);     /* powered down at once, without sleeping: on a panic's way out */
+/* The OnePlus 6T's speaker amplifier (bsd/dev/hakios.tfa9894.c): its set-up as Android's driver did it, replayed. */
+void hakios_tfa9894_init(void);        /* boot-arg tfa9894=N: a look (1), or set up and powered down (2) */
+bool hakios_tfa9894_prepare(void);     /* reset, the recorded set-up, powered down */
+bool hakios_tfa9894_start(void);       /* switched on: only while the port's clocks run */
+void hakios_tfa9894_stop(void);        /* muted and powered down */
+void hakios_tfa9894_quiesce(void);     /* the same without sleeping, and its reset pin as found: the run's end, a panic */
+/* The OnePlus 6T's earpiece (bsd/dev/hakios.slim.c): the WCD934x codec over the audio SLIMbus. */
+bool hakios_slim_codec_ready(uint32_t ms);     /* the codec brought up (slim=3), waited for up to ms */
+bool hakios_slim_earpiece(bool on);
+bool hakios_slim_mic(bool on);         /* the codec's handset microphone (AMIC4) and the bus's channel from it, up or down */    /* the codec's EAR path and the bus's channel to it, up (once the AFE port runs) or down */
+/* the amplifiers' own temperature and battery voltage read (every second while they play): the reduction they call for */
+uint32_t hakios_speaker_monitor(bool tell);
+
+/*
+ * The speakers' guard (bsd/dev/hakios.guard.c): what the samples go through in the feeder on their
+ * way to the amplifiers, for want of the DSP's speaker protection. Levels in eighths of a dB.
+ */
+#define HAKIOS_GUARD_SILENT    0xffffffffu     /* the amplifiers are off: nothing reaches the speakers */
+struct hakios_guard_report {
+	uint32_t blocks, rms_blocks, fast_blocks, slow_blocks;  /* blocks done, and in how many each average held the level down */
+	uint32_t limited_frames;        /* frames in which the peak limiter turned the level down */
+	uint32_t peak_in, peak_out;     /* the largest sample that came in and that went out */
+	uint32_t least_peak_gain;       /* the peak limiter's least gain, in 1/65536 */
+	uint64_t least_gain, gain;      /* the power guard's (with the monitor's) least gain and the latest, Q30 */
+	uint64_t rms, fast, slow;       /* the averages now, the louder speaker's: Q30 of a full-scale square wave at Android's level */
+};
+#define HAKIOS_GUARD_MAX_GAIN  (12 * 8)        /* the most gain before the guard: 12 dB */
+void hakios_guard_configure(bool hpf, uint32_t gain);         /* the high-pass filter; `gain' before everything */
+void hakios_guard_attenuation(uint32_t below);                 /* the amplifiers' level under Android's (or HAKIOS_GUARD_SILENT):
+                                                                 * what the limits are reckoned from */
+void hakios_guard_monitor(uint32_t below);                     /* a reduction asked for by hakios_speaker_monitor() */
+void hakios_guard_process(int16_t *frames, uint32_t count);    /* stereo frames, in place */
+void hakios_guard_take_report(struct hakios_guard_report *report);   /* what happened since the last call */
+int hakios_guard_decibels(uint64_t ratio);                     /* 10 log10 of a Q30 ratio, in tenths of a dB */
+/* boot-arg rec_sound_fed=1: the recording (rec_sound=N) has what the guard let through instead of what iOS wrote */
+bool hakios_audio_recording_fed(void);
+void hakios_audio_record_fed(const int16_t *frames, uint32_t count);
 
 /*
  * The audio DSP's services, for the sound's path (bsd/dev/hakios.adsp.c, bsd/dev/hakios.sound.c).
@@ -87,6 +141,15 @@ void hakios_adsp_fw_free(const uint8_t *data, uint64_t size);
 void hakios_sound_dsp_up(void);        /* the DSP's audio services are up (adsp=1): boot-arg sound=N begins */
 void hakios_sound_dsp_down(void);      /* before the DSP is shut down at the run's end: everything of the sound's stopped */
 void hakios_sound_quiesce(void);       /* on a panic's way out: the amplifiers off, without sleeping */
+/* the microphones' part of the memory the DSP sees (hakios.sound.c): false if it cannot be had; given back with _put() */
+bool hakios_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t *bytes);
+void hakios_audio_dsp_memory_put(void);
+/* a second handler of the DSP's events (the microphones'), asked when the first does not take one */
+void hakios_adsp_apr_events_second(hakios_apr_events_t handler);
+/* boot-arg rec_sound_mic=1: the recording (rec_sound=N) has what the microphone hears (given with hakios_audio_record_fed()) */
+bool hakios_audio_recording_mic(void);
+void hakios_mic_dsp_up(void);          /* the DSP's audio services are up (adsp=1): boot-arg mic=N begins */
+void hakios_mic_dsp_down(void);        /* before the DSP is shut down at the run's end: what the microphones' path asked for given back */
 #endif
 
 #endif /* _SYS_HAKIOS_AUDIO_H_ */
