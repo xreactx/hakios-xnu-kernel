@@ -416,6 +416,53 @@ write_logs(const char *klog, uint64_t klog_len)
 	compose_logs(klog, klog_len);
 }
 
+/*
+ * A sound recording the kernel left (rec_sound) goes into logdump as well, 32 MB in, behind a block of its own
+ * ("HAKSOUND", then its length in 8 bytes): on the OnePlus 6T a short log is read again through a fresh loader
+ * (xl's run), which knows nothing of what this one was left, and `xl sound` then reads it from there.
+ */
+#define SOUND_PARTITION_AT      (32ull << 20)
+
+static const char *sound_data;
+static uint64_t sound_len;
+
+static void
+write_sound(void)
+{
+	efi_block_io *bio = sound_data != NULL ? find_log_partition() : NULL;
+	uint64_t bs, lba, whole, tail;
+	efi_status ws;
+
+	if (bio == NULL || !hc_list_is_uefis()) {
+		return;
+	}
+	bs = bio->media->block_size;
+	if (bs > sizeof(block_buffer) || sound_len > (32ull << 20) - bs ||
+	    (SOUND_PARTITION_AT + bs + sound_len + bs - 1) / bs > bio->media->last_block + 1) {
+		print("sound: the recording (%d bytes) does not fit into logdump\n", sound_len);
+		return;
+	}
+	lba = SOUND_PARTITION_AT / bs;
+	memset(block_buffer, 0, bs);
+	memcpy(block_buffer, "HAKSOUND", 8);
+	memcpy(block_buffer + 8, &sound_len, 8);
+	ws = bio->write_blocks(bio, bio->media->media_id, lba, bs, block_buffer);
+	whole = sound_len / bs * bs;
+	tail = sound_len - whole;
+	if (!EFI_ERROR(ws) && whole != 0) {
+		ws = bio->write_blocks(bio, bio->media->media_id, lba + 1, whole, (void *)sound_data);
+	}
+	if (!EFI_ERROR(ws) && tail != 0) {
+		memset(block_buffer, 0, bs);
+		memcpy(block_buffer, sound_data + whole, tail);
+		ws = bio->write_blocks(bio, bio->media->media_id, lba + 1 + whole / bs, bs, block_buffer);
+	}
+	if (!EFI_ERROR(ws)) {
+		bio->flush_blocks(bio);
+	}
+	print("sound: the recording, %d bytes, written to logdump at 32 MB (%x)\n", sound_len, ws);
+}
+
 static void
 flush_log(void)
 {
@@ -1018,9 +1065,6 @@ static int charger_enabled;
 /* The screen recording the last kernel left in memory, if it made one ("oem recording" stages it). */
 static const char *recording_data;
 static uint64_t recording_len;
-/* ... and the recording of the sound ("oem sound"). */
-static const char *sound_data;
-static uint64_t sound_len;
 #define KERNEL_LIVE_MAGIC2      0x324556494c554e58ULL
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
@@ -3660,6 +3704,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		}
 	}
 	write_logs(klog, klog_len);
+	write_sound();
 	return 1;
 }
 

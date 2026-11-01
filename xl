@@ -262,8 +262,19 @@ recording() { # recording [file.mp4]
 sound() { # sound [file.wav]
 	enter || return 1
 	local out=${1:-logs/sound.wav}
-	fb oem sound | grep -q OKAY || { echo "xl: the last run left no sound recording (boot-arg rec_sound=N)"; return 1; }
-	FB_TIMEOUT=120 fb get_staged logs/sound.raw >/dev/null
+	if fb oem sound | grep -q OKAY; then
+		FB_TIMEOUT=120 fb get_staged logs/sound.raw >/dev/null
+	else
+		# (a fresh loader -- the 6T's short logs are read again through one -- knows nothing of it: the one the
+		# kernel returned to wrote it into logdump, 32 MB in, behind a block saying "HAKSOUND" and its length)
+		local len
+		flash_read logdump 2000000 1000 logs/sound.head >/dev/null &&
+		    len=$(python3 -c 'import sys; h = open(sys.argv[1], "rb").read(16); print(int.from_bytes(h[8:], "little") if h[:8] == b"HAKSOUND" else 0)' logs/sound.head)
+		rm -f logs/sound.head
+		[ -n "$len" ] && [ "$len" -gt 0 ] || { echo "xl: the last run left no sound recording (boot-arg rec_sound=N)"; return 1; }
+		flash_read logdump 2001000 "$(printf %x "$len")" logs/sound.raw >/dev/null || return 1
+		echo "xl: the recording read from logdump ($len bytes)"
+	fi
 	tools/sound.py logs/sound.raw "$out" && rm -f logs/sound.raw
 }
 
