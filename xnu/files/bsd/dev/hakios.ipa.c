@@ -32,6 +32,13 @@
  * we look at what the hardware wrote.
  *
  * modem_ipa_data_off=1: none of this. modem_ipa_data_trace=1: a line per packet.
+ *
+ * The SDM845 (the OnePlus 6T) has IPA 3.5.1 with GSI 1.3 (hakios_ipa_version_3_5_1(), called by the modem
+ * driver before the set-up): the same work with Linux's ipa_data-v3.5.1.c, reg/gsi_reg-v3.1.c and
+ * reg/ipa_reg-v3.1.c -- other channels and endpoints (command 4/5, LAN in 5/9, to the modem 3/2, from it
+ * 6/10), the GSI's registers of an execution environment 0xd000 higher, no escape buffer but the doorbell
+ * engine, the aggregation fields lower and counted in 500 us, resource group 1, the replication sequencer,
+ * the endpoints' DELAY and SUSPEND bits cleared, and the hash flush at 0x90.
  */
 #include <kern/clock.h>
 #include <kern/kalloc.h>
@@ -65,9 +72,13 @@ static LCK_MTX_DECLARE(ipa_lock, &ipa_lock_group);
 #define IPA_REGS_SIZE           0x1000
 #define GSI_FROM                0xc000          /* what is used of the GSI's registers: from the inter-EE masks (0xc020) to the scratch (0x12400) */
 #define GSI_SIZE                0x7000
+#define GSI_SIZE_V3             0x14000         /* GSI 1.x: to its scratch at 0x1f400 */
+#define GSI_EE_SHIFT_V3         0xd000          /* GSI 1.x: an EE's registers (0xf000 and up here) are this much higher (Linux: GSI_EE_REG_ADJUST) */
 
 static uint64_t ipa_regs_phys = IPA_REGS_PHYS_DEFAULT, gsi_phys = GSI_PHYS_DEFAULT;
 static vm_offset_t ipa_regs, gsi_regs;         /* gsi_regs maps gsi_phys + GSI_FROM */
+static bool v35;                                /* IPA 3.5.1 (hakios_ipa_version_3_5_1()) */
+static uint32_t ee_shift;                       /* GSI_EE_SHIFT_V3 on IPA 3.5.1 */
 
 static inline uint32_t
 ipa_rd(uint32_t offset)
@@ -82,16 +93,17 @@ ipa_wr(uint32_t offset, uint32_t value)
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
+/* (the offsets below are GSI 2.x's: from 0xf000 on, an EE's own registers, which GSI 1.x has ee_shift higher) */
 static inline uint32_t
 gsi_rd(uint32_t offset)
 {
-	return *(volatile uint32_t *)(gsi_regs + (offset - GSI_FROM));
+	return *(volatile uint32_t *)(gsi_regs + (offset + (offset >= 0xf000 ? ee_shift : 0) - GSI_FROM));
 }
 
 static inline void
 gsi_wr(uint32_t offset, uint32_t value)
 {
-	*(volatile uint32_t *)(gsi_regs + (offset - GSI_FROM)) = value;
+	*(volatile uint32_t *)(gsi_regs + (offset + (offset >= 0xf000 ? ee_shift : 0) - GSI_FROM)) = value;
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
@@ -146,6 +158,7 @@ gsi_wr(uint32_t offset, uint32_t value)
 #define ELEMENT_SIZE            16
 
 /* The IPA's endpoint registers (0x70 apart) */
+#define ENDP_INIT_CTRL(ep)      (0x800 + 0x70 * (ep))     /* IPA 3.5.1: bit 0 SUSPEND, bit 1 DELAY */
 #define ENDP_INIT_CFG(ep)       (0x808 + 0x70 * (ep))
 #define ENDP_INIT_NAT(ep)       (0x80c + 0x70 * (ep))
 #define ENDP_INIT_HDR(ep)       (0x810 + 0x70 * (ep))
@@ -160,6 +173,7 @@ gsi_wr(uint32_t offset, uint32_t value)
 #define ENDP_STATUS(ep)         (0x840 + 0x70 * (ep))
 #define IPA_SHARED_MEM_SIZE     0x54            /* bits 31:16: the local memory's offset in 8-byte units */
 #define IPA_FILT_ROUT_HASH_FLUSH 0x14c
+#define IPA_FILT_ROUT_HASH_FLUSH_V3 0x90
 
 /* ---- memory the hardware reads and writes ------------------------------------------------------ */
 
@@ -247,6 +261,26 @@ static struct channel modem_rx = { "modem-rx", 7, 3, 16, false, false, true, tru
 static struct channel *channels[] = { &command, &lan_rx, &modem_tx, &modem_rx };
 #define AGGR_LIMIT_KB           12              /* the IPA closes a receive buffer once this much is in it (a page holds another 4 KB packet) */
 #define AGGR_TIME_TICKS         5               /* ... or after 5 ticks of the first pulse generator: 500 us (TIMERS_PULSE_GRAN_CFG gran 0 = 100 us) */
+
+/* IPA 3.5.1's (Linux's ipa_data-v3.5.1.c): channel, endpoint and TLV count of each; set before anything is programmed */
+void
+hakios_ipa_version_3_5_1(void)
+{
+	v35 = true;
+	ee_shift = GSI_EE_SHIFT_V3;
+	command.id = 4;
+	command.endpoint = 5;
+	command.tlv = 20;
+	lan_rx.id = 5;
+	lan_rx.endpoint = 9;
+	lan_rx.tlv = 8;
+	modem_tx.id = 3;
+	modem_tx.endpoint = 2;
+	modem_tx.tlv = 16;
+	modem_rx.id = 6;
+	modem_rx.endpoint = 10;
+	modem_rx.tlv = 8;
+}
 
 static bool ready, trace;
 static uint32_t mem_offset;                     /* the local memory's offset within the IPA's shared memory */
@@ -385,8 +419,13 @@ channel_setup(struct channel *ch)
 	gsi_wr(CH_CNTXT(c, 1), ch->slots * ELEMENT_SIZE);
 	gsi_wr(CH_CNTXT(c, 2), (uint32_t)ch->tre_ring.phys);
 	gsi_wr(CH_CNTXT(c, 3), (uint32_t)(ch->tre_ring.phys >> 32));
-	/* QOS: the command channel gets the lowest round-robin weight and no escape buffer; the doorbell counts bytes */
-	value = (ch->command ? 0xf : 0) | (ch->command ? 0 : 1u << 10 /* PREFETCH_MODE: escape buffer only */) | 1u << 24;
+	/* QOS: the command channel gets the lowest round-robin weight and no escape buffer; the doorbell counts bytes
+	 * (GSI 1.x: no escape buffer, no byte doorbells; the doorbell engine used instead) */
+	if (v35) {
+		value = (ch->command ? 0xf : 0) | 1u << 9 /* USE_DB_ENG */;
+	} else {
+		value = (ch->command ? 0xf : 0) | (ch->command ? 0 : 1u << 10 /* PREFETCH_MODE: escape buffer only */) | 1u << 24;
+	}
 	gsi_wr(CH_QOS(c), value);
 	/* the GPI scratch: the most outstanding TREs (in bytes), the threshold 2 TREs */
 	gsi_wr(CH_SCRATCH(c, 0), (ch->tlv * ELEMENT_SIZE) << 16);
@@ -402,6 +441,10 @@ endpoint_program(const struct channel *ch)
 {
 	uint32_t ep = ch->endpoint, value;
 
+	if (v35) {
+		/* Linux's ipa_endpoint_program() before IPA 4.2: a TX endpoint's DELAY off, an RX endpoint's SUSPEND off */
+		ipa_wr(ENDP_INIT_CTRL(ep), 0);
+	}
 	ipa_wr(ENDP_INIT_CFG(ep), 0);                   /* no fragment or checksum offload */
 	ipa_wr(ENDP_INIT_NAT(ep), 0);                   /* NAT bypassed */
 	value = 0;
@@ -427,7 +470,11 @@ endpoint_program(const struct channel *ch)
 		/* the command endpoint moves its data to the LAN receive endpoint (DMA mode); the rest is basic */
 		ipa_wr(ENDP_INIT_MODE(ep), ch->command ? 3 | (uint32_t)lan_rx.endpoint << 4 : 0);
 	}
-	if (!ch->to_ipa && ch->aggregate) {
+	if (!ch->to_ipa && ch->aggregate && v35) {
+		/* IPA 3.5.1: the time limit at bits 14:10 in 500 us units (COUNTER_CFG's granularity), SW_EOF_ACTIVE bit 21 */
+		value = 1 /* AGGR_EN: aggregate */ | 4u << 2 /* AGGR_TYPE: generic */ | AGGR_LIMIT_KB << 5 | 1u << 10 /* 500 us */ |
+		    (ch->close_eof ? 1u << 21 /* SW_EOF_ACTIVE */ : 0);
+	} else if (!ch->to_ipa && ch->aggregate) {
 		value = 1 /* AGGR_EN: aggregate */ | 4u << 2 /* AGGR_TYPE: generic */ | AGGR_LIMIT_KB << 5 | AGGR_TIME_TICKS << 12 |
 		    (ch->close_eof ? 1u << 23 /* SW_EOF_ACTIVE */ : 0);
 	} else if (ch->to_ipa && ch->qmap) {
@@ -441,9 +488,11 @@ endpoint_program(const struct channel *ch)
 	} else {
 		ipa_wr(ENDP_INIT_DEAGGR(ep), 0);
 	}
-	ipa_wr(ENDP_INIT_RSRC_GRP(ep), 0);              /* resource group 0: UL/DL (the only one with limits) */
+	/* resource group 0: UL/DL (the only one with limits); IPA 3.5.1's UL/DL groups are 1 (SRC_UL_DL, DST_UL_DL_DPL) */
+	ipa_wr(ENDP_INIT_RSRC_GRP(ep), v35 ? 1 : 0);
 	if (ch->to_ipa) {
-		ipa_wr(ENDP_INIT_SEQ(ep), ch->command ? 0 /* DMA */ : 4 /* 2_PASS_SKIP_LAST_UC */);
+		/* (IPA 3.5.1: the modem's transmit endpoint replicates through the DMA parser, SEQ_REP_TYPE 8 at bits 15:8) */
+		ipa_wr(ENDP_INIT_SEQ(ep), ch->command ? 0 /* DMA */ : 4 /* 2_PASS_SKIP_LAST_UC */ | (v35 ? 8u << 8 : 0));
 	}
 	ipa_wr(ENDP_STATUS(ep), 0);                     /* no status packets */
 }
@@ -572,6 +621,7 @@ ipa_command(const char *what, uint8_t opcode, const void *payload, size_t size)
  * headers 0x688, 0x440 bytes in all.
  */
 #define FILTERED_ENDPOINTS      ((1ull << 2) | (1ull << 5) | (1ull << 8))
+#define FILTERED_ENDPOINTS_V3   ((1ull << 2) | (1ull << 3) | (1ull << 6))      /* IPA 3.5.1: ours to the modem, the modem's LAN and AP TX */
 #define FILTER_ENTRIES          4               /* the bitmap and one per filtering endpoint */
 #define ROUTE_ENTRIES           15
 
@@ -601,7 +651,7 @@ tables_setup(void)
 	} headers;
 
 	t[0] = 0;                                       /* the zero rule */
-	t[1] = FILTERED_ENDPOINTS << 1;                 /* the filter bitmap */
+	t[1] = (v35 ? FILTERED_ENDPOINTS_V3 : FILTERED_ENDPOINTS) << 1;  /* the filter bitmap */
 	for (unsigned n = 0; n < ROUTE_ENTRIES; n++) {
 		t[2 + n] = table.phys;
 	}
@@ -613,12 +663,13 @@ tables_setup(void)
 		return false;
 	}
 	headers.hdr_table_addr = zero.phys;
-	headers.flags = 0x440 | (mem_offset + 0x688) << 12;
+	/* the modem's headers and ours: 0x240 + 0x200; IPA 3.5.1 has the modem's 0x140 alone (Linux: no AP_HEADER region) */
+	headers.flags = (v35 ? 0x140 : 0x440) | (mem_offset + 0x688) << 12;
 	headers.reserved = 0;
 	if (!ipa_command("header table init", IPA_CMD_HDR_INIT_LOCAL, &headers, sizeof(headers))) {
 		return false;
 	}
-	ipa_wr(IPA_FILT_ROUT_HASH_FLUSH, 0x1111);      /* the hashed tables' caches, flushed */
+	ipa_wr(v35 ? IPA_FILT_ROUT_HASH_FLUSH_V3 : IPA_FILT_ROUT_HASH_FLUSH, 0x1111);  /* the hashed tables' caches, flushed */
 	return true;
 }
 
@@ -810,7 +861,7 @@ hakios_ipa_data_setup(void)
 		PE_parse_boot_argn("soc_ipa_base", &ipa_regs_phys, sizeof(ipa_regs_phys));
 		PE_parse_boot_argn("soc_gsi_base", &gsi_phys, sizeof(gsi_phys));
 		ipa_regs = ml_io_map(ipa_regs_phys, IPA_REGS_SIZE);
-		gsi_regs = ml_io_map(gsi_phys + GSI_FROM, GSI_SIZE);
+		gsi_regs = ml_io_map(gsi_phys + GSI_FROM, v35 ? GSI_SIZE_V3 : GSI_SIZE);
 	}
 	if (ipa_regs == 0 || gsi_regs == 0) {
 		printf("ipa: the registers cannot be mapped: no data path\n");

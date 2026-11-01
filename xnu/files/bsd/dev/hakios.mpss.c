@@ -2394,6 +2394,79 @@ ipa_hardware_init(void)
 
 
 /*
+ * The SDM845's IPA 3.5.1, set up as Linux's driver does before the modem (ipa_mem_config(), ipa_hardware_config(),
+ * ipa_resource_config() with ipa_data-v3.5.1.c and reg/ipa_reg-v3.1.c): its local memory -- at 0x1e47000 there
+ * ("ipa-shared"), not redwood's 0x1e50000 -- zeroed from the tables to the end of the modem's region (the
+ * microcontroller's areas, 0..0x288 and its event ring from 0x1c00, left alone) and its canaries written; the
+ * backward-compatibility bits, the QSB masters' limits, the aggregation timer's granularity (500 us), the
+ * resource groups' limits (four source groups, three destination ones), and the default route to the LAN
+ * endpoint (9). The idle indication Linux's 3.1 register table has not: left as it is.
+ */
+static struct block ipa_sram_v35 = { "ipa-shared (IPA 3.5.1)", 0x01e47000, 0x2000 };
+#define IPA_BCR                 0x1d0
+#define IPA_COUNTER_CFG         0x1f0
+
+static void
+ipa_hardware_init_v35(void)
+{
+	static const uint16_t canaries[][2] = {
+		{ 0x0288, 2 }, { 0x0308, 2 }, { 0x0388, 2 }, { 0x0408, 2 }, { 0x0488, 2 }, { 0x0508, 2 }, { 0x0588, 2 }, { 0x0608, 2 },
+		{ 0x0688, 2 }, { 0x07d0, 2 }, { 0x1c00, 1 },
+	};
+	/* per resource type: groups 0..3 (sources: LWA_DL, UL_DL, MHI_DMA, UC_RX_Q) as min, max */
+	static const uint8_t source[5][4][2] = {
+		{ { 1, 63 }, { 1, 63 }, { 0, 0 }, { 1, 63 } },         /* packet contexts */
+		{ { 10, 10 }, { 10, 10 }, { 0, 0 }, { 8, 8 } },        /* descriptor lists */
+		{ { 12, 12 }, { 14, 14 }, { 0, 0 }, { 8, 8 } },        /* descriptor buffers */
+		{ { 0, 63 }, { 0, 63 }, { 0, 63 }, { 0, 63 } },        /* HPS DMARs */
+		{ { 14, 14 }, { 20, 20 }, { 0, 0 }, { 14, 14 } },      /* ACK entries */
+	};
+	/* groups 0..2 (destinations: LWA_DL, UL_DL_DPL, unused) */
+	static const uint8_t destination[2][3][2] = {
+		{ { 4, 4 }, { 4, 4 }, { 3, 3 } },                       /* data sectors */
+		{ { 2, 63 }, { 1, 63 }, { 1, 2 } },                     /* DPS DMARs */
+	};
+	const uint32_t end = 0x0bd8 + 0x1024;                   /* the modem's region's end */
+
+	need(&ipa_sram_v35);
+	need(&ipa_regs);
+	for (uint32_t at = 0x288; at < end; at += 4) {
+		wr(ipa_sram_v35.base + ipa_mem_offset + at, 0);
+	}
+	for (unsigned r = 0; r < sizeof(canaries) / sizeof(canaries[0]); r++) {
+		for (unsigned c = 1; c <= canaries[r][1]; c++) {
+			wr(ipa_sram_v35.base + ipa_mem_offset + canaries[r][0] - 4 * c, 0xdeadbeef);
+		}
+	}
+	/* BCR: CMDQ_L_LACK_ONE_ENTRY, TX_NOT_USING_BRESP, SUSPEND_L2_IRQ, HOLB_DROP_L2_IRQ, DUAL_TX */
+	wr(ipa_regs.base + IPA_BCR, 1u << 0 | 1u << 1 | 1u << 3 | 1u << 4 | 1u << 5);
+	/* QSB: the DDR master 8 writes and 8 reads outstanding, PCIe's 4 and 12 */
+	wr(ipa_regs.base + IPA_QSB_MAX_WRITES, 8 | 4u << 4);
+	wr(ipa_regs.base + IPA_QSB_MAX_READS, 8 | 12u << 4);
+	/* the aggregation timer's granularity: 500 us of the 32 kHz clock, less one (AGGR_GRANULARITY, bits 8:4) */
+	wr(ipa_regs.base + IPA_COUNTER_CFG, 15u << 4);
+	for (unsigned t = 0; t < 5; t++) {
+		wr(ipa_regs.base + IPA_SRC_RSRC_GRP_01(t), RSRC(source[t][0][0], source[t][0][1], source[t][1][0], source[t][1][1]));
+		wr(ipa_regs.base + IPA_SRC_RSRC_GRP_23(t), RSRC(source[t][2][0], source[t][2][1], source[t][3][0], source[t][3][1]));
+	}
+	for (unsigned t = 0; t < 2; t++) {
+		wr(ipa_regs.base + IPA_DST_RSRC_GRP_01(t), RSRC(destination[t][0][0], destination[t][0][1], destination[t][1][0],
+		    destination[t][1][1]));
+		wr(ipa_regs.base + IPA_DST_RSRC_GRP_23(t), RSRC(destination[t][2][0], destination[t][2][1], 0, 0));
+	}
+	/* the default route: not disabled, the LAN endpoint 9, header table 1, fragments to 9, the header retained */
+	wr(ipa_regs.base + IPA_ROUTE, 0x1120052);
+	settle();
+	printf("mpss: ipa: the IPA 3.5.1 set up as Linux's driver does: local memory zeroed (0x288..%#x at offset %#x) and its canaries "
+	    "written; BCR %#x, QSB %#x %#x, counter %#x, route %#x, source group 1 %u/%u/%u/%u/%u, destination sectors %#x\n", end,
+	    ipa_mem_offset, rd(ipa_regs.base + IPA_BCR), rd(ipa_regs.base + IPA_QSB_MAX_WRITES), rd(ipa_regs.base + IPA_QSB_MAX_READS),
+	    rd(ipa_regs.base + IPA_COUNTER_CFG), rd(ipa_regs.base + IPA_ROUTE), (rd(ipa_regs.base + IPA_SRC_RSRC_GRP_01(0)) >> 16) & 0xff,
+	    (rd(ipa_regs.base + IPA_SRC_RSRC_GRP_01(1)) >> 16) & 0xff, (rd(ipa_regs.base + IPA_SRC_RSRC_GRP_01(2)) >> 16) & 0xff,
+	    (rd(ipa_regs.base + IPA_SRC_RSRC_GRP_01(3)) >> 16) & 0xff, (rd(ipa_regs.base + IPA_SRC_RSRC_GRP_01(4)) >> 16) & 0xff,
+	    rd(ipa_regs.base + IPA_DST_RSRC_GRP_01(0)));
+}
+
+/*
  * The IPA reaches memory through the application processors' SMMU (dt of Linux: iommus 0x480 and
  * 0x482 of apps_smmu), where a stream nobody matches faults, and the hypervisor grants no bypass
  * (tried on 24 October: the S2CR stayed "fault"). So, as the Wi-Fi's radio has (hakios.wifi.c,
@@ -2837,7 +2910,8 @@ ipa_firmware_load(void)
 		/*
 		 * The SDM845's IPA is 3.5.1: what follows (GSI_CFG, which its TrustZone guards; the status, the local
 		 * memory, the hardware's set-up and our channels) is laid out for the first phone's IPA 4 and lands on
-		 * other registers there (crash dump 4, 31 October). Its firmware runs; the rest is the modem's for now.
+		 * other registers there (crash dump 4, 31 October). Here instead: IPA 3.5.1's set-up, then our
+		 * channels and endpoints in hakios.ipa.c's IPA 3.5.1 form (modem_ipa_raw=1: neither).
 		 */
 		uint32_t shared;
 
@@ -2846,8 +2920,16 @@ ipa_firmware_load(void)
 		shared = rd(ipa_regs.base + 0x54);
 		ipa_mem_offset = 8 * (shared >> 16);
 		wr(ipa_regs.base + 0x1e8, ipa_mem_offset + 0x07d0);
-		printf("mpss: %u: the IPA is an SDM845's (3.5.1): its local memory is %u bytes at offset %#x (SHARED_MEM_SIZE %#x); the rest "
-		    "of its set-up is not done from here\n", step, 8 * (shared & 0xffff), ipa_mem_offset, shared);
+		printf("mpss: %u: the IPA is an SDM845's (3.5.1): its local memory is %u bytes at offset %#x (SHARED_MEM_SIZE %#x)\n", step,
+		    8 * (shared & 0xffff), ipa_mem_offset, shared);
+		if (!option("modem_ipa_raw")) {
+			ipa_hardware_init_v35();
+			hakios_ipa_version_3_5_1();
+			/* this processor's own channels and endpoints, and the IPA's tables, before the modem (hakios.ipa.c); then en1 on them */
+			if (hakios_ipa_data_setup()) {
+				hakios_cell_attach();
+			}
+		}
 		ok = true;
 		ipa_tz_loaded = true;
 		goto out;

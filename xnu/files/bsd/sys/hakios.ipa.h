@@ -27,6 +27,8 @@
  * path (the log says why); everything else goes on without it.
  */
 bool hakios_ipa_data_setup(void);
+/* The SDM845's IPA 3.5.1 (GSI 1.3) rather than IPA 4.11: called before hakios_ipa_data_setup(). */
+void hakios_ipa_version_3_5_1(void);
 bool hakios_ipa_data_ready(void);
 /* One IP packet to the modem on QMAP mux `mux`. Copied. False if dropped (no room, too long). */
 bool hakios_ipa_transmit(uint8_t mux, const void *packet, size_t length);
