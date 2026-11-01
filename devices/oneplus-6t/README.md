@@ -618,8 +618,10 @@ WDA in QMAPv4 as the SDM845's Android asks for it (`modem_qmap1=1`: plain QMAP),
 with an address every time. The modem's own counts (WDS 0x24) show our packets going out to the network and nothing
 coming back -- echoes (`cell_ping=1`, `=N` for size) and DNS queries to the session's server (`cell_dns=1`) alike --
 and Android on this phone gets no data from the same SIM either (its APN `nxtgenphone`; `data.lycamobile.com` is
-refused), though the SIM works in another phone: an APN or network-side question, left for later. Still to do on
-our side: en1 is attached but iOS's configd never configures it (it has no IOKit object). Keep `thermal` and
+refused), though the SIM works in another phone: an APN or network-side question, left for later. On our side en1 is now in
+the IOKit registry as an Ethernet interface (`HakiosEthernetStart()`, beside the Wi-Fi's), and iOS configures it:
+with `cell_fake=1` (en1 at start with a made-up session, no modem) configd asked DHCP on it, took 10.64.0.2 and the
+router, and routed its traffic out through it (run 2 November, 171 packets, dropped for want of a modem behind). Keep `thermal` and
 `bootcpu` in run.args for modem runs: without them the modem stays offline. A run (the line must fit XNU's 1023
 characters: xl refuses one that does not):
 
