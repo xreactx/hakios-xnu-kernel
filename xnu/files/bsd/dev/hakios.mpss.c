@@ -1532,6 +1532,7 @@ image_forget(void)
 
 static unsigned rmtfs_load(void);
 static void servreg_load(void);
+extern void hakios_wlfw10_start(void);          /* bsd/dev/hakios.wlfw10.c */
 
 static bool
 step_firmware(void)
@@ -3825,6 +3826,9 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 			qrtr_servers[found].port = control->words[3];
 		}
 		lck_mtx_unlock(&qrtr_lock);
+		if (control->words[0] == 69) {
+			hakios_wlfw10_start();          /* (the Wi-Fi firmware's service: hakios.wlfw10.c, with wifi10=N) */
+		}
 		printf("mpss: qrtr: a service: %u (%#x), version %u, instance %u, at node %u port %u\n", control->words[0],
 		    control->words[0], control->words[1] & 0xff, control->words[1] >> 8, control->words[2], control->words[3]);
 		qrtr_tell(control->words[0], control->words[1], control->words[2], control->words[3], true);
@@ -4362,6 +4366,10 @@ rmtfs_share(bool in)
 
 #define OWNER_HLOS              1u
 #define OWNER_MSA               2u
+#define OWNER_WLAN              4u              /* the Wi-Fi firmware's (QCOM_SCM_VMID_WLAN 0x18) ... */
+#define OWNER_WLAN_CE           8u              /* ... and its copy engines' (QCOM_SCM_VMID_WLAN_CE 0x19) */
+#define VMID_WLAN               0x18
+#define VMID_WLAN_CE            0x19
 
 static bool
 mss_assign_owners(uint64_t address, uint64_t size, uint32_t from, uint32_t to, const char *what);
@@ -4407,12 +4415,26 @@ mss_assign_owners(uint64_t address, uint64_t size, uint32_t from, uint32_t to, c
 	if (from & OWNER_MSA) {
 		page->sources[sources++] = VMID_MSS_MSA;
 	}
+	if ((from & OWNER_WLAN) && sources < 3) {
+		page->sources[sources++] = VMID_WLAN;
+	}
+	if ((from & OWNER_WLAN_CE) && sources < 3) {
+		page->sources[sources++] = VMID_WLAN_CE;
+	}
 	if (to & OWNER_HLOS) {
 		page->destinations[destinations].vmid = VMID_HLOS;
 		page->destinations[destinations++].permission = VM_PERM_RWX;
 	}
 	if (to & OWNER_MSA) {
 		page->destinations[destinations].vmid = VMID_MSS_MSA;
+		page->destinations[destinations++].permission = VM_PERM_RW;
+	}
+	if ((to & OWNER_WLAN) && destinations < 3) {
+		page->destinations[destinations].vmid = VMID_WLAN;
+		page->destinations[destinations++].permission = VM_PERM_RW;
+	}
+	if ((to & OWNER_WLAN_CE) && destinations < 3) {
+		page->destinations[destinations].vmid = VMID_WLAN_CE;
 		page->destinations[destinations++].permission = VM_PERM_RW;
 	}
 	pa = kvtophys(memory);
@@ -4432,9 +4454,30 @@ mss_assign_owners(uint64_t address, uint64_t size, uint32_t from, uint32_t to, c
 		    to & OWNER_HLOS ? "HLOS " : "", to & OWNER_MSA ? "MSA" : "", result, answer);
 		return false;
 	}
-	printf("mpss: %u: %s (%#llx, %#llx bytes) is now %s%s%s\n", step, what, address, size, to & OWNER_HLOS ? "ours" : "",
-	    to == (OWNER_HLOS | OWNER_MSA) ? " and " : "", to & OWNER_MSA ? "the modem's" : "");
+	printf("mpss: %u: %s (%#llx, %#llx bytes) is now %s%s%s%s%s\n", step, what, address, size, to & OWNER_HLOS ? "ours" : "",
+	    to == (OWNER_HLOS | OWNER_MSA) ? " and " : "", to & OWNER_MSA ? "the modem's" : "", to & OWNER_WLAN ? ", the Wi-Fi's" : "",
+	    to & OWNER_WLAN_CE ? ", its copy engines'" : "");
 	return true;
+}
+
+/*
+ * For the Wi-Fi firmware's client (hakios.wlfw10.c): a region of its memory (MSA) given to the modem's MSA, the Wi-Fi
+ * and -- unless the firmware calls it secure -- its copy engines, or back to us (Linux's ath10k_qmi_map_msa_permission()).
+ */
+bool
+hakios_mpss_assign_wlan(uint64_t address, uint64_t size, bool secure, bool to_firmware)
+{
+	uint32_t firmware = OWNER_MSA | OWNER_WLAN | (secure ? 0 : OWNER_WLAN_CE);
+
+	return to_firmware ? mss_assign_owners(address, size, OWNER_HLOS, firmware, "the Wi-Fi firmware's memory") :
+	       mss_assign_owners(address, size, firmware, OWNER_HLOS, "the Wi-Fi firmware's memory");
+}
+
+/* For the Wi-Fi firmware's client: a file of /fw (the modem's image, staged by MODEM=1 builds); free with kfree_data(). */
+const uint8_t *
+hakios_mpss_fw_file(const char *name, uint64_t *size)
+{
+	return root_file(name, size);
 }
 
 /*
