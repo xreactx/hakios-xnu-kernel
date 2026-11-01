@@ -38,6 +38,7 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 
 extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+static bool scanReady(void);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -163,6 +164,16 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
  * Reading them takes two bus clocks, turned on once as display_probe() turns them on (one bit each).
  */
 static TUNABLE(uint32_t, gScan, "fb_scan", 0);
+static TUNABLE(uint32_t, gProbe, "fb_probe", 0);  /* (see scanProbe()) */
+/*
+ * Boot-arg fb_flip=1 (with soc_display=845, the OnePlus 6T): two buffers, the panel's and one beside it in the
+ * firmware's splash memory; a frame is drawn into the one not shown, and the display controller's pipe is
+ * pointed at it once drawn -- the panel never gets half of a frame (see flipReady()).
+ */
+static TUNABLE(uint32_t, gFlip, "fb_flip", 0);
+static bool flipReady(uint64_t frontPhys, uint32_t rowBytes, uint32_t height, uint8_t * front);   /* (needs fb_map_mb=26) */
+static uint8_t * flipBack(void);
+static void flipShow(void);
 /*
  * Boot-arg fb_threads=N (1 to 8): so many processors scale a frame onto the panel together (see
  * drawRows()). Three by default: a frame is in the panel's memory 3 ms after its turn instead of 9
@@ -237,7 +248,9 @@ class IOMobileFramebuffer : public IOService
 
 public:
 	IOLock *        fLock;
-	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
+	uint8_t *       fBase;                  /* the boot framebuffer: the panel (fb_flip=1: the buffer being drawn) */
+	uint64_t        fBasePhys;              /* its physical address */
+	bool            fFlip;                  /* fb_flip=1, and its registers were found as expected */
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
 	MiniIOSurface * fDefaultSurface;
@@ -428,6 +441,7 @@ IOMobileFramebuffer::start(IOService * provider)
 		thread_deallocate(thread);
 	}
 	fBase = (uint8_t *) vinfo.v_baseaddr;
+	fBasePhys = vinfo.v_physaddr;
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
@@ -938,8 +952,23 @@ IOMobileFramebuffer::presenter(void)
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 {
+	static bool probed;
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
+
+	if (!probed) {
+		/* (fb_probe=1: the display's registers at the first frame -- the vsync path that would ask is never taken) */
+		probed = true;
+		if (gProbe) {
+			scanReady();
+		}
+		if (gFlip) {
+			fFlip = flipReady(fBasePhys, fRowBytes, fPanelHeight, fBase);
+		}
+	}
+	if (fFlip && fGraphics) {
+		fBase = flipBack();             /* (the one not shown, once the last flip has been taken up) */
+	}
 	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
 	bool report;
@@ -1050,6 +1079,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	drawn = mach_absolute_time();
+	if (fFlip && fGraphics) {
+		flipShow();
+	}
 	if (recorded != NULL) {
 		record(recorded);
 	}
@@ -1243,6 +1275,15 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define SCAN_DISPCC             0x0af00000              /* the display's clock controller: its register bus clock */
 #define SCAN_DISPCC_MDSS_AHB_CBCR 0x1050
 #define SCAN_INTF               0x0ae36000              /* intf1, the DSI interface the panel hangs on */
+/*
+ * Boot-arg soc_display=845: the SDM845's (the OnePlus 6T's) numbers instead -- Linux's gcc-sdm845.c
+ * (gcc_disp_ahb_clk at 0xb00c), dispcc-sdm845.c (disp_cc_mdss_ahb_clk at 0x4004), and its INTF_1 at
+ * 0xae01000 + 0x6a800 (dpu_4_0_sdm845.h; the 6T's tree: qcom,sde-intf-off 0x6b800 from 0xae00000).
+ */
+#define SCAN_845_GCC_DISP_AHB_CBCR      0xb00c
+#define SCAN_845_DISPCC_MDSS_AHB_CBCR   0x4004
+#define SCAN_845_INTF                   0x0ae6b800
+static TUNABLE(uint32_t, gSocDisplay, "soc_display", 0);
 #define SCAN_INTF_HSYNC_CTL     0x008                   /* clocks a line << 16 */
 #define SCAN_INTF_VSYNC_PERIOD  0x00c                   /* clocks a frame */
 #define SCAN_INTF_FRAME_COUNT   0x0ac
@@ -1256,7 +1297,6 @@ static volatile uint32_t * gScanIntf;
  * pipe's size, address, stride and format, each control path's layers, top and flush. Only reads.
  */
 #define SCAN_MDP                0x0ae00000
-static TUNABLE(uint32_t, gProbe, "fb_probe", 0);
 
 static void
 scanProbe(void)
@@ -1313,11 +1353,16 @@ scanReady(void)
 	}
 	gScanState = -1;
 	hakios_tl("fb_scan: the display's counters asked for\n");
-	gcc = (volatile uint32_t *) ml_io_map(SCAN_GCC + SCAN_GCC_DISP_AHB_CBCR, 4);
-	dispcc = (volatile uint32_t *) ml_io_map(SCAN_DISPCC + SCAN_DISPCC_MDSS_AHB_CBCR, 4);
-	gScanIntf = (volatile uint32_t *) ml_io_map(SCAN_INTF, 0x100);
+	{
+		bool sdm845 = gSocDisplay == 845;
+
+		gcc = (volatile uint32_t *) ml_io_map(SCAN_GCC + (sdm845 ? SCAN_845_GCC_DISP_AHB_CBCR : SCAN_GCC_DISP_AHB_CBCR), 4);
+		dispcc = (volatile uint32_t *) ml_io_map(SCAN_DISPCC + (sdm845 ? SCAN_845_DISPCC_MDSS_AHB_CBCR :
+		    SCAN_DISPCC_MDSS_AHB_CBCR), 4);
+		gScanIntf = (volatile uint32_t *) ml_io_map(sdm845 ? SCAN_845_INTF : SCAN_INTF, 0x100);
+	}
 	if (gcc == NULL || dispcc == NULL || gScanIntf == NULL) {
-		IOLog("MiniIOMobileFramebuffer: fb_scan: the display's registers cannot be mapped: our own refresh clock\n");
+		hakios_tl("fb_scan: the display's registers cannot be mapped: our own refresh clock\n");
 		return false;
 	}
 	*gcc |= 1;                                      /* (the firmware leaves it off; Linux keeps it on) */
@@ -1325,9 +1370,15 @@ scanReady(void)
 	*dispcc |= 1;
 	IODelay(10000);
 	if (*dispcc & 0x80000000u) {
-		IOLog("MiniIOMobileFramebuffer: fb_scan: the display block's register clock does not run (%#x): our own refresh "
+		hakios_tl("fb_scan: the display block's register clock does not run (%#x): our own refresh "
 		    "clock\n", *dispcc);
 		return false;
+	}
+	hakios_tl("fb_scan: clocks %#x %#x; interface hsync %#x vsync period %#x frame %#x line %#x\n", *gcc, *dispcc,
+	    gScanIntf[SCAN_INTF_HSYNC_CTL / 4], gScanIntf[SCAN_INTF_VSYNC_PERIOD / 4], gScanIntf[SCAN_INTF_FRAME_COUNT / 4],
+	    gScanIntf[SCAN_INTF_LINE_COUNT / 4]);
+	if (gProbe) {
+		scanProbe();            /* (whatever the counters say) */
 	}
 	line = gScanIntf[SCAN_INTF_HSYNC_CTL / 4] >> 16;
 	gScanLines = line != 0 ? gScanIntf[SCAN_INTF_VSYNC_PERIOD / 4] / line : 0;
@@ -1337,7 +1388,7 @@ scanReady(void)
 	scanRead(&f1, &l1, &t1);
 	lines = (uint64_t)(f1 - f0) * gScanLines + l1 - l0;
 	if (gScanLines < 100 || lines == 0 || l0 >= gScanLines || l1 >= gScanLines) {
-		IOLog("MiniIOMobileFramebuffer: fb_scan: the counters make no sense (%u lines a scan; frame %u line %u, then %u %u): our "
+		hakios_tl("fb_scan: the counters make no sense (%u lines a scan; frame %u line %u, then %u %u): our "
 		    "own refresh clock\n", gScanLines, f0, l0, f1, l1);
 		return false;
 	}
@@ -1347,16 +1398,136 @@ scanReady(void)
 
 		absolutetime_to_nanoseconds((gScanLineAbs * gScanLines) >> 16, &ns);
 		scan = ns;
-		IOLog("MiniIOMobileFramebuffer: fb_scan: THE REFRESHES ARE THE PANEL'S: %u lines a scan, %llu.%03llu ms each (%llu.%02llu a "
+		hakios_tl("fb_scan: THE REFRESHES ARE THE PANEL'S: %u lines a scan, %llu.%03llu ms each (%llu.%02llu a "
 		    "second); a vsync every second scan\n", gScanLines, scan / 1000000, scan / 1000 % 1000, 1000000000ull / scan,
 		    100000000000ull / scan % 100);
 	}
 	gScanState = 1;
 	hakios_tl("fb_scan: the refreshes are the panel's: %u lines a scan\n", gScanLines);
-	if (gProbe) {
-		scanProbe();
-	}
 	return true;
+}
+
+/*
+ * fb_flip=1. The 6T's panel is in command mode (CTL_0's top register: bit 17), fed by source pipe VIG0 from the
+ * firmware's splash memory (fb_probe=1, 1 November: VIG0 at 0x9d400000, 2340 x 1080, rows of 4320 bytes; control
+ * path 0). A pipe's address is double-buffered: written, then its bit in the control path's flush register; the
+ * controller takes it up at the next frame it sends and clears the bit (Linux: dpu_hw_sspp.c SSPP_SRC0_ADDR,
+ * dpu_hw_ctl.c CTL_FLUSH, VIG0 bit 0). The second buffer is 16 MB into the splash region (36 MB: the tree's
+ * cont_splash_region), far from the kernel's memory (the loader's window: 0xf4000000 up). The loader points
+ * the pipe back at the first buffer when the kernel returns (xnuloader/loader.c).
+ */
+#define FLIP_VIG0               0x5000
+#define FLIP_SRC0_ADDR          0x14
+#define FLIP_SRC_YSTRIDE0       0x24
+#define FLIP_CTL0               0x2000
+#define FLIP_CTL_FLUSH          0x18
+#define FLIP_CTL_TOP            0x14
+#define FLIP_VIG0_BIT           (1u << 0)
+#define FLIP_BUFFERS            3                       /* (two made each frame wait for the last flip: app zooms stuttered) */
+#define FLIP_SPACING            (10u << 20)             /* a frame is 10108800 bytes */
+#define FLIP_SPLASH_SIZE        (36u << 20)
+
+static volatile uint32_t * gFlipMdp;
+static uint8_t * gFlipBuffer[FLIP_BUFFERS];
+static uint64_t gFlipPhys[FLIP_BUFFERS];
+static unsigned gFlipShown;                             /* the one the pipe reads (its last flip taken up) */
+static unsigned gFlipWritten;                           /* the one last given to the pipe (taken up, or still pending) */
+static unsigned gFlipTarget;                            /* the one being drawn (flipBack()), given to the pipe by flipShow() */
+static uint32_t gFlipFrames, gFlipPending;              /* frames drawn; of them, while the flip before was still pending */
+
+static bool
+flipReady(uint64_t frontPhys, uint32_t rowBytes, uint32_t height, uint8_t * front)
+{
+	volatile uint32_t * gcc, * dispcc;
+	uint64_t size = (uint64_t) rowBytes * height;
+
+	if (gSocDisplay != 845 || size > FLIP_SPACING || (FLIP_BUFFERS - 1) * FLIP_SPACING + size > FLIP_SPLASH_SIZE) {
+		hakios_tl("fb_flip: not here (soc_display=845 and a frame of at most 10 MB wanted; the panel at %#llx, %llu bytes)\n",
+		    frontPhys, size);
+		return false;
+	}
+	gcc = (volatile uint32_t *) ml_io_map(SCAN_GCC + SCAN_845_GCC_DISP_AHB_CBCR, 4);
+	dispcc = (volatile uint32_t *) ml_io_map(SCAN_DISPCC + SCAN_845_DISPCC_MDSS_AHB_CBCR, 4);
+	gFlipMdp = (volatile uint32_t *) ml_io_map(SCAN_MDP, 0x10000);
+	if (gcc == NULL || dispcc == NULL || gFlipMdp == NULL) {
+		hakios_tl("fb_flip: the display's registers cannot be mapped\n");
+		return false;
+	}
+	*gcc |= 1;
+	IODelay(10000);
+	*dispcc |= 1;
+	IODelay(10000);
+	if (frontPhys == 0) {
+		frontPhys = gFlipMdp[(FLIP_VIG0 + FLIP_SRC0_ADDR) / 4];   /* (the console may not know it: what the panel shows) */
+	}
+	if (frontPhys == 0 || gFlipMdp[(FLIP_VIG0 + FLIP_SRC0_ADDR) / 4] != (uint32_t) frontPhys ||
+	    (gFlipMdp[(FLIP_VIG0 + FLIP_SRC_YSTRIDE0) / 4] & 0xffff) != rowBytes ||
+	    !(gFlipMdp[(FLIP_CTL0 + FLIP_CTL_TOP) / 4] & (1u << 17))) {
+		hakios_tl("fb_flip: the display is not as expected (VIG0 at %#x, rows of %u; control path 0's top %#x): one buffer\n",
+		    gFlipMdp[(FLIP_VIG0 + FLIP_SRC0_ADDR) / 4], gFlipMdp[(FLIP_VIG0 + FLIP_SRC_YSTRIDE0) / 4] & 0xffff,
+		    gFlipMdp[(FLIP_CTL0 + FLIP_CTL_TOP) / 4]);
+		return false;
+	}
+	{
+		/* (mapped at boot with the first: boot-arg fb_map_mb, pexpert/arm/pe_init.c; a mapping made now runs out of room) */
+		uint32_t mapped = 0;
+
+		uint64_t wanted = (FLIP_BUFFERS - 1) * (uint64_t) FLIP_SPACING + size;
+
+		if (!PE_parse_boot_argn("fb_map_mb", &mapped, sizeof(mapped)) || ((uint64_t) mapped << 20) < wanted) {
+			hakios_tl("fb_flip: the console maps %u MB of the splash memory: fb_map_mb=%llu wanted; one buffer\n", mapped,
+			    (wanted + (1u << 20) - 1) >> 20);
+			return false;
+		}
+	}
+	for (unsigned i = 0; i < FLIP_BUFFERS; i++) {
+		gFlipPhys[i] = frontPhys + (uint64_t) i * FLIP_SPACING;
+		gFlipBuffer[i] = front + (size_t) i * FLIP_SPACING;
+		if (i != 0) {
+			memcpy(gFlipBuffer[i], front, (size_t) size);    /* (the same picture, whichever is shown first) */
+		}
+	}
+	gFlipShown = gFlipWritten = 0;
+	hakios_tl("fb_flip: %u BUFFERS from %#llx, %u MB apart (%llu bytes each); VIG0 flipped through control path 0\n",
+	    FLIP_BUFFERS, gFlipPhys[0], FLIP_SPACING >> 20, size);
+	return true;
+}
+
+/*
+ * The buffer to draw into, without waiting: neither the one shown nor the one last given to the pipe (if its
+ * flip is still pending, the next replaces it, and the one shown stays shown until a flip is taken up).
+ */
+static uint8_t *
+flipBack(void)
+{
+	unsigned target;
+
+	if (!(gFlipMdp[(FLIP_CTL0 + FLIP_CTL_FLUSH) / 4] & FLIP_VIG0_BIT)) {
+		gFlipShown = gFlipWritten;                      /* (taken up: the pipe reads it now) */
+	} else {
+		gFlipPending++;
+	}
+	for (target = 0; target == gFlipShown || target == gFlipWritten; target++) {
+	}
+	gFlipTarget = target;
+	gFlipFrames++;
+	if ((gFlipFrames & 1023) == 0) {
+		hakios_tl("fb_flip: %u frames, %u of them drawn while the flip before was still pending\n", gFlipFrames, gFlipPending);
+	}
+	return gFlipBuffer[target];
+}
+
+/* The drawn buffer to the panel: the pipe's address, then its flush bit. */
+static void
+flipShow(void)
+{
+	unsigned next = gFlipTarget;
+
+	__asm__ volatile ("dsb sy" ::: "memory");       /* (the write-combined frame out before the pipe reads it) */
+	gFlipMdp[(FLIP_VIG0 + FLIP_SRC0_ADDR) / 4] = (uint32_t) gFlipPhys[next];
+	gFlipMdp[(FLIP_CTL0 + FLIP_CTL_FLUSH) / 4] = FLIP_VIG0_BIT;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gFlipWritten = next;                            /* (shown once taken up: see flipBack()) */
 }
 
 /* The start of the first even-numbered scan at least `after` (mach_absolute_time); 0 if the counters cannot be had. */

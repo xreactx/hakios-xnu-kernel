@@ -3126,6 +3126,29 @@ index 3ad743fc3efb..ce036c5a2c26 100644
  #else
  void
  pe_init_fiq()
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index c622b4cc84ab..aa67c8772fb3 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -414,6 +414,18 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 		PE_state.video.v_scale = ((boot_args_ptr->Video.v_depth >> kBootVideoDepthScaleShift) & kBootVideoDepthMask) + 1;
+ 		PE_state.video.v_display = boot_args_ptr->Video.v_display;
+ 		strlcpy(PE_state.video.v_pixelFormat, "BBBBBBBBGGGGGGGGRRRRRRRR", sizeof(PE_state.video.v_pixelFormat));
++		{
++			/*
++			 * hakios: boot-arg fb_map_mb=N -- the console maps N MB of video memory, not one frame: room
++			 * for a second buffer beside the first (the OnePlus 6T's fb_flip=1, iokit's MiniIOMobileFramebuffer),
++			 * mapped now, while the kernel's address space has room for it.
++			 */
++			uint32_t map_mb = 0;
++
++			if (PE_parse_boot_argn("fb_map_mb", &map_mb, sizeof(map_mb)) && map_mb != 0 && map_mb <= 64) {
++				PE_state.video.v_length = (unsigned long)map_mb << 20;
++			}
++		}
+ 	}
+ 	if (!vm_initialized) {
+ 		/*
 diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
 index 65144c74239c..ab6260d52d84 100644
 --- a/pexpert/arm/pe_kprintf.c
