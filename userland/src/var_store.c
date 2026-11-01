@@ -81,6 +81,15 @@ static const char *const SKIP[] = {
 	"log", "logs",          /* what the last boot said */
 	"db/diagnostics", "db/uuidtext",        /* logd's archive: tens of MB a boot, and remade */
 	"jb",                   /* the package prefix, grafted from the read-only image at every boot */
+	/*
+	 * What iOS remakes by itself and what only grows: on the OnePlus 6T these were 80 of the archive's
+	 * 165 MB (1 November), its store a 201 MiB slot. Usage-event streams for Siri's suggestions and Biome,
+	 * the icon cache, diagnostics and analytics; every Library/Caches besides (is_skipped()).
+	 */
+	"mobile/Library/DuetExpertCenter",
+	"mobile/Library/Biome", "db/biome",
+	"containers/Shared/SystemGroup/systemgroup.com.apple.lsd.iconscache",
+	"wireless/awdd", "db/analyticsd", "Keychains/Analytics",
 	NULL,
 };
 
@@ -531,12 +540,16 @@ static uint64_t skipped_kinds, skipped_big;
 static int
 is_skipped(const char *relative)
 {
+	static const char caches[] = "Library/Caches";
+	size_t n = strlen(relative), c = sizeof(caches) - 1;
+
 	for (int i = 0; SKIP[i] != NULL; i++) {
 		if (strcmp(relative, SKIP[i]) == 0) {
 			return 1;
 		}
 	}
-	return 0;
+	/* a Library/Caches anywhere: the user's, a container's, a daemon's (what is in a cache is to be had again) */
+	return n >= c && strcmp(relative + n - c, caches) == 0 && (n == c || relative[n - c - 1] == '/');
 }
 
 /* The name this inode was first met under, if it has one; otherwise this one is remembered. */

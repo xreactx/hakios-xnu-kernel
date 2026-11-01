@@ -154,8 +154,11 @@ the store. `ufs=2 ufs_write=1 var_store=1` are in `run.args` (every run loads th
 at the end; the kernel's and the loader's command line is 1024 bytes now, Apple's 608 having been too small for
 the 6T's own boot-args):
 the first run saved `/private/var` (138 MB), the next put it back at boot (6411 directories, 2492 files) and
-saved into the other slot (165 MB). Flashing a new image into `system_a` leaves the store as it is. The volume
-already fills 80 % of a slot: past it a save fails and the older slot is kept.
+saved into the other slot (165 MB). Flashing a new image into `system_a` leaves the store as it is. Half of
+that was what iOS remakes or only adds to -- the usage-event streams of Siri's suggestions and Biome, the icon
+cache, diagnostics, every `Library/Caches` -- and is left out now (`var_store.c`, SKIP and `is_skipped()`): the
+volume is 85 MB, 42 % of a slot (runs 125928 and the next). A save that would not fit fails and the older slot
+is kept.
 
 **6. Touch and buttons.**
 
