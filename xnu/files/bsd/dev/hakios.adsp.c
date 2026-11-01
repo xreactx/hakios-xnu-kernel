@@ -100,6 +100,9 @@
 #include <vm/vm_kern.h>
 #include <sys/hakios.audio.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.qrtr.h>
+
+extern void hakios_slim_start(void);           /* bsd/dev/hakios.slim.c */
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
@@ -2511,6 +2514,178 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
 	return error;
 }
 
+/*
+ * QRTR ports of our own on the DSP's link, for the QMI helpers (sys/hakios.qrtr.h): what hakios.wifi.c has for
+ * the Wi-Fi DSP, the same here -- the SLIMbus driver (hakios.slim.c) asks the audio DSP's SLIMbus service
+ * (769) through it. Ports are numbered as Linux numbers those that ask for no number.
+ */
+#define HAKIOS_QRTR_MAX         8192
+#define QRTR_FIRST_PORT         0x4000u
+
+struct hakios_qrtr_port {
+	uint32_t number;                        /* 0: free */
+	hakios_qrtr_receive_t receive;
+	hakios_qrtr_server_t server;
+	void *context;
+	struct {
+		uint32_t service, instance;     /* the instance as on the wire: version | instance << 8; 0: any */
+		bool asked;
+		bool fresh;                     /* not yet told of the services that were there before it */
+	} lookups[4];
+};
+
+static LCK_MTX_DECLARE(qrtr_lock, &adsp_lock_group);    /* the table below */
+static LCK_MTX_DECLARE(qrtr_calling, &adsp_lock_group); /* held by the link's thread around a callback */
+static struct hakios_qrtr_port qrtr_ports[8];
+static uint32_t qrtr_next_port = QRTR_FIRST_PORT;
+static thread_t link_thread_is;
+
+static bool
+qrtr_matches(uint32_t service, uint32_t instance, unsigned server)
+{
+	return qrtr_servers[server].there && qrtr_servers[server].service == service &&
+	       (instance == 0 || qrtr_servers[server].instance == instance);
+}
+
+/* Everybody who looked a service up is told that it has come, or gone. From the link's thread. */
+static void
+qrtr_tell(uint32_t service, uint32_t instance, uint32_t node, uint32_t port, bool arrived)
+{
+	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
+		for (unsigned l = 0; l < 4; l++) {
+			hakios_qrtr_server_t server = NULL;
+			void *context;
+
+			lck_mtx_lock(&qrtr_lock);
+			if (qrtr_ports[p].number != 0 && qrtr_ports[p].lookups[l].asked && !qrtr_ports[p].lookups[l].fresh &&
+			    qrtr_ports[p].lookups[l].service == service &&
+			    (qrtr_ports[p].lookups[l].instance == 0 || qrtr_ports[p].lookups[l].instance == instance)) {
+				server = qrtr_ports[p].server;
+			}
+			context = qrtr_ports[p].context;
+			lck_mtx_unlock(&qrtr_lock);
+			if (server != NULL) {
+				lck_mtx_lock(&qrtr_calling);
+				server(context, arrived, service, instance & 0xff, instance >> 8, node, port);
+				lck_mtx_unlock(&qrtr_calling);
+			}
+		}
+	}
+}
+
+/* Lookups made since the last look are told of the services that were there before them. From the link's thread. */
+static void
+qrtr_fresh(void)
+{
+	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
+		for (unsigned l = 0; l < 4; l++) {
+			hakios_qrtr_server_t server;
+			uint32_t service, instance;
+			void *context;
+
+			lck_mtx_lock(&qrtr_lock);
+			if (qrtr_ports[p].number == 0 || !qrtr_ports[p].lookups[l].fresh) {
+				lck_mtx_unlock(&qrtr_lock);
+				continue;
+			}
+			qrtr_ports[p].lookups[l].fresh = false;
+			server = qrtr_ports[p].server;
+			service = qrtr_ports[p].lookups[l].service;
+			instance = qrtr_ports[p].lookups[l].instance;
+			context = qrtr_ports[p].context;
+			lck_mtx_unlock(&qrtr_lock);
+			for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]) && server != NULL; i++) {
+				if (qrtr_matches(service, instance, i)) {
+					lck_mtx_lock(&qrtr_calling);
+					server(context, true, qrtr_servers[i].service, qrtr_servers[i].instance & 0xff,
+					    qrtr_servers[i].instance >> 8, qrtr_servers[i].node, qrtr_servers[i].port);
+					lck_mtx_unlock(&qrtr_calling);
+				}
+			}
+		}
+	}
+}
+
+static struct hakios_qrtr_port *
+qrtr_open(hakios_qrtr_receive_t receive, hakios_qrtr_server_t server, void *context)
+{
+	struct hakios_qrtr_port *port = NULL;
+
+	lck_mtx_lock(&qrtr_lock);
+	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]) && port == NULL; p++) {
+		if (qrtr_ports[p].number == 0) {
+			port = &qrtr_ports[p];
+			bzero(port, sizeof(*port));
+			port->number = qrtr_next_port++;
+			port->receive = receive;
+			port->server = server;
+			port->context = context;
+		}
+	}
+	lck_mtx_unlock(&qrtr_lock);
+	return port;
+}
+
+static int
+qrtr_send(struct hakios_qrtr_port *port, uint32_t node, uint32_t to, const void *data, size_t length)
+{
+	if (port == NULL || port->number == 0 || length > HAKIOS_QRTR_MAX) {
+		return EINVAL;
+	}
+	return qrtr_out_packet(QRTR_DATA, port->number, node, to, data, (uint32_t)length);
+}
+
+static int
+qrtr_lookup(struct hakios_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance)
+{
+	int error = ENOSPC;
+
+	lck_mtx_lock(&qrtr_lock);
+	for (unsigned l = 0; l < 4 && error != 0 && port != NULL && port->number != 0; l++) {
+		if (!port->lookups[l].asked) {
+			port->lookups[l].service = service;
+			port->lookups[l].instance = instance != 0 ? (version & 0xff) | instance << 8 : 0;
+			port->lookups[l].asked = true;
+			port->lookups[l].fresh = true;
+			error = 0;
+		}
+	}
+	lck_mtx_unlock(&qrtr_lock);
+	return error;
+}
+
+static void
+qrtr_close(struct hakios_qrtr_port *port)
+{
+	struct qrtr_control gone = { .command = QRTR_DEL_CLIENT, .words = { QRTR_US, port ? port->number : 0 } };
+	bool outside = current_thread() != link_thread_is;
+
+	if (port == NULL || port->number == 0) {
+		return;
+	}
+	if (outside) {
+		lck_mtx_lock(&qrtr_calling);            /* (a callback of the port's that is running ends first) */
+	}
+	lck_mtx_lock(&qrtr_lock);
+	port->number = 0;
+	lck_mtx_unlock(&qrtr_lock);
+	if (outside) {
+		lck_mtx_unlock(&qrtr_calling);
+	}
+	if (qrtr_peer != 0) {
+		qrtr_out_packet(QRTR_DEL_CLIENT, gone.words[1], qrtr_peer, QRTR_CONTROL, &gone, sizeof(gone));
+	}
+}
+
+static const struct hakios_qrtr_ops adsp_qrtr_ops = { .open = qrtr_open, .send = qrtr_send, .lookup = qrtr_lookup, .close = qrtr_close };
+
+/* The audio DSP's link as a QRTR transport for the QMI helpers (hakios_qmi_handle_init_transport()); NULL before it is up. */
+const struct hakios_qrtr_ops *
+hakios_adsp_qrtr(void)
+{
+	return qrtr_peer != 0 ? &adsp_qrtr_ops : NULL;
+}
+
 static void
 qrtr_control(const struct qrtr_header *header, const struct qrtr_control *control)
 {
@@ -2544,12 +2719,17 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 		}
 		printf("adsp: qrtr: a service: %u (%#x), version %u, instance %u, at node %u port %u\n", control->words[0],
 		    control->words[0], control->words[1] & 0xff, control->words[1] >> 8, control->words[2], control->words[3]);
+		qrtr_tell(control->words[0], control->words[1], control->words[2], control->words[3], true);
+		if (control->words[0] == 0x301) {
+			hakios_slim_start();    /* (the SLIMbus service: bsd/dev/hakios.slim.c, with slim=1) */
+		}
 		break;
 	case QRTR_DEL_SERVER:
 		printf("adsp: qrtr: service %u at node %u port %u has gone\n", control->words[0], control->words[2], control->words[3]);
 		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
 			if (qrtr_servers[i].there && qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]) {
 				qrtr_servers[i].there = false;
+				qrtr_tell(qrtr_servers[i].service, qrtr_servers[i].instance, qrtr_servers[i].node, qrtr_servers[i].port, false);
 			}
 		}
 		break;
@@ -2617,6 +2797,25 @@ qrtr_input(const uint8_t *data, uint32_t length)
 		memcpy(&control, data + at, header.size < sizeof(control) ? header.size : sizeof(control));
 		qrtr_control(&header, &control);
 		return;
+	}
+	{
+		hakios_qrtr_receive_t receive = NULL;
+		void *context = NULL;
+
+		lck_mtx_lock(&qrtr_lock);
+		for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
+			if (qrtr_ports[p].number != 0 && qrtr_ports[p].number == header.to_port && header.type == QRTR_DATA) {
+				receive = qrtr_ports[p].receive;
+				context = qrtr_ports[p].context;
+			}
+		}
+		lck_mtx_unlock(&qrtr_lock);
+		if (receive != NULL) {
+			lck_mtx_lock(&qrtr_calling);
+			receive(context, header.from_node, header.from_port, data + at, header.size);
+			lck_mtx_unlock(&qrtr_calling);
+			return;
+		}
 	}
 	printf("adsp: qrtr: a datagram of %u bytes from node %u port %u to our port %u: nobody here listens there\n", header.size,
 	    header.from_node, header.from_port, header.to_port);
@@ -3049,9 +3248,11 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 
 	bzero(&last, sizeof(last));
 	dsp_words(&last);
+	link_thread_is = current_thread();
 	while (link_wanted) {
 		sleep_us(1000);
 		doorbells();
+		qrtr_fresh();
 		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
 			last = words;
 			dsp_listen(&words);
