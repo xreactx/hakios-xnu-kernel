@@ -3600,7 +3600,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (uint64_t)block_shared.kernel_native.switched_in, (uint64_t)block_shared.kernel_native.switched_out);
 	}
 	if (block_write_requested) {
-		print("ufs: %d writes into darwin, %d bytes, read back the same; %d refused\n", block_writes,
+		print("ufs: %d writes into %s, %d bytes, read back the same; %d refused\n", block_writes,
+		    block_write_part >= 0 ? block_shared.part[block_write_part].name : "nothing",
 		    block_write_bytes, block_writes_refused);
 	}
 	/* ... and its other cores should all be off again: the next kernel cannot start one that is not */

@@ -452,8 +452,9 @@ hakios_ufs_report(const char *when)
 	    "copying %llu ms\n", when, ufs_requests, ufs_small, ufs_medium, ufs_large, ufs_sequential,
 	    ufs_errors, ufs_bytes, ufs_wait_us / 1000, loader_ns / 1000000, ufs_copy_us / 1000);
 	if (ufs_write_part >= 0 || ufs_writes != 0 || ufs_write_refused != 0) {
-		printf("ufs: %s: %llu writes into darwin, %llu bytes, read back by the loader; %llu did not "
-		    "finish, %llu refused here\n", when, ufs_writes, ufs_write_bytes, ufs_write_errors,
+		printf("ufs: %s: %llu writes into %s, %llu bytes, read back by the loader; %llu did not "
+		    "finish, %llu refused here\n", when, ufs_writes, ufs_var_part[0] != 0 ? ufs_var_part : "nothing", ufs_write_bytes,
+		    ufs_write_errors,
 		    ufs_write_refused);
 	}
 }
