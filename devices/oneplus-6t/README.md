@@ -591,7 +591,16 @@ streams (0x720, 0x722) mapped through a context of the apps SMMU, the modem acce
 in 126 ms), its buses halted, reset, the MBA's region taken back, its clocks and rail given back, and iOS runs on.
 With a SIM (slot 1, run 231839, `modem_data_off=1`): UIM reads the card READY (PIN disabled), and **the modem
 registers on LTE** (-105 dBm, 3 bars) 4 s after DMS puts it online. (NAS's network id reads "0-0": not parsed yet.)
-Next: this side of the IPA 3.5.1 (its endpoints and channels) for data. A run (the line must fit XNU's
+**Mobile data (1 November).** This side of the IPA 3.5.1 is up (`hakios.ipa.c` in its 3.5.1 form, set up as Linux's
+`ipa_data-v3.5.1.c` and checked against Android's live registers): four channels, the tables, DPM (endpoints 2/10),
+WDA in QMAPv4 as the SDM845's Android asks for it (`modem_qmap1=1`: plain QMAP), the WDS bind, and a data session
+with an address every time. The modem's own counts (WDS 0x24) show our packets going out to the network and nothing
+coming back -- echoes (`cell_ping=1`, `=N` for size) and DNS queries to the session's server (`cell_dns=1`) alike --
+and Android on this phone gets no data from the same SIM either (its APN `nxtgenphone`; `data.lycamobile.com` is
+refused), though the SIM works in another phone: an APN or network-side question, left for later. Still to do on
+our side: en1 is attached but iOS's configd never configures it (it has no IOKit object). Keep `thermal` and
+`bootcpu` in run.args for modem runs: without them the modem stays offline. A run (the line must fit XNU's 607
+characters: xl now refuses one that does not):
 607 characters: xl now refuses one that does not):
 
 ```sh
