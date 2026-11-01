@@ -1610,6 +1610,29 @@ ufs_survey(void)
 #define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
 
 /*
+ * The OnePlus 6T has no partition of the port's own: its store is the end of system_a, the system slot
+ * Android does not boot from, which already holds the system image (2576719872 bytes: its blocks 0..629081,
+ * flashed from the computer with fastboot). Writes go from block 629248 (the next MiB) to its end: 102912
+ * blocks, 402 MiB, two slots of iOS's data volume (userland/src/var_store.c). Its identity as the 6T's GPT
+ * had it on 1 November 2026.
+ */
+#define BLOCK_SYSTEM_A_FIRST 85824ULL
+#define BLOCK_SYSTEM_A_LAST  817983ULL
+#define BLOCK_SYSTEM_A_WRITE_FIRST 629248ULL
+#define BLOCK_SYSTEM_A_TYPE  { 0x77036cd4, 0x03d5, 0x42bb, { 0x8e, 0xd1, 0x37, 0xe5, 0xa8, 0x8b, 0xaa, 0x34 } }
+#define BLOCK_SYSTEM_A_UNIQ  { 0x07ea75d4, 0x6026, 0xd575, { 0x46, 0x4d, 0xac, 0x2c, 0x7e, 0xf6, 0x5b, 0x3c } }
+
+/* The partitions a write may reach -- one at most in a run: the first of these found as it was set up. */
+static const struct block_target {
+	const char *name;
+	efi_guid type, uniq;
+	uint64_t first, last, write_first;
+} block_targets[] = {
+	{ "darwin", BLOCK_DARWIN_TYPE, BLOCK_DARWIN_UNIQ, BLOCK_DARWIN_FIRST, BLOCK_DARWIN_LAST, BLOCK_WRITE_FIRST },
+	{ "system_a", BLOCK_SYSTEM_A_TYPE, BLOCK_SYSTEM_A_UNIQ, BLOCK_SYSTEM_A_FIRST, BLOCK_SYSTEM_A_LAST, BLOCK_SYSTEM_A_WRITE_FIRST },
+};
+
+/*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
  * ... in the order UEFI lists them). Each partition says which of those it is on and where it
  * begins there, so that a reader of the units themselves -- the kernel's own UFS driver -- finds
@@ -1693,6 +1716,7 @@ static efi_block_io *block_bios[BLOCK_MAX_PARTS];
 static int block_enabled;
 static int block_write_requested;       /* ufs_write=1 on the command line */
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
+static uint64_t block_write_first;      /* ... and its first block a write may reach (its block_targets[] entry's) */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
 
 /* the bytes of a device path before its end node */
@@ -1947,36 +1971,43 @@ block_tables(void)
 static int
 block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
-	static const efi_guid type = BLOCK_DARWIN_TYPE, uniq = BLOCK_DARWIN_UNIQ;
-	static const char name[] = "darwin";
+	const struct block_target *t = NULL;
 	const char *why = NULL;
 
-	for (unsigned i = 0; i < sizeof(name); i++) {
-		if (bp->name[i] != name[i]) {
-			return 0;               /* another partition: nothing to say about it */
+	for (unsigned k = 0; k < sizeof(block_targets) / sizeof(block_targets[0]) && t == NULL; k++) {
+		unsigned i;
+
+		for (i = 0; block_targets[k].name[i] != 0 && bp->name[i] == block_targets[k].name[i]; i++) {
+		}
+		if (block_targets[k].name[i] == 0 && bp->name[i] == 0) {
+			t = &block_targets[k];
 		}
 	}
-	if (memcmp(&info->type_guid, &type, sizeof(type)) != 0) {
+	if (t == NULL || block_write_part >= 0) {
+		return 0;                       /* another partition (or one is chosen already): nothing to say about it */
+	}
+	if (memcmp(&info->type_guid, &t->type, sizeof(t->type)) != 0) {
 		why = "its type GUID is not the one it had";
-	} else if (memcmp(&info->unique_guid, &uniq, sizeof(uniq)) != 0) {
+	} else if (memcmp(&info->unique_guid, &t->uniq, sizeof(t->uniq)) != 0) {
 		why = "its unique GUID is not the one it had";
-	} else if (info->start_lba != BLOCK_DARWIN_FIRST || info->end_lba != BLOCK_DARWIN_LAST) {
+	} else if (info->start_lba != t->first || info->end_lba != t->last) {
 		why = "it does not begin and end where it did";
 	} else if (bp->unit != 0) {
 		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
 		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
 		why = "it is not on the first logical unit";
-	} else if (bp->block_size != 4096 || bp->blocks != BLOCK_DARWIN_LAST - BLOCK_DARWIN_FIRST + 1) {
+	} else if (bp->block_size != 4096 || bp->blocks != t->last - t->first + 1) {
 		why = "its blocks are not what they were";
 	} else if (bio->media->read_only) {
 		why = "UEFI gives it out read only";
 	}
 	if (why != NULL) {
-		print("ufs: darwin: no write will be served: %s\n", why);
+		print("ufs: %s: no write will be served: %s\n", t->name, why);
 		return 0;
 	}
-	print("ufs: darwin (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n",
-	    info->start_lba, info->end_lba, BLOCK_WRITE_FIRST);
+	print("ufs: %s (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n", t->name,
+	    info->start_lba, info->end_lba, t->write_first);
+	block_write_first = t->write_first;
 	return 1;
 }
 
@@ -2099,7 +2130,7 @@ block_start(void)
 	block_writes = block_writes_refused = block_write_bytes = 0;
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
-		block_shared.write_first = BLOCK_WRITE_FIRST;
+		block_shared.write_first = block_write_first;
 	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
@@ -2226,8 +2257,8 @@ block_poll(void)
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
 		} else if (op == BLOCK_OP_WRITE) {
-			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
-				/* not darwin, or not past what the build writes from the computer: never */
+			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < block_write_first) {
+				/* not the store's partition, or not past what the build writes from the computer: never */
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
 					    block_shared.part[part].name);
@@ -2253,8 +2284,8 @@ block_poll(void)
 					flush_dcache((uint64_t)(uintptr_t)block_buffer,
 					    (uint64_t)(uintptr_t)block_buffer + bytes);
 					if (!EFI_ERROR(s) && ufs_crc32(block_buffer, bytes) != want) {
-						print("ufs: %d blocks from %d of darwin read back DIFFERENT\n",
-						    count, lba);
+						print("ufs: %d blocks from %d of %s read back DIFFERENT\n",
+						    count, lba, block_shared.part[part].name);
 						s = 0x800000000000000AULL;      /* EFI_VOLUME_CORRUPTED */
 					}
 				}
@@ -3082,6 +3113,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * loader asked for (the loader stays resident across runs) */
 	block_write_requested = 0;
 	block_write_part = -1;
+	block_write_first = ~0ull;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;

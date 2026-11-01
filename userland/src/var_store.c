@@ -48,10 +48,17 @@
 
 #define BLOCK           4096
 #define BUFFER          (4u << 20)              /* the loader's own buffer: one request a write */
-#define STORE_AT        8589934592LL            /* darwin's block 2097152: past the cryptexes, with room to spare */
-#define SLOT_BYTES      0x80000000LL            /* 2 GiB a slot, two slots */
+/*
+ * Where the store is: darwin's block 2097152 (past the cryptexes, with room to spare), two slots of 2 GiB --
+ * or, where the kernel says the store is elsewhere (kern.hakios.var_part, var_first, var_end: the OnePlus 6T's
+ * end of system_a, behind the system image), from its first writable MiB on, two slots splitting the rest.
+ */
+static char store_device[64] = "/dev/rufs_darwin";
+static off_t store_at = 8589934592LL, slot_bytes = 0x80000000LL;
+#define STORE_AT        store_at
+#define SLOT_BYTES      slot_bytes
 #define SLOTS           2
-#define DEVICE          "/dev/rufs_darwin"
+#define DEVICE          store_device
 #define ROOT            "/private/var"
 #define MAX_PATH        1024
 #define MAX_DEPTH       32
@@ -162,6 +169,38 @@ static int
 sysctl_set_int(const char *name, int value)
 {
 	return sysctlbyname(name, NULL, NULL, &value, sizeof(value));
+}
+
+/* Where the kernel says the store is this run (see STORE_AT); darwin's place if it says nothing. */
+static void
+store_place(void)
+{
+	char part[36] = "";
+	uint64_t first = 0, end = 0;
+	size_t len = sizeof(part);
+
+	if (sysctlbyname("kern.hakios.var_part", part, &len, NULL, 0) != 0 || part[0] == 0 || strcmp(part, "darwin") == 0) {
+		return;
+	}
+	len = sizeof(first);
+	if (sysctlbyname("kern.hakios.var_first", &first, &len, NULL, 0) != 0) {
+		return;
+	}
+	len = sizeof(end);
+	if (sysctlbyname("kern.hakios.var_end", &end, &len, NULL, 0) != 0) {
+		return;
+	}
+	first = (first + (1 << 20) - 1) & ~(uint64_t)((1 << 20) - 1);
+	if (end <= first + 2 * (8 << 20)) {
+		printf("var_store: %s leaves no room for a store (from %llu to %llu)\n", part, (unsigned long long)first,
+		    (unsigned long long)end);
+		return;
+	}
+	part[sizeof(part) - 1] = 0;
+	strcpy(store_device, "/dev/rufs_");             /* (36 bytes at most behind 10: it fits) */
+	strcpy(store_device + 10, part);
+	store_at = (off_t)first;
+	slot_bytes = (off_t)(((end - first) / 2) & ~(uint64_t)((1 << 20) - 1));
 }
 
 /* The claim on the store: nothing may be written without it, and only one program may hold it. */
@@ -1362,6 +1401,7 @@ main(int argc, char **argv, char **envp)
 
 	(void)envp;
 	crc_init();
+	store_place();
 	if (strcmp(what, "stamp") == 0) {
 		return stamp(argc > 2 ? argv[2] : "/private/var/hakios-stamp") ? 0 : 1;
 	}
