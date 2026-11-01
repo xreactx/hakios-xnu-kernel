@@ -268,7 +268,8 @@ recording() { # recording [file.mp4]
 hangdump() { # hangdump: what a loader that stopped answering left in logdump, before any run writes over it
 	# (it saves its log there after 2 s without a word from the USB driver; the next run's loader writes its own)
 	local out=logs/hang-$(date +%H%M%S).log
-	flash_read logdump 0 200000 "$out.dump" >/dev/null || return 1
+	# (a fresh loader writes its own log over it; the first time, it copies what was there 16 MB in)
+	flash_read logdump 1000000 200000 "$out.dump" >/dev/null || return 1
 	tr -d '\0' < "$out.dump" > "$out" && rm -f "$out.dump"
 	echo "xl: the stuck loader's log: $out ($(stat -c %s "$out") bytes); its USB lines:"
 	grep -a "usb: \|ramdisk:" "$out" | tail -15

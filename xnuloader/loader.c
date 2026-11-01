@@ -366,6 +366,31 @@ static int hc_log_skips;                /* logs not written this run (said twice
 static void hc_print_state(const char *when);
 static void hc_take_back(const char *when);
 
+/*
+ * Before a loader first writes its log into logdump, the log already there -- the previous loader's, which
+ * may have stopped answering and been left only by a forced restart -- is copied 16 MB in (xl hangdump reads
+ * it there); once a life.
+ */
+#define PREVIOUS_LOG_AT         (16ull << 20)
+
+static void
+keep_previous_log(efi_block_io *bio)
+{
+	static int kept;
+	uint64_t bs = bio->media->block_size, len = sizeof(out_buf) < sizeof(block_buffer) ? sizeof(out_buf) : sizeof(block_buffer);
+	efi_status rs, ws = 0;
+
+	if (kept || bs == 0 || len % bs != 0 || (PREVIOUS_LOG_AT + len) / bs > bio->media->last_block + 1) {
+		return;
+	}
+	kept = 1;
+	rs = bio->read_blocks(bio, bio->media->media_id, 0, len, block_buffer);
+	if (!EFI_ERROR(rs)) {
+		ws = bio->write_blocks(bio, bio->media->media_id, PREVIOUS_LOG_AT / bs, len, block_buffer);
+	}
+	print("log: the previous log kept in logdump at 16 MB (%x %x)\n", rs, ws);
+}
+
 static void
 write_logs(const char *klog, uint64_t klog_len)
 {
@@ -397,6 +422,7 @@ write_logs(const char *klog, uint64_t klog_len)
 		compose_logs(klog, klog_len);
 		return;
 	}
+	keep_previous_log(bio);
 	ws = bio->write_blocks(bio, bio->media->media_id, 0, len, out_buf);
 
 	if (!EFI_ERROR(ws)) {
