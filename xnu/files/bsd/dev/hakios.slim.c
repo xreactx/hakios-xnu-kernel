@@ -445,6 +445,72 @@ codec_read(uint8_t la, uint32_t element)
 	return reply[4];
 }
 
+/* The codec's registers by their 16-bit addresses: the page selected when it changes, then the window. */
+static uint8_t codec_pgd;
+static int codec_page = -1;
+
+static bool
+codec_page_select(unsigned reg)
+{
+	if (codec_page == (int)(reg >> 8)) {
+		return true;
+	}
+	if (!codec_write(codec_pgd, 0x800, (uint8_t)(reg >> 8))) {
+		codec_page = -1;
+		return false;
+	}
+	codec_page = (int)(reg >> 8);
+	return true;
+}
+
+static bool
+codec_reg_write(unsigned reg, uint8_t value)
+{
+	return codec_page_select(reg) && codec_write(codec_pgd, 0x800 + (reg & 0xff), value);
+}
+
+static int
+codec_reg_read(unsigned reg)
+{
+	return codec_page_select(reg) ? codec_read(codec_pgd, 0x800 + (reg & 0xff)) : -1;
+}
+
+/* Linux's wcd934x_bring_up(): its digital core reset, its internal supplies (SIDO) started, the core powered. */
+static bool
+codec_bring_up(void)
+{
+	static const struct {
+		uint16_t reg;
+		uint8_t value;
+		uint8_t settle_ms;
+	} steps[] = {
+		{ 0x0009, 0x01, 0 },    /* CODEC_RPM_RST_CTL */
+		{ 0x071b, 0x19, 0 },    /* SIDO_NEW_VOUT_A_STARTUP */
+		{ 0x071c, 0x15, 1 },    /* SIDO_NEW_VOUT_D_STARTUP; 1 ms for VOUT to settle */
+		{ 0x0011, 0x05, 0 },    /* CODEC_RPM_PWR_CDC_DIG_HM_CTL */
+		{ 0x0011, 0x07, 0 },
+		{ 0x0009, 0x03, 0 },
+		{ 0x0009, 0x07, 0 },
+		{ 0x0011, 0x03, 0 },
+	};
+	static const uint16_t shown[] = { 0x0009, 0x0011, 0x071b, 0x071c, 0x0003 };
+
+	for (unsigned i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+		if (!codec_reg_write(steps[i].reg, steps[i].value)) {
+			printf("slim: codec: bring-up write %u (%#06x = %#x) not sent\n", i, steps[i].reg, steps[i].value);
+			return false;
+		}
+		if (steps[i].settle_ms) {
+			delay_for_interval(steps[i].settle_ms, NSEC_PER_MSEC);
+		}
+	}
+	for (unsigned i = 0; i < sizeof(shown) / sizeof(shown[0]); i++) {
+		printf("slim: codec: register %#06x reads %#x\n", shown[i], codec_reg_read(shown[i]));
+	}
+	printf("slim: codec: BROUGHT UP (reset 0x7 and power 0x3 expected above)\n");
+	return true;
+}
+
 /*
  * The codec's registers (Linux: drivers/mfd/wcd934x.c, its regmap over SLIMbus): 16-bit addresses through a window
  * -- the page (address >> 8) into the selector at value element 0x800, the register at 0x800 + its low byte. Its
@@ -474,6 +540,9 @@ codec_talk(void)
 	}
 	printf("slim: codec: THE WCD934x ANSWERS: chip id major %#x, minor %#x (bytes %02x %02x %02x %02x)\n", id[2] | id[3] << 8,
 	    id[0] | id[1] << 8, id[0], id[1], id[2], id[3]);
+	codec_pgd = pgd;
+	codec_page = 0;
+	codec_bring_up();
 }
 
 static void
