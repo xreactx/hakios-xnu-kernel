@@ -16,6 +16,9 @@
  *   system ID                          a system sound by its number (1100 is the lock sound,
  *                                      1104 a keyboard click), as SpringBoard plays them
  *   file PATH                          a sound file, played as a system sound
+ *   session receiver|speaker           this program's audio session as a call has it: play-and-record, whose
+ *                                      output is the receiver (the earpiece) unless moved to the speaker --
+ *                                      "speaker" moves it (overrideOutputAudioPort); the tones after it go there
  *   route                              where iOS says its sound goes: the audio session's outputs and volume,
  *                                      and the devices of the system's output context
  *   haptic [SECONDS]                   haptics the way an application (and UIKit's feedback generators) plays
@@ -247,6 +250,27 @@ route(void)
 	}
 }
 
+/* The audio session: play-and-record, active, its output the receiver or (moved) the speaker. */
+static int
+session(const char *where)
+{
+	id audio = send((id)objc_getClass("AVAudioSession"), "sharedInstance");
+	id *category = dlsym(RTLD_DEFAULT, "AVAudioSessionCategoryPlayAndRecord"), error = NULL;
+	BOOL speaker = strcmp(where, "speaker") == 0;
+
+	if (audio == NULL || category == NULL ||
+	    !((BOOL (*)(id, SEL, id, id *))objc_msgSend)(audio, sel_registerName("setCategory:error:"), *category, &error) ||
+	    !((BOOL (*)(id, SEL, unsigned long, id *))objc_msgSend)(audio, sel_registerName("overrideOutputAudioPort:error:"),
+	    speaker ? 0x73706b72ul : 0ul, &error) ||                    /* AVAudioSessionPortOverrideSpeaker 'spkr', or None */
+	    !((BOOL (*)(id, SEL, BOOL, id *))objc_msgSend)(audio, sel_registerName("setActive:error:"), YES, &error)) {
+		printf("sound_test: session %s: %s\n", where, audio == NULL || category == NULL ? "no AVAudioSession" :
+		    text(send(error, "localizedDescription")));
+		return 1;
+	}
+	printf("sound_test: session: play-and-record, active, its output %s\n", speaker ? "moved to the speaker" : "the default");
+	return 0;
+}
+
 /* CoreHaptics' constants (NSString *) by name, the framework opened when first asked for */
 static id
 haptics_constant(const char *name)
@@ -384,6 +408,8 @@ main(int argc, char **argv)
 			wait_for_ringer();
 		} else if (strcmp(argv[i], "route") == 0) {
 			route();
+		} else if (strcmp(argv[i], "session") == 0 && i + 1 < argc) {
+			failed |= session(argv[++i]);
 		} else if (strcmp(argv[i], "restart") == 0) {
 			restart();
 		} else if (strcmp(argv[i], "haptic") == 0) {
