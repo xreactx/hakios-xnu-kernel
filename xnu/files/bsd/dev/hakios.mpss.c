@@ -1533,6 +1533,7 @@ image_forget(void)
 static unsigned rmtfs_load(void);
 static void servreg_load(void);
 extern void hakios_wlfw10_start(void);          /* bsd/dev/hakios.wlfw10.c */
+extern void hakios_wifi6t_start(void);          /* bsd/dev/hakios.wifi6t.c */
 
 static bool
 step_firmware(void)
@@ -3827,7 +3828,8 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 		}
 		lck_mtx_unlock(&qrtr_lock);
 		if (control->words[0] == 69) {
-			hakios_wlfw10_start();          /* (the Wi-Fi firmware's service: hakios.wlfw10.c, with wifi10=N) */
+			hakios_wlfw10_start();          /* (the Wi-Fi firmware's service: hakios.wlfw10.c, with wifi10=N ... */
+			hakios_wifi6t_start();          /* ... or ath10k itself, hakios.wifi6t.c, with wifi6t=1) */
 		}
 		printf("mpss: qrtr: a service: %u (%#x), version %u, instance %u, at node %u port %u\n", control->words[0],
 		    control->words[0], control->words[1] & 0xff, control->words[1] >> 8, control->words[2], control->words[3]);

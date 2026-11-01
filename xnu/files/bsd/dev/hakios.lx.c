@@ -38,6 +38,12 @@ extern void thread_set_thread_name(thread_t thread, const char *name);
 
 #define say hakios_wifi_say
 
+/* the OnePlus 6T's radio and ath10k (bsd/dev/hakios.wifi6t.c, boot-arg wifi6t=1); otherwise redwood's (hakios.wifi.c) */
+extern bool hakios_wifi6t(void);
+extern bool hakios_wifi6t_radio_map(uint64_t physical, uint64_t size, unsigned long long *address);
+extern const uint8_t *hakios_wifi6t_file(const char *name, uint64_t *size);
+extern bool hakios_mpss_assign_wlan(uint64_t address, uint64_t size, bool secure, bool to_firmware);
+
 static LCK_GRP_DECLARE(lx_lock_group, "hakios-lx");
 static LCK_MTX_DECLARE(lx_lock, &lx_lock_group);
 
@@ -79,7 +85,8 @@ lx_os_radio_memory(unsigned long size, unsigned long long *address)
 	}
 	__asm__ volatile ("dsb sy");
 	uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB);
-	if (uncached == 0 || !hakios_wifi_radio_map(physical, size, address)) {
+	if (uncached == 0 || !(hakios_wifi6t() ? hakios_wifi6t_radio_map(physical, size, address) :
+	    hakios_wifi_radio_map(physical, size, address))) {
 		return NULL;
 	}
 	return (void *)uncached;
@@ -215,7 +222,7 @@ int
 lx_os_firmware(const char *name, const void **data, unsigned long *size)
 {
 	uint64_t length = 0;
-	const uint8_t *file = hakios_wifi_driver_file(name, &length);
+	const uint8_t *file = hakios_wifi6t() ? hakios_wifi6t_file(name, &length) : hakios_wifi_driver_file(name, &length);
 
 	if (file == NULL) {
 		return ENOENT;
@@ -427,6 +434,22 @@ lx_irq_runs(__unused void *parameter, __unused wait_result_t result)
 	}
 }
 
+static bool lx_irq_level;                       /* the 6T's lines: level-triggered; redwood's messages: edges */
+
+int
+lx_os_irq_lines(unsigned first)
+{
+	lx_irq_first = first;
+	lx_irq_level = true;
+	return 1;
+}
+
+int
+lx_os_wlan_memory(unsigned long long address, unsigned long size, int secure, int to_firmware)
+{
+	return hakios_mpss_assign_wlan(address, size, secure != 0, to_firmware != 0) ? 0 : EIO;
+}
+
 int
 lx_os_irq_msi(unsigned long long *address, unsigned *data)
 {
@@ -448,8 +471,8 @@ lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument)
 		return EINVAL;
 	}
 	if (lx_irq_thread == THREAD_NULL) {
-		hakios_wifi_tell("lx: wifi_irq: THE GIC'S DISTRIBUTOR IS WRITTEN for the radio's interrupts: each vector's SPI (%u + v) edge-"
-		    "triggered, group 1, routed to this processor, then enabled\n", lx_irq_first);
+		hakios_wifi_tell("lx: wifi_irq: THE GIC'S DISTRIBUTOR IS WRITTEN for the radio's interrupts: each vector's SPI (%u + v) %s-"
+		    "triggered, group 1, routed to this processor, then enabled\n", lx_irq_first, lx_irq_level ? "level" : "edge");
 		if (kernel_thread_start(lx_irq_runs, NULL, &lx_irq_thread) != KERN_SUCCESS) {
 			lx_irq_thread = THREAD_NULL;
 			return ENOMEM;
@@ -461,7 +484,7 @@ lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument)
 	lx_vector[vector].argument = argument;
 	lx_vector[vector].attached = true;
 	lck_mtx_unlock(&lx_irq_lock);
-	if ((kr = gic_v3_spi_attach(lx_irq_first + vector, true, lx_irq_arrived, NULL)) != KERN_SUCCESS) {
+	if ((kr = gic_v3_spi_attach(lx_irq_first + vector, !lx_irq_level, lx_irq_arrived, NULL)) != KERN_SUCCESS) {
 		lck_mtx_lock(&lx_irq_lock);
 		lx_vector[vector].attached = false;
 		lck_mtx_unlock(&lx_irq_lock);
