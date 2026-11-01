@@ -29,7 +29,7 @@
 
 extern const struct hakios_qrtr_ops *hakios_adsp_qrtr(void);           /* bsd/dev/hakios.adsp.c */
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-extern bool hakios_adsp_rpmh_set(const char *name, uint32_t value);   /* bsd/dev/hakios.adsp.c */
+extern bool hakios_adsp_rpmh_set(const char *name, uint32_t offset, uint32_t value);     /* bsd/dev/hakios.adsp.c */
 
 /* Every line goes to the loader's log directly as well (as hakios.buttons.c's): this runs early in a boot. */
 extern void loader_log_putc(char c);
@@ -378,7 +378,7 @@ codec_up(void)
 		return;
 	}
 	printf("slim: codec: its reset, gpio%u: cfg %#x, io %#x (bit 1: driven high, bit 0: reads)\n", WCD_RESET_GPIO, pin[0], pin[1]);
-	if (!hakios_adsp_rpmh_set("lnbclka2", 1)) {
+	if (!hakios_adsp_rpmh_set("lnbclka2", 4, 1)) {         /* (its enable: Linux's CLK_RPMH_VRM_EN_OFFSET) */
 		printf("slim: codec: its clock is not on: it is not let out of reset\n");
 		return;
 	}
