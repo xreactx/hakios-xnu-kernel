@@ -144,8 +144,16 @@ file's). The OnePlus 6's USB driver loses a question asked while the loader is b
 one asked after is at once -- so xl asks again after each step. An OTA would overwrite system_a; flash it again.
 What it costs: Android's other slot is not an Android any more (no falling back to it until an update rewrites it).
 
-The rest -- the kernel reading the flash itself (`ufs=2`, `root_apfs=`), iOS's data kept between boots -- needs
-a partition of the port's own, as redwood's `darwin` (Apple's root container alone is 5.6 GB).
+**iOS's data kept between boots** (1 November 2026, runs 033221 and 033818): the 6T has no partition of the
+port's own, so the store is the end of `system_a`, behind the image: from its block 629248 (the next MiB after the
+image's 629082 blocks) to its end, 402 MiB, two slots of 201 MiB written in turn. The loader serves a write there
+only after checking `system_a`'s name, both GUIDs, first and last LBA, unit and block size, and only from that
+block on, reading each write back; the kernel (`hakios.ufs.c`) keeps the same bounds and tells `var_store` the
+place (`kern.hakios.var_part`, `var_first`, `var_end`). `build.sh` refuses a 6T `system.apfs` that would reach
+the store. With `ufs=2 ufs_write=1 var_store=1` (the line must fit: `XL_DROP="battery pmi_haptics slider"`):
+the first run saved `/private/var` (138 MB), the next put it back at boot (6411 directories, 2492 files) and
+saved into the other slot (165 MB). Flashing a new image into `system_a` leaves the store as it is. The volume
+already fills 80 % of a slot: past it a save fails and the older slot is kept.
 
 **6. Touch and buttons.**
 
