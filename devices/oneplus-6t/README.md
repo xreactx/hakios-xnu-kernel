@@ -597,7 +597,7 @@ Then, with `slim=3` (and `adsp_listen=5`: the DSP's hello once took more than a 
 
 - `sound_earpiece=3`: a test tone through the earpiece -- AFE `SLIMBUS_0_RX` (0x4000), one 16-bit channel on bus
   channel 144, the codec's RX0 -> INT0 -> EAR with class-H, as Linux's DAPM powers it. Runs clean (the DSP takes
-  48 kHz, no underflow); **not yet heard** by anyone.
+  48 kHz, no underflow); heard (run 170252, 1 November).
 - `mic=3 mic_wcd=1`: the handset microphone (Android's `handset-mic` = AMIC4) -- MIC BIAS1 at 2.7 V, ADC4, decimator
   0, the codec's TX0 on bus channel 128, AFE `SLIMBUS_0_TX` (0x4001), the DSP's stream as redwood's. Levels each
   second in the log (a quiet room: about -70 dBFS). `mic=4 mic_wcd=1` gives it to iOS (`/dev/hakios-mic`).
