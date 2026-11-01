@@ -103,6 +103,7 @@ static LCK_MTX_DECLARE(ipa_lock, &ipa_lock_group);
 static uint64_t ipa_regs_phys = IPA_REGS_PHYS_DEFAULT, gsi_phys = GSI_PHYS_DEFAULT;
 static vm_offset_t ipa_regs, gsi_regs;         /* gsi_regs maps gsi_phys + GSI_FROM */
 static bool v35;                                /* IPA 3.5.1 (hakios_ipa_version_3_5_1()) */
+static bool qmap4;                              /* QMAPv4, QMAP with checksum offload (hakios_ipa_qmap_v4()) */
 static uint32_t ee_shift;                       /* GSI_EE_SHIFT_V3 on IPA 3.5.1 */
 
 static inline uint32_t
@@ -293,6 +294,16 @@ hakios_ipa_version_3_5_1(void)
 {
 	v35 = true;
 	ee_shift = GSI_EE_SHIFT_V3;
+	{
+		/*
+		 * The SDM845's Android asks the modem for QMAPv4 both ways (netmgr_config.xml "SDM845": data aggregation
+		 * protocol 8), and its IPA has the matching endpoints (ep 2 HDR_LEN 8, CFG 0xa; ep 10 CFG 0x4): the same here;
+		 * with plain QMAP the 6T's echoes were answered by empty frames. modem_qmap1=1: plain QMAP.
+		 */
+		uint32_t plain = 0;
+
+		qmap4 = !(PE_parse_boot_argn("modem_qmap1", &plain, sizeof(plain)) && plain != 0);
+	}
 	command.id = 4;
 	command.endpoint = 5;
 	command.tlv = 20;
@@ -470,11 +481,14 @@ endpoint_program(const struct channel *ch)
 		/* Linux's ipa_endpoint_program() before IPA 4.2: a TX endpoint's DELAY off, an RX endpoint's SUSPEND off */
 		ipa_wr(ENDP_INIT_CTRL(ep), 0);
 	}
-	ipa_wr(ENDP_INIT_CFG(ep), 0);                   /* no fragment or checksum offload */
+	/* no fragment or checksum offload -- but QMAPv4's: the uplink's (CS_OFFLOAD_EN 1, its metadata header 1 word in: 0xa) on
+	 * the modem transmit endpoint, the downlink's (CS_OFFLOAD_EN 2: 0x4) on the receive one, as Android's */
+	ipa_wr(ENDP_INIT_CFG(ep), qmap4 && ch == &modem_tx ? 0xa : qmap4 && ch == &modem_rx ? 0x4 : 0);
 	ipa_wr(ENDP_INIT_NAT(ep), 0);                   /* NAT bypassed */
 	value = 0;
 	if (ch->qmap) {
-		value = 4 /* HDR_LEN */ | 1u << 6 /* HDR_OFST_METADATA_VALID, at 0 */;
+		/* (QMAPv4 on the way out: the QMAP header and the 4-byte uplink checksum header, 8 bytes in all) */
+		value = (qmap4 && ch->to_ipa ? 8 : 4) /* HDR_LEN */ | 1u << 6 /* HDR_OFST_METADATA_VALID, at 0 */;
 		if (!ch->to_ipa) {
 			/* where the IPA writes the mux id (byte 1) and the packet's length (bytes 2-3) of the header it makes */
 			value |= 1u << 7 /* HDR_OFST_METADATA */ | 1u << 19 /* HDR_OFST_PKT_SIZE_VALID */ | 2u << 20 /* HDR_OFST_PKT_SIZE */;
@@ -783,7 +797,10 @@ receive_event(struct channel *ch, const struct event *e, void *context)
 			uint32_t pad = buffer[at] & 0x3f, cmd = buffer[at] & 0x80, mux = buffer[at + 1];
 			uint32_t packet = (uint32_t)buffer[at + 2] << 8 | buffer[at + 3];
 
-			if (packet == 0 || at + 4 + packet > length || pad > packet) {
+			/* QMAPv4: an 8-byte downlink checksum trailer after each packet, outside its length */
+			uint32_t trailer = qmap4 && cmd == 0 ? 8 : 0;
+
+			if (packet == 0 || at + 4 + packet + trailer > length || pad > packet) {
 				break;
 			}
 			if (cmd == 0) {
@@ -795,7 +812,7 @@ receive_event(struct channel *ch, const struct event *e, void *context)
 			} else if (trace) {
 				printf("ipa: %s: a QMAP command (%u bytes) on mux %u\n", ch->name, packet, mux);
 			}
-			at += 4 + packet;
+			at += 4 + packet + trailer;
 		}
 	} else {
 		ch->packets++;                          /* the LAN endpoint: looked at, dropped */
@@ -823,7 +840,9 @@ hakios_ipa_transmit(uint8_t mux, const void *packet, size_t length)
 	uint32_t slot;
 	uint8_t *buffer;
 
-	if (!ready || length == 0 || length + 4 > ch->buffer_size) {
+	uint32_t header = qmap4 ? 8 : 4;                 /* QMAP, and with QMAPv4 the uplink checksum header (zero: no offload asked) */
+
+	if (!ready || length == 0 || length + header > ch->buffer_size) {
 		return false;
 	}
 	lck_mtx_lock(&ipa_lock);
@@ -839,9 +858,12 @@ hakios_ipa_transmit(uint8_t mux, const void *packet, size_t length)
 	buffer[1] = mux;
 	buffer[2] = (uint8_t)(length >> 8);
 	buffer[3] = (uint8_t)length;
-	memcpy(buffer + 4, packet, length);
-	dma_sync((vm_offset_t)buffer, length + 4);
-	tre_fill(ch, ch->next, slot_phys(ch, slot), (uint16_t)(length + 4), TRE_TYPE_XFER | TRE_IEOT | TRE_BEI);
+	if (qmap4) {
+		bzero(buffer + 4, 4);
+	}
+	memcpy(buffer + header, packet, length);
+	dma_sync((vm_offset_t)buffer, length + header);
+	tre_fill(ch, ch->next, slot_phys(ch, slot), (uint16_t)(length + header), TRE_TYPE_XFER | TRE_IEOT | TRE_BEI);
 	ch->next++;
 	channel_doorbell(ch);
 	ch->packets++;
@@ -874,6 +896,12 @@ hakios_ipa_modem_endpoints(uint32_t *to_modem, uint32_t *from_modem)
 {
 	*to_modem = modem_tx.endpoint;          /* 2: what Linux exports as modem/tx_endpoint_id */
 	*from_modem = modem_rx.endpoint;        /* 16: modem/rx_endpoint_id */
+}
+
+bool
+hakios_ipa_qmap_v4(void)
+{
+	return qmap4;
 }
 
 bool
