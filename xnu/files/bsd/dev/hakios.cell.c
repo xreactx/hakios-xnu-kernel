@@ -292,7 +292,7 @@ cell_transmit(mbuf_t packet, size_t length)
 #define PING_COUNT              10
 #define PING_ID                 0x4861                  /* "Ha" */
 static uint32_t ping_wanted, ping_to = 0x08080808, ping_sent, ping_answered;
-static uint32_t ping_data = 32;                 /* the echo's data bytes (cell_ping_size=N, up to 1400) */
+static uint32_t ping_data = 32;                 /* the echo's data bytes (cell_ping_size=N or cell_ping=N, up to 1400) */
 static uint64_t ping_next, ping_at[PING_COUNT];
 
 static uint64_t
@@ -479,6 +479,9 @@ hakios_cell_attach(void)
 	PE_parse_boot_argn("cell_ping", &ping_wanted, sizeof(ping_wanted));
 	PE_parse_boot_argn("cell_ping_to", &ping_to, sizeof(ping_to));
 	PE_parse_boot_argn("cell_ping_size", &ping_data, sizeof(ping_data));
+	if (ping_wanted > 1) {
+		ping_data = ping_wanted;        /* (cell_ping=N, N > 1: the size as well, for a command line near XNU's limit) */
+	}
 	if (ping_data > 1400) {
 		ping_data = 1400;
 	}
