@@ -28,6 +28,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern const struct hakios_qrtr_ops *hakios_mpss_qrtr(void);           /* bsd/dev/hakios.mpss.c */
 extern const uint8_t *hakios_mpss_fw_file(const char *name, uint64_t *size);
+extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 extern void hakios_qmi_set_transport(const struct hakios_qrtr_ops *ops); /* bsd/dev/hakios.qmi.c */
 extern int hakios_lx_start(void);                                       /* bsd/dev/hakios.lx.c */
 extern lck_mtx_t hakios_smmu_lock;                                      /* bsd/dev/hakios.sound.c */
@@ -235,7 +236,8 @@ hakios_wifi6t_file(const char *name, uint64_t *size)
 	if (strcmp(last, "board.bin") == 0) {
 		data = hakios_mpss_fw_file("image/bdwlan.bin", size);
 	} else if (strcmp(last, "firmware-5.bin") == 0) {
-		data = hakios_mpss_fw_file("ath10k-wcn3990-firmware-5.bin", size);
+		/* (the small image's fw/, where userland/build.sh stages it from fw-wifi: not the modem's image) */
+		data = hakios_image_file("fw", "ath10k-wcn3990-firmware-5.bin", size, NULL);
 	}
 	say("wifi6t: the driver asks for %s: %s\n", name, data != NULL ? "given" : "not here");
 	return data;
