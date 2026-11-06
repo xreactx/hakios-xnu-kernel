@@ -75,15 +75,9 @@ OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
  * The same for an interface that is not a radio (the modem's en1, bsd/dev/hakios.cell.c): SCNetworkInterface
  * calls an IFT_ETHER interface whose controller is none of the special kinds (802.11, Thunderbolt, Bluetooth,
  * a USB tether) an Ethernet one, as it would a USB Ethernet adapter, and configd gives it a service and asks
- * DHCP -- which hakios.cell.c answers with the data session's settings.
+ * DHCP -- which hakios.cell.c answers with the data session's settings. (Its controller is the IOEthernetController
+ * above, the Wi-Fi's base class.)
  */
-class IOEthernetController : public IOService
-{
-	OSDeclareDefaultStructors(IOEthernetController);
-};
-
-OSDefineMetaClassAndStructors(IOEthernetController, IOService);
-
 class IOEthernetInterface : public IONetworkInterface
 {
 	OSDeclareDefaultStructors(IOEthernetInterface);
