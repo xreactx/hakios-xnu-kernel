@@ -111,6 +111,47 @@ eventratecheck(struct timeval *lasttime, int *cureps, int maxeps)
 	return (1);
 }
 
+/*
+ * Linux's %pV: a format and its arguments handed on whole (struct va_format), which is how ath10k's ath10k_info(),
+ * _warn(), _err() and _dbg() reach dev_printk(). Expanded where it is the format's one conversion -- as it is in
+ * all of those -- and the format printed as it is otherwise.
+ */
+struct lx_va_format {
+	const char *fmt;
+	va_list *va;
+};
+
+static void
+expand(char *line, size_t size, const char *format, va_list list)
+{
+	const char *at = strstr(format, "%pV");
+	size_t before;
+
+	for (const char *c = format; at != NULL && *c != 0; c++) {
+		if (*c == '%' && c != at && c[1] != '%') {
+			at = NULL;              /* (another conversion: not ours to take apart) */
+		} else if (*c == '%' && c[1] == '%') {
+			c++;
+		}
+	}
+	if (at == NULL) {
+		vsnprintf(line, size, format, list);
+		return;
+	}
+	before = (size_t)(at - format) < size - 1 ? (size_t)(at - format) : size - 1;
+	memcpy(line, format, before);
+	line[before] = 0;
+	{
+		struct lx_va_format *vaf = va_arg(list, struct lx_va_format *);
+		va_list inner;
+
+		va_copy(inner, *vaf->va);
+		vsnprintf(line + before, size - before, vaf->fmt, inner);
+		va_end(inner);
+	}
+	strlcat(line, at + 3, size);
+}
+
 int
 device_printf(device_t dev, const char *format, ...)
 {
@@ -118,7 +159,7 @@ device_printf(device_t dev, const char *format, ...)
 	va_list list;
 
 	va_start(list, format);
-	vsnprintf(line, sizeof(line), format, list);
+	expand(line, sizeof(line), format, list);
 	va_end(list);
 	return (printf("ath10k: %s", line));
 }
