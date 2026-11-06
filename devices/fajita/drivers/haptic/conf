@@ -1,0 +1,5 @@
+# devices/fajita/drivers/haptic/conf: the OnePlus 6T's vibration motor.
+
+driver PMI_HAPTICS
+	file    bsd/dev/hakios.pmi_haptics.c
+	help    the PMI8998's haptics block through the PMIC arbiter, for Darwin's haptics (pmi_haptics=N)

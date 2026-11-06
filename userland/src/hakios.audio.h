@@ -38,7 +38,7 @@ struct hakios_audio_volume {
 #define HAKIOS_AUDIO_SET_VOLUME _IOW('r', 1, struct hakios_audio_volume)
 
 /*
- * ioctl(HAKIOS_AUDIO_SET_ROUTE): where what is written is to be heard -- the speaker, or the earpiece (iOS's
+ * ioctl(HAKIOS_AUDIO_SET_ROUTE): where what is written is to be heard -- the speaker, or the earpiece (Darwin's
  * "Built-In Receiver", the plug-in's device "Codec"). The plug-in says it when the device that plays changes.
  */
 #define HAKIOS_AUDIO_ROUTE_SPEAKER      0
@@ -64,7 +64,7 @@ void hakios_virtio_sound_init(void);   /* boot-arg virtio_sound=1: QEMU's virtio
 void hakios_speaker_init(void);        /* boot-arg speaker_probe=N: a look at the phone's speaker amplifiers */
 void hakios_haptic_init(void);         /* boot-arg haptic=N: the phone's vibration motor (bsd/dev/hakios.haptic.c) */
 void hakios_haptic_quiesce(void);      /* its chip back into reset: at the run's end and on a panic's way out */
-void hakios_haptic_pretend(uint32_t peak); /* a test's stand-in for iOS's waveform: as if a write of this loudness came */
+void hakios_haptic_pretend(uint32_t peak); /* a test's stand-in for Darwin's waveform: as if a write of this loudness came */
 void hakios_torch_init(void);          /* boot-arg torch=N: the phone's flashlight (bsd/dev/hakios.torch.c) */
 void hakios_torch_quiesce(void);       /* the light off: at the run's end and on a panic's way out */
 void hakios_camera_init(void);         /* boot-arg cam=N: the phone's cameras (bsd/dev/hakios.camera.c) */
@@ -114,7 +114,7 @@ void hakios_guard_monitor(uint32_t below);                     /* a reduction as
 void hakios_guard_process(int16_t *frames, uint32_t count);    /* stereo frames, in place */
 void hakios_guard_take_report(struct hakios_guard_report *report);   /* what happened since the last call */
 int hakios_guard_decibels(uint64_t ratio);                     /* 10 log10 of a Q30 ratio, in tenths of a dB */
-/* boot-arg rec_sound_fed=1: the recording (rec_sound=N) has what the guard let through instead of what iOS wrote */
+/* boot-arg rec_sound_fed=1: the recording (rec_sound=N) has what the guard let through instead of what Darwin wrote */
 bool hakios_audio_recording_fed(void);
 void hakios_audio_record_fed(const int16_t *frames, uint32_t count);
 

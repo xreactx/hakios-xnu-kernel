@@ -115,7 +115,7 @@ static bool quiet;                      /* repeating accesses that have been ann
 /*
  * The OnePlus 6T's GPU (soc_gpu=630): an Adreno 630 of the SDM845, whose clock controllers keep most
  * of their registers where redwood's do (gcc-sdm845.c, gpucc-sdm845.c), not all, and whose GMU is the
- * older kind (devices/oneplus-6t/README.md, step 9). Only the steps looked at for it are done there.
+ * older kind (devices/fajita/README.md, step 9). Only the steps looked at for it are done there.
  */
 static bool a630;
 #define PORTED_A630             22

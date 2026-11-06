@@ -2,6 +2,7 @@ ADRENO	arg	adreno	GPU and display	k	hakios.adreno.c
 ADRENO_BLIND	arg	adreno_blind	GPU and display	k	hakios.adreno.c	
 ADRENO_DIRTY	arg	adreno_dirty	GPU and display	k	hakios.adreno.c	
 ADRENO_FINE	arg	adreno_fine	GPU and display	k	hakios.adreno.c	the newest step waits like that before every single access
+ADRENO_GFX	arg	adreno_gfx	GPU and display	k	hakios.adreno.c	
 ADRENO_KEEP	arg	adreno_keep	GPU and display	k	hakios.adreno.c	
 ADRENO_ONLY	arg	adreno_only	GPU and display	k	hakios.adreno.c	step K alone (what steps 6 to 10 need, they check for themselves: within one session of the loader, power and clocks stay as an earlier run left them)
 ADRENO_PAUSE	arg	adreno_pause	GPU and display	k	hakios.adreno.c	how long the newest step waits after announcing a group of accesses (default 2200)
@@ -10,6 +11,7 @@ ADRENO_SKIP	arg	adreno_skip	GPU and display	k	hakios.adreno.c	leave out the step
 ADRENO_SPEED	arg	adreno_speed	GPU and display	k	hakios.adreno.c	step 17 asks the GMU for the 3D core's Nth speed: 1 315 MHz, 2 450 MHz, 3 550 MHz (the default: the most this phone's GPU is rated for)
 ADRENO_STREAM1	arg	adreno_stream1	GPU and display	k	hakios.adreno.c	step 18 leaves the core's second stream out (0) or gives it an empty context of its own (2): what the SMMU then records shows what the core
 ADRENO_WATCH	arg	adreno_watch	GPU and display	k	hakios.adreno.c	after the last step, say once a second for S seconds (default 20) that the machine is still alive, and what was written last
+ADSP_AFTER	arg	adsp_after	Audio and battery	k	hakios.adsp.c	
 ADSP_AGAIN	arg	adsp_again	Audio and battery	k	hakios.adsp.c	
 ADSP_APR_WAIT	arg	adsp_apr_wait	Audio and battery	k	hakios.adsp.c	
 ADSP_KEEP	arg	adsp_keep	Audio and battery	k	hakios.adsp.c	
@@ -56,6 +58,8 @@ BATTMGR	arg	battmgr	Audio and battery	k	hakios.adsp.c	every property once, for t
 BT	arg	bt	User space	k	hakios.bt.c	
 BT_AGAIN	arg	bt_again	User space	k	hakios.bt.c	the second look this many seconds later (0: no second look; 30)
 BUTTONS	arg	buttons	Touch and buttons	k	hakios.buttons.c	
+BUTTONS_AFTER	arg	buttons_after	Touch and buttons	k	hakios.buttons.c	
+BUTTONS_POLL_MS	arg	buttons_poll_ms	Touch and buttons	k	hakios.buttons.c	
 BUTTONS_STEPS	arg	buttons_steps	Touch and buttons	k	hakios.buttons.c	
 CA_METALLIB	arg	ca_metallib	User space	u	inject.c	
 CA_PROF	arg	ca_prof	User space	u	HakiosMetalCA.m	
@@ -74,6 +78,13 @@ CAM_SETTLE	arg	cam_settle	Cameras	k	hakios.camera.c
 CAM_SHUTTER	arg	cam_shutter	Cameras	k	hakios.camera.c	
 CAM_VBLANK	arg	cam_vblank	Cameras	k	hakios.camera.c	
 CC_FADE	arg	cc_fade	User space	u	inject_sb.c	
+CELL_DNS	arg	cell_dns	Cellular	k	hakios.cell.c	
+CELL_FAKE	arg	cell_fake	Cellular	k	hakios.cell.c	
+CELL_PING	arg	cell_ping	Cellular	k	hakios.cell.c	the data path tried without Darwin -- once the session is up, ten ICMP echoes from the session's
+CELL_PING_SIZE	arg	cell_ping_size	Cellular	k	hakios.cell.c	
+CELL_PING_TO	arg	cell_ping_to	Cellular	k	hakios.cell.c	
+CPUFREQ_OSM	arg	cpufreq_osm	CPU, memory and boot	k	hakios.cpufreq.c	
+CPUFREQ_OSM_MHZ	arg	cpufreq_osm_mhz	CPU, memory and boot	k	hakios.cpufreq.c	
 CPULOAD	arg	cpuload	CPU, memory and boot	k	hakios.cpufreq.c	every MS milliseconds, how busy each of our cores was meanwhile, in percent, to the loader's log (tools/frames.py shows it per gesture)
 CPUMASK	arg	cpumask	Loader	l	loader.c	
 DDR	arg	ddr	CPU, memory and boot	k	hakios.cpufreq.c	the memory's bus clock managers ("BCM") in the command database the boot loader left, with what is needed to vote for bandwidth on them -- only read
@@ -85,11 +96,15 @@ FB_BEAT	arg	fb_beat	GPU and display	k	MiniIOMobileFramebuffer.cpp
 FB_CA_HZ	arg	fb_ca_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	the refresh rate told to CoreAnimation (IOMFBDisplayRefresh) when it is not to be fb_hz's
 FB_DIFF	arg	fb_diff	GPU and display	k	MiniIOMobileFramebuffer.cpp	which pixels of the panel each frame changed (it costs: the panel's memory is slow to read)
 FB_FILTER	arg	fb_filter	GPU and display	k	MiniIOMobileFramebuffer.cpp	the picture is scaled to the panel nearest neighbour, as it once was
+FB_FLIP	arg	fb_flip	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_HZ	arg	fb_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_INTF	arg	fb_intf	GPU and display	k	MiniIOMobileFramebuffer.cpp	the registers of the display interface the panel is on, for a port
+FB_MAP_MB	arg	fb_map_mb	GPU and display	k	(patch),MiniIOMobileFramebuffer.cpp	
 FB_MEASURE	arg	fb_measure	GPU and display	k	MiniIOMobileFramebuffer.cpp	how often the panel is really refreshed
 FB_PRI	arg	fb_pri	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_PROBE	arg	fb_probe	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_QUEUE	arg	fb_queue	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_SCAN	arg	fb_scan	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_THREADS	arg	fb_threads	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FBHEIGHT	arg	fbheight	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FBSCALE	arg	fbscale	GPU and display	k	MiniIOMobileFramebuffer.cpp	the same 375 x 812 points drawn at two pixels a point instead of three
@@ -160,12 +175,14 @@ MIC_MAIN	arg	mic_main	Audio and battery	k	hakios.mic.c
 MIC_SECS	arg	mic_secs	Audio and battery	k	hakios.mic.c	
 MIC_TAP	arg	mic_tap	Audio and battery	k	hakios.mic.c	
 MIC_TEST	arg	mic_test	Audio and battery	k	hakios.mic.c	
+MIC_WCD	arg	mic_wcd	Audio and battery	k	hakios.mic.c	
 MODEM_APN	arg	modem_apn	Cellular	k	hakios.mpss.c	a session to that APN instead of the default profile
 MODEM_DATA_NOBIND	arg	modem_data_nobind	Cellular	k	hakios.mpss.c	
 MODEM_DATA_OFF	arg	modem_data_off	Cellular	k	hakios.mpss.c	
 MODEM_DATA_WAIT	arg	modem_data_wait	Cellular	k	hakios.mpss.c	
 MODEM_DPM_OFF	arg	modem_dpm_off	Cellular	k	hakios.mpss.c	
 MODEM_IPA	arg	modem_ipa	Cellular	k	hakios.mpss.c	
+MODEM_IPA_ANSWER_RULES	arg	modem_ipa_answer_rules	Cellular	k	hakios.mpss.c	
 MODEM_IPA_BUS_OFF	arg	modem_ipa_bus_off	Cellular	k	hakios.mpss.c	
 MODEM_IPA_DATA_OFF	arg	modem_ipa_data_off	Cellular	k	hakios.ipa.c	none of this. modem_ipa_data_trace=1: a line per packet.
 MODEM_IPA_DATA_TRACE	arg	modem_ipa_data_trace	Cellular	k	hakios.cell.c,hakios.ipa.c	
@@ -173,14 +190,19 @@ MODEM_IPA_FW	arg	modem_ipa_fw	Cellular	k	hakios.mpss.c
 MODEM_IPA_FW_AT	arg	modem_ipa_fw_at	Cellular	k	hakios.mpss.c	
 MODEM_IPA_GSI_ENABLE	arg	modem_ipa_gsi_enable	Cellular	k	hakios.mpss.c	
 MODEM_IPA_ITEM	arg	modem_ipa_item	Cellular	k	hakios.mpss.c	
+MODEM_IPA_NO_AGGR	arg	modem_ipa_no_aggr	Cellular	k	hakios.ipa.c	
 MODEM_IPA_NO_PROBE	arg	modem_ipa_no_probe	Cellular	k	hakios.mpss.c	
 MODEM_IPA_QUIET	arg	modem_ipa_quiet	Cellular	k	hakios.mpss.c	
 MODEM_IPA_RAW	arg	modem_ipa_raw	Cellular	k	hakios.mpss.c	
+MODEM_IPA_READBACK	arg	modem_ipa_readback	Cellular	k	hakios.mpss.c	
 MODEM_IPA_ROUTES	arg	modem_ipa_routes	Cellular	k	hakios.mpss.c	
 MODEM_IPA_SKIP_UC	arg	modem_ipa_skip_uc	Cellular	k	hakios.mpss.c	
 MODEM_IPA_SMMU_OFF	arg	modem_ipa_smmu_off	Cellular	k	hakios.mpss.c	
+MODEM_IPA_TZ	arg	modem_ipa_tz	Cellular	k	hakios.mpss.c	
 MODEM_KEEP	arg	modem_keep	Cellular	k	hakios.mpss.c	
+MODEM_LEAVE	arg	modem_leave	Cellular	k	hakios.mpss.c	
 MODEM_LISTEN	arg	modem_listen	Cellular	k	hakios.mpss.c	
+MODEM_META	arg	modem_meta	Cellular	k	hakios.mpss.c	
 MODEM_NAS_WAIT	arg	modem_nas_wait	Cellular	k	hakios.mpss.c	
 MODEM_NEW	arg	modem_new	Cellular	k	hakios.mpss.c	
 MODEM_NO_IPA_QMI	arg	modem_no_ipa_qmi	Cellular	k	hakios.mpss.c	
@@ -188,6 +210,7 @@ MODEM_NO_NAV	arg	modem_no_nav	Cellular	k	hakios.mpss.c
 MODEM_NO_TFTP	arg	modem_no_tftp	Cellular	k	hakios.mpss.c	
 MODEM_ONLINE	arg	modem_online	Cellular	k	hakios.mpss.c	
 MODEM_PAUSE	arg	modem_pause	Cellular	k	hakios.mpss.c	
+MODEM_QMAP1	arg	modem_qmap1	Cellular	k	hakios.ipa.c	
 MODEM_RETURN	arg	modem_return	Cellular	k	hakios.mpss.c	
 MODEM_RMTFS_DELAY	arg	modem_rmtfs_delay	Cellular	k	hakios.mpss.c	
 MODEM_RMTFS_RW_FAKE	arg	modem_rmtfs_rw_fake	Cellular	k	hakios.mpss.c	
@@ -197,8 +220,13 @@ MODEM_SHARE_TEST	arg	modem_share_test	Cellular	k	hakios.mpss.c
 MODEM_SIM_PROBE_OFF	arg	modem_sim_probe_off	Cellular	k	hakios.mpss.c	
 MODEM_SIM_SWITCH_OFF	arg	modem_sim_switch_off	Cellular	k	hakios.mpss.c	
 MODEM_STEP	arg	modem_step	Cellular	k	hakios.mpss.c	the steps once the root is there, then back to the loader if modem_return=1 says so
+MODEM_STOP	arg	modem_stop	Cellular	k	hakios.mpss.c	
 MODEM_WAIT	arg	modem_wait	Cellular	k	hakios.mpss.c	
 MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c	
+PMI_HAPTICS	arg	pmi_haptics	User space	k	hakios.pmi_haptics.c	a look, reading only: which channel of the arbiter is the block's and which system may write through it, what the block says it is, and its registers
+PMI_HAPTICS_AFTER	arg	pmi_haptics_after	User space	k	hakios.pmi_haptics.c	
+PMI_HAPTICS_MS	arg	pmi_haptics_ms	User space	k	hakios.pmi_haptics.c	
+PMI_HAPTICS_TAP_MS	arg	pmi_haptics_tap_ms	User space	k	hakios.pmi_haptics.c	
 PMIC_LIST	arg	pmic_list	Chip, thermal and PMIC	k	hakios.pmic.c	only the clock, not the inventory of every block
 PRESS_POWER	arg	press_power	Touch and buttons	k	hakios.buttons.c	a short press of the power key that many seconds after boot, and another ten seconds later, given to Darwin as the key's own are (hakios_touch_post):
 PRESS_POWER_MS	arg	press_power_ms	Touch and buttons	k	hakios.buttons.c	
@@ -217,24 +245,44 @@ RETURN_CPU	arg	return_cpu	CPU, memory and boot	k	loader_return.c
 RETURN_PANIC	arg	return_panic	CPU, memory and boot	k	loader_return.c	
 ROOT_APFS	arg	root_apfs	User space	u	init.c	the root is to be the Darwin root volume on /dev/DEV -- the phone's flash, read only
 SERIAL	arg	serial	Loader	l	loader.c	
+SLIDER	arg	slider	User space	k	hakios.slider.c	a look, reading only: the three pins' setup and levels at the start, then every 50 ms, and each change said with its time
+SLIM	arg	slim	User space	k	hakios.slim.c	the QMI part alone; slim=2: the NGD as well; slim=3: the codec's clock and reset too
 SMALL_CORES	arg	small_cores	CPU, memory and boot	k	(patch)	
 SMALL_CORES_AFTER	arg	small_cores_after	CPU, memory and boot	k	GenericARMPE.cpp	
-SOC_CMD_DB	hex	soc_cmd_db	Cellular	k	hakios.mpss.c	
+SOC_ADSP_CX	hex	soc_adsp_cx	Audio and battery	k	hakios.adsp.c	
+SOC_ADSP_MEM	hex	soc_adsp_mem	Audio and battery	k	hakios.adsp.c	
+SOC_ADSP_MEM_SIZE	hex	soc_adsp_mem_size	Audio and battery	k	hakios.adsp.c	
+SOC_AOSS	hex	soc_aoss	Audio and battery	k	hakios.adsp.c	
+SOC_APCS_IPC	hex	soc_apcs_ipc	Cellular	k	hakios.adsp.c,hakios.mpss.c	
+SOC_AUDIO_STREAM	hex	soc_audio_stream	Audio and battery	k	hakios.sound.c	
+SOC_CMD_DB	hex	soc_cmd_db	GPU and display	k	hakios.adreno.c,hakios.adsp.c,hakios.cpufreq.c,hakios.mpss.c	
+SOC_DISPLAY	hex	soc_display	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+SOC_GPU	hex	soc_gpu	GPU and display	k	hakios.adreno.c	
 SOC_GSI_BASE	hex	soc_gsi_base	Cellular	k	hakios.ipa.c	
 SOC_IMEM	hex	soc_imem	Cellular	k	hakios.mpss.c	
 SOC_IPA_BASE	hex	soc_ipa_base	Cellular	k	hakios.ipa.c	
 SOC_IPA_FW	arg	soc_ipa_fw	Cellular	k	hakios.mpss.c	
 SOC_IPA_STREAM	arg	soc_ipa_stream	Cellular	k	hakios.mpss.c	
 SOC_IPA_STREAM_UC	arg	soc_ipa_stream_uc	Cellular	k	hakios.mpss.c	
+SOC_MBA_MEM	hex	soc_mba_mem	Cellular	k	hakios.mpss.c	
+SOC_MBA_MEM_SIZE	hex	soc_mba_mem_size	Cellular	k	hakios.mpss.c	
 SOC_MPSS_MEM	hex	soc_mpss_mem	Cellular	k	hakios.mpss.c	
+SOC_MPSS_MEM_SIZE	hex	soc_mpss_mem_size	Cellular	k	hakios.mpss.c	
 SOC_PAS_IPA	arg	soc_pas_ipa	Cellular	k	hakios.mpss.c	
 SOC_PAS_MPSS	arg	soc_pas_mpss	Cellular	k	hakios.mpss.c	
-SOC_SMEM	hex	soc_smem	Cellular	k	hakios.mpss.c,hakios.socinfo.c	where SMEM is (also the modem driver's argument; 0x80900000 on the reference phone)
+SOC_RSC	hex	soc_rsc	Audio and battery	k	hakios.adsp.c,hakios.cpufreq.c	
+SOC_SMEM	hex	soc_smem	Cellular	k	hakios.adsp.c,hakios.mpss.c,hakios.socinfo.c	where SMEM is (also the modem driver's argument; 0x80900000 on the reference phone)
 SOC_SMEM_SIZE	hex	soc_smem_size	Chip, thermal and PMIC	k	hakios.socinfo.c	
+SOC_SOUND_BITS	hex	soc_sound_bits	Audio and battery	k	hakios.sound.c	
+SOC_SOUND_CLOCK	hex	soc_sound_clock	Audio and battery	k	hakios.sound.c	
+SOC_SOUND_PORT	hex	soc_sound_port	Audio and battery	k	hakios.sound.c	
+SOC_VTIMER	hex	soc_vtimer	User space	k	gic_v3_irq.c	
 SOUND_BELOW	arg	sound_below	Audio and battery	k	hakios.sound.c	
+SOUND_EARPIECE	arg	sound_earpiece	Audio and battery	k	hakios.sound.c	
 SOUND_GAIN	arg	sound_gain	Audio and battery	k	hakios.sound.c	
 SOUND_GUARD_AS	arg	sound_guard_as	Audio and battery	k	hakios.sound.c	
 SOUND_PAUSE	arg	sound_pause	Audio and battery	k	hakios.sound.c	
+SOUND_RECEIVER	arg	sound_receiver	Audio and battery	k	hakios.sound.c	
 SOUND_SECS	arg	sound_secs	Audio and battery	k	hakios.sound.c	
 SPEAKER_PROBE	arg	speaker_probe	Audio and battery	k	hakios.speaker.c	reads registers and nothing else: the pins, the power names (below)
 SURF_CLEAR	arg	surf_clear	GPU and display	k	MiniIOSurface.cpp	kept memory is given out as it is (to see what the clearing costs; a surface is then not all zeroes)
@@ -242,9 +290,13 @@ SURF_WRAP	arg	surf_wrap	GPU and display	k	MiniIOSurface.cpp	surfaces around the 
 SURFTRACE	arg	surftrace	GPU and display	k	MiniIOSurface.cpp	log the first N surfaces created (default 24)
 SURFTRACE_OF	arg	surftrace_of	GPU and display	k	MiniIOSurface.cpp	
 SWITCHER_WALLPAPER	arg	switcher_wallpaper	User space	u	inject_sb.c	
+SYNAPTICS	arg	synaptics	User space	k	hakios.synaptics.c	a look: the pins, and whether anything answers at 0x20 (one read of the page register)
+SYNAPTICS_AFTER	arg	synaptics_after	User space	k	hakios.synaptics.c	
 SYSSLEEP	arg	syssleep	CPU, memory and boot	k	(patch)	
 SYSTRACE	arg	systrace	CPU, memory and boot	k	(patch),user_exception_trace.c	
 SYSTRACE_NAME	arg	systrace_name	CPU, memory and boot	k	(patch)	
+TFA9894	arg	tfa9894	User space	k	hakios.tfa9894.c	a look: the pins, then the chip's revision (register 3, 0x1a94) over I2C; reads only
+THERMAL_EVERY	arg	thermal_every	User space	k	hakios.tsens845.c	
 THERMAL_LOG	arg	thermal_log	Chip, thermal and PMIC	k	hakios.thermal.c	a summary line this often (0: only on a rise; 60)
 THERMAL_TM0	arg	thermal_tm0	Chip, thermal and PMIC	k	hakios.thermal.c	
 THERMAL_TM1	arg	thermal_tm1	Chip, thermal and PMIC	k	hakios.thermal.c	
@@ -283,6 +335,9 @@ VIRTIO_INPUT	arg	virtio_input	Touch and buttons	k	hakios.virtio_input.c
 VIRTIO_SOUND	arg	virtio_sound	Audio and battery	k	hakios.virtio_sound.c	
 WALLPAPER_CACHE	arg	wallpaper_cache	User space	u	inject_sb.c	the window that shows the wallpaper rasterized by the window server (CALayer's shouldRasterize), drawn from one texture instead of composed again
 WALLPAPER_FREEZE	arg	wallpaper_freeze	User space	u	inject_sb.c	the wallpaper as one still picture
+WIFI10	arg	wifi10	User space	k	hakios.wlfw10.c	the indications ath10k wants (firmware ready, MSA ready); the firmware's status
+WIFI10_MSA	arg	wifi10_msa	User space	k	hakios.wlfw10.c	
+WIFI6T	arg	wifi6t	User space	k	hakios.wifi6t.c	
 WIFI_AGAIN	arg	wifi_again	Wi-Fi	k	hakios.wifi.c	start the DSP although the one before it was shut down without having acknowledged a stop: THAT HAS RESET THE PHONE, twice of two
 WIFI_ASK	arg	wifi_ask	Wi-Fi	k	hakios.wifi.c	step 14 also asks that service a question (its capabilities) and writes down the beginning of an answer
 WIFI_BA	arg	wifi_ba	Wi-Fi	k	lx_80211.c	
@@ -292,7 +347,7 @@ WIFI_FILE	arg	wifi_file	Wi-Fi	k	hakios.wifi.c	with wifi=1: the network of fw/net
 WIFI_FINE	arg	wifi_fine	Wi-Fi	k	hakios.wifi.c	such a step waits like that before every single write and call
 WIFI_HOLD	arg	wifi_hold	Wi-Fi	k	lx_bus.c	
 WIFI_IRQ	arg	wifi_irq	Wi-Fi	k	lx_bus.c	
-WIFI_JOIN	arg	wifi_join	Wi-Fi	k	lx_bus.c	
+WIFI_JOIN	arg	wifi_join	Wi-Fi	k	lx_bus.c,lx_snoc.c	
 WIFI_KEEP	arg	wifi_keep	Wi-Fi	k	hakios.wifi.c	when the steps are over the DSP and the link stay up while the system runs, for whoever uses sys/hakios.qrtr.h; stopped when the run ends
 WIFI_LISTEN	arg	wifi_listen	Wi-Fi	k	hakios.wifi.c	how long step 14 waits for the Wi-Fi firmware's service (default 3)
 WIFI_LOUD	arg	wifi_loud	Wi-Fi	k	hakios.wifi.c	
@@ -302,11 +357,11 @@ WIFI_MAC	arg	wifi_mac	Wi-Fi	k	hakios.wifi.c	the radio's own address for the driv
 WIFI_MISSION	arg	wifi_mission	Wi-Fi	k	hakios.wlfw.c	
 WIFI_NEW	arg	wifi_new	Wi-Fi	k	hakios.wifi.c	steps K and later have not been seen to work (default: the last one)
 WIFI_PAUSE	arg	wifi_pause	Wi-Fi	k	hakios.wifi.c	
-WIFI_QUIET	arg	wifi_quiet	Wi-Fi	k	lx_bus.c	
+WIFI_QUIET	arg	wifi_quiet	Wi-Fi	k	lx_bus.c,lx_snoc.c	
 WIFI_RADIO_READ	arg	wifi_radio_read	Wi-Fi	k	hakios.wifi.c	step 16 does read (2: whatever mode the firmware is in)
 WIFI_READY	arg	wifi_ready	Wi-Fi	k	hakios.wlfw.c	
 WIFI_RETURN	arg	wifi_return	Wi-Fi	k	hakios.wifi.c	when all is over, go back to the loader instead of starting the system
-WIFI_SCAN	arg	wifi_scan	Wi-Fi	k	lx_bus.c	
+WIFI_SCAN	arg	wifi_scan	Wi-Fi	k	lx_bus.c,lx_snoc.c	
 WIFI_SMMU	arg	wifi_smmu	Wi-Fi	k	hakios.wifi.c	before any step: read what the boot chain has set up in the SMMU for the radio's stream (smmu_look() below; nothing is written)
 WIFI_STATION	arg	wifi_station	Wi-Fi	k	lx_bus.c	
 WIFI_STEP	arg	wifi_step	Wi-Fi	k	hakios.wifi.c	

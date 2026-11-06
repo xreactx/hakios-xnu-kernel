@@ -283,7 +283,7 @@ cell_transmit(mbuf_t packet, size_t length)
 }
 
 /*
- * cell_ping=1: the data path tried without iOS -- once the session is up, ten ICMP echoes from the session's
+ * cell_ping=1: the data path tried without Darwin -- once the session is up, ten ICMP echoes from the session's
  * address to 8.8.8.8 (cell_ping_to=0xAABBCCDD: elsewhere), two seconds apart, straight onto the IPA from the
  * interface's thread, and each answer logged with its round trip. An answer is the IPA and the modem
  * carrying a packet both ways; none, with "sent" lines, is the way out or back failing; no "sent" line at
@@ -517,9 +517,9 @@ hakios_cell_session(bool up, uint32_t address, uint32_t mask, uint32_t gateway, 
 }
 
 /*
- * cell_fake=1 (a test of iOS's side alone): en1 attached at start without the modem or the IPA, its "session" made up
+ * cell_fake=1 (a test of Darwin's side alone): en1 attached at start without the modem or the IPA, its "session" made up
  * -- 10.64.0.2, router 10.64.0.1, DNS 1.1.1.1 -- and its link up, so that configd's DHCP on it, and the answer from
- * here, show whether iOS takes en1 as a network interface. Its IP packets go nowhere (no data path).
+ * here, show whether Darwin takes en1 as a network interface. Its IP packets go nowhere (no data path).
  */
 void
 hakios_cell_fake(void)

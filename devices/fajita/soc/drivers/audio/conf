@@ -1,0 +1,7 @@
+# soc/drivers/audio/conf: the SDM845's audio SLIMbus and the WCD934x codec on it.
+
+driver SLIM
+	file    bsd/dev/hakios.slim.c
+	requires ADSP
+	help    the DSP's SLIMbus (QMI service 0x301), the NGD, and the WCD934x: the earpiece (sound_receiver=1,
+	help    sound_earpiece=N) and the handset microphone (mic_wcd=1) through it (slim=N)

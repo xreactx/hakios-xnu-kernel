@@ -251,7 +251,7 @@ SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, &u
     "microseconds spent waiting for core 0's answers");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_copy_us, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_copy_us,
     "microseconds spent copying out of the loader's buffer");
-/* where iOS's data volume may be kept this run, for userland/src/var_store.c: none ("") without ufs_write=1 */
+/* where Darwin's data volume may be kept this run, for userland/src/var_store.c: none ("") without ufs_write=1 */
 static char ufs_var_part[36];
 static uint64_t ufs_var_first, ufs_var_end;     /* bytes into that partition: the first a write may reach, and its end */
 SYSCTL_STRING(_kern_hakios, OID_AUTO, var_part, CTLFLAG_RD | CTLFLAG_LOCKED, ufs_var_part, sizeof(ufs_var_part),

@@ -121,8 +121,10 @@ def scan(root, keep=None):
         if f == "xnu/hakios.patch":
             text = "\n".join(l[1:] for l in text.splitlines() if l.startswith("+") and not l.startswith("+++"))
             base = "(patch)"
-        # the kernel's side: where the drivers are kept (xnu/files/ until they moved to drivers/<subsystem>/) and the Linux layer
-        if f.startswith(("xnu/", "drivers/", "wifi/lx/src/")):
+        # the kernel's side: where the drivers are kept (xnu/files/ until they moved to drivers/<subsystem>/), the drivers of
+        # the SoC and device layers checked out here (devices/<name>/drivers/, devices/<name>/soc/drivers/, socs/<name>/drivers/)
+        # and the Linux layers (wifi/lx/src/, and wifi/lx/ath10k/ for the WCN3990's ath10k)
+        if f.startswith(("xnu/", "drivers/", "wifi/lx/src/", "wifi/lx/ath10k/")) or re.match(r"(devices|socs)/[^/]+/(soc/)?drivers/", f):
             for m in KERNEL.finditer(text):
                 found[m.group(1)]["kernel"].add(base)
             for m in STRING.finditer(text):

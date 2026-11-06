@@ -38,7 +38,7 @@ struct hakios_audio_volume {
 #define HAKIOS_AUDIO_SET_VOLUME _IOW('r', 1, struct hakios_audio_volume)
 
 /*
- * ioctl(HAKIOS_AUDIO_SET_ROUTE): where what is written is to be heard -- the speaker, or the earpiece (iOS's
+ * ioctl(HAKIOS_AUDIO_SET_ROUTE): where what is written is to be heard -- the speaker, or the earpiece (Darwin's
  * "Built-In Receiver", the plug-in's device "Codec"). The plug-in says it when the device that plays changes.
  */
 #define HAKIOS_AUDIO_ROUTE_SPEAKER      0

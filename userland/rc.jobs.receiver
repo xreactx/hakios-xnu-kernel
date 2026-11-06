@@ -1,5 +1,5 @@
 # Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
-# The earpiece through iOS (README step 10b; sound_receiver=1): once SpringBoard is up, a tone with this program's
+# The earpiece through Darwin (README step 10b; sound_receiver=1): once SpringBoard is up, a tone with this program's
 # audio session as a call has it (play-and-record: the receiver), then moved to the speaker, the route said each time.
 /redwood/bin/sound_test springboard wait 20 route session receiver route tone 10 wait 2 session speaker route tone 4 >> /private/var/results
 /bin/cat /private/var/results

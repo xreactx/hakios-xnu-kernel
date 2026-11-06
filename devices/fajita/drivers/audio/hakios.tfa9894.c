@@ -9,7 +9,7 @@
  * it -- that is a container of a patch for the chip's DSP and of its parameters, in NXP's own format --
  * but by doing again what that driver did: the I2C transfers of its set-up at a cold boot, recorded
  * under Android with the kernel's I2C trace and made into fw/tfa9894-coldboot.replay by
- * tools/tfa-trace2replay.py (devices/oneplus-6t/README.md, step 10). The file holds the writes, and the
+ * tools/tfa-trace2replay.py (devices/fajita/README.md, step 10). The file holds the writes, and the
  * reads with what the chip answered then; it is the vendor's (the patch is in it), in the small image
  * with ADSP=1 userland/build.sh, never in the repository.
  *

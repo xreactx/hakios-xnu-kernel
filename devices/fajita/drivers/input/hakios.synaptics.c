@@ -1,7 +1,7 @@
 /*
  * The touch screen of the OnePlus 6T (fajita): a Synaptics S3320-family controller speaking RMI4 over
  * I2C (Android's "synaptics-rmi-ts@20", compatible "HWK,synaptics,s3320"). Every address and number
- * below belongs to this phone, from its own device tree (devices/oneplus-6t/README.md):
+ * below belongs to this phone, from its own device tree (devices/fajita/README.md):
  *
  *   I2C        the serial engine 12 (qupv3_se12_i2c at 0xa90000, function qup12 on GPIO 49 data and
  *              50 clock, no pulls of its own), address 0x20; done by hand, as hakios.haptic.c does

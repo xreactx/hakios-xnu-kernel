@@ -82,7 +82,7 @@ static const char *const SKIP[] = {
 	"db/diagnostics", "db/uuidtext",        /* logd's archive: tens of MB a boot, and remade */
 	"jb",                   /* the package prefix, grafted from the read-only image at every boot */
 	/*
-	 * What iOS remakes by itself and what only grows: on the OnePlus 6T these were 80 of the archive's
+	 * What Darwin remakes by itself and what only grows: on the OnePlus 6T these were 80 of the archive's
 	 * 165 MB (1 November), its store a 201 MiB slot. Usage-event streams for Siri's suggestions and Biome,
 	 * the icon cache, diagnostics and analytics; every Library/Caches besides (is_skipped()).
 	 */

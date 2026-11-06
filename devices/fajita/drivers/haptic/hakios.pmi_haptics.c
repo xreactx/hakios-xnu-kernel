@@ -22,8 +22,8 @@
  *                   moves. At the run's end the three registers are put back as they were found.
  *   pmi_haptics=3   ... and one pulse of pmi_haptics_ms=N milliseconds (100) 3 s after that: enable, play,
  *                   the status read while it plays, then play and enable off again.
- *   pmi_haptics=4   ... configured as for 2, and instead of the pulse the motor for iOS until the run ends:
- *                   what iOS plays on its "Actuator" (userland/src/audio_plugin.c) comes to
+ *   pmi_haptics=4   ... configured as for 2, and instead of the pulse the motor for Darwin until the run ends:
+ *                   what Darwin plays on its "Actuator" (userland/src/audio_plugin.c) comes to
  *                   /dev/hakios-haptic as samples, and is told apart as redwood's driver tells it
  *                   (hakios.haptic.c, haptic=5): a waveform after a pause is a tap -- a pulse of
  *                   pmi_haptics_tap_ms=N (30) -- and one that goes on past 60 ms a vibration, the motor
@@ -188,14 +188,14 @@ pulse(void)
 }
 
 
-/* ---- pmi_haptics=4: the motor for iOS (as hakios.haptic.c's haptic=5) ------------------------------- */
+/* ---- pmi_haptics=4: the motor for Darwin (as hakios.haptic.c's haptic=5) ------------------------------- */
 
 #define HAPTIC_MAX_MS           1000
 #define ACTIVE_US               30000           /* a write that was not silence counts for this long */
 #define SILENT_BELOW            256             /* of 32768: samples no larger are silence */
 #define TAP_US                  60000           /* longer than this, and it is a vibration, not a tap */
-#define SETTLE_US               8000            /* how long iOS's waveform is listened to before a tap: its loudness */
-#define FOLLOW_US               20000           /* how often a vibration's strength follows iOS's */
+#define SETTLE_US               8000            /* how long Darwin's waveform is listened to before a tap: its loudness */
+#define FOLLOW_US               20000           /* how often a vibration's strength follows Darwin's */
 #define TOLD_EVENTS             24              /* the first so many taps and vibrations are each said */
 
 static volatile uint64_t heard_us, quiet_us, onset_us;
@@ -269,7 +269,7 @@ static const struct cdevsw haptic_cdevsw = {
 	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
 };
 
-/* the maximum voltage for a waveform of iOS's of this loudness: 5/8 of Android's for the softest, Android's from a third up */
+/* the maximum voltage for a waveform of Darwin's of this loudness: 5/8 of Android's for the softest, Android's from a third up */
 static uint8_t
 vmax_for(uint32_t peak)
 {
@@ -340,7 +340,7 @@ serve(void)
 				playing = vmax;
 				taps++;
 				if (taps + loops <= TOLD_EVENTS) {
-					say("pmi_haptics: tap %u: iOS's waveform peaks at %u of 32768: %u ms at %u mV\n", taps, peak, tap_ms,
+					say("pmi_haptics: tap %u: Darwin's waveform peaks at %u of 32768: %u ms at %u mV\n", taps, peak, tap_ms,
 					    vmax * 116);
 				}
 			}
@@ -353,7 +353,7 @@ serve(void)
 				loops++;
 				heard_peak = 0;
 				if (taps + loops <= TOLD_EVENTS) {
-					say("pmi_haptics: vibration %u: iOS goes on playing (peak %u): held on, %u ms at most\n", loops, peak,
+					say("pmi_haptics: vibration %u: Darwin goes on playing (peak %u): held on, %u ms at most\n", loops, peak,
 					    HAPTIC_MAX_MS);
 				}
 				break;
@@ -392,7 +392,7 @@ serve(void)
 				state = cut ? REST : IDLE;
 				if (taps + loops <= TOLD_EVENTS + 1) {
 					say("pmi_haptics: vibration %u: %s after %llu ms\n", loops, cut ? "CUT at the limit" :
-					    "iOS stopped, and so does the motor", (now - since) / 1000);
+					    "Darwin stopped, and so does the motor", (now - since) / 1000);
 				}
 			}
 			break;
@@ -416,7 +416,7 @@ pmi_haptics_thread(__unused void *arg, __unused wait_result_t wr)
 
 	say("pmi_haptics: level %u: %s; the bus is left to the loader's core for %u s\n", level,
 	    level == 1 ? "a look, reading only" : level == 2 ? "a look, then configured (nothing moves)" :
-	    level == 3 ? "configured, then one pulse" : "configured, then the motor for iOS",
+	    level == 3 ? "configured, then one pulse" : "configured, then the motor for Darwin",
 	    after_s);
 	delay_for_interval(after_s * 1000, NSEC_PER_MSEC);
 	channel = hakios_spmi_channel(HAPTICS_ID, &owner);

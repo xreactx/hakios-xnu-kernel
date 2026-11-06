@@ -1,0 +1,9 @@
+# devices/fajita/drivers/input/conf: the OnePlus 6T's own input hardware (docs/drivers-config.md has every word).
+
+driver SYNAPTICS
+	file    bsd/dev/hakios.synaptics.c
+	help    the touch screen: a Synaptics S3706B (RMI4) on I2C done by hand (synaptics=N)
+
+driver SLIDER
+	file    bsd/dev/hakios.slider.c
+	help    the alert slider (oneplus,tri-state-key) as Darwin's ring/silent switch (slider=N)

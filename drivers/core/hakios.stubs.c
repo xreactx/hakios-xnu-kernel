@@ -135,3 +135,59 @@ void hakios_torch_quiesce(void) {}
 void hakios_camera_init(void) {}
 void hakios_camera_quiesce(void) {}
 #endif
+
+/*
+ * The OnePlus 6T's own drivers (devices/fajita/drivers/) and the SDM845's (devices/fajita/soc/drivers/), for a kernel built
+ * without them (every other phone's): the calls the common drivers make into them.
+ */
+void hakios_slim_start(void);
+void hakios_synaptics_quiesce(void);
+void hakios_thermal_quiesce(void);
+bool hakios_wifi6t(void);
+const uint8_t *hakios_wifi6t_file(const char *name, uint64_t *size);
+bool hakios_wifi6t_radio_map(uint64_t physical, uint64_t size, unsigned long long *address);
+void hakios_wifi6t_start(void);
+void hakios_wlfw10_start(void);
+
+#ifndef HAKIOS_SYNAPTICS
+void hakios_synaptics_init(void) {}
+void hakios_synaptics_quiesce(void) {}
+#endif
+
+#ifndef HAKIOS_SLIDER
+void hakios_slider_init(void) {}
+void hakios_slider_quiesce(void) {}
+#endif
+
+#ifndef HAKIOS_PMI_HAPTICS
+void hakios_pmi_haptics_init(void) {}
+void hakios_pmi_haptics_quiesce(void) {}
+#endif
+
+#ifndef HAKIOS_TFA9894
+void hakios_tfa9894_init(void) {}
+bool hakios_tfa9894_prepare(void) { return false; }
+bool hakios_tfa9894_start(void) { return false; }
+void hakios_tfa9894_stop(void) {}
+void hakios_tfa9894_quiesce(void) {}
+#endif
+
+#ifndef HAKIOS_SLIM
+void hakios_slim_start(void) {}
+bool hakios_slim_codec_ready(__unused uint32_t ms) { return false; }
+bool hakios_slim_earpiece(__unused bool on) { return false; }
+bool hakios_slim_mic(__unused bool on) { return false; }
+#endif
+
+#ifndef HAKIOS_WIFI6T
+bool hakios_wifi6t(void) { return false; }
+const uint8_t *hakios_wifi6t_file(__unused const char *name, __unused uint64_t *size) { return NULL; }
+bool hakios_wifi6t_radio_map(__unused uint64_t physical, __unused uint64_t size, __unused unsigned long long *address) { return false; }
+void hakios_wifi6t_start(void) {}
+void hakios_wlfw10_start(void) {}
+#endif
+
+#ifndef HAKIOS_TSENS845
+void hakios_thermal_init(void) {}
+void hakios_thermal_quiesce(void) {}
+#endif

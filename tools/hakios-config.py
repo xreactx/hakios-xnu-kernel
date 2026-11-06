@@ -21,7 +21,7 @@ applies). A few symbols are not arguments but facts about the build (CONFIG_DEVI
 Where this differs from Linux's, on purpose:
   - CONFIG_FIRMWARE="none" is a profile that loads NOTHING of the phone's own (no GPU, Wi-Fi, audio or modem
     firmware pulled from the device): the open configuration. The check refuses an option that needs firmware in it.
-  - the kernel's command line holds 607 characters; the check says how much of them the configuration takes, and
+  - the kernel's command line holds 1023 characters; the check says how much of them the configuration takes, and
     refuses what cannot fit, because a command line that is too long loses its tail without an error.
 """
 import argparse
@@ -35,7 +35,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-KERNEL_LINE = 607                   # BOOT_LINE_LENGTH 608 less the terminator: what the kernel's boot_args can hold
+KERNEL_LINE = 1023                  # BOOT_LINE_LENGTH 1024 (xnu/hakios.patch: pexpert/pexpert/arm64/boot.h) less the terminator
 RUN_OVERHEAD = 260                  # what a run adds itself: the loader's own arguments, xl's, the runner's (measured: ~190-250)
 
 class ConfigError(Exception):

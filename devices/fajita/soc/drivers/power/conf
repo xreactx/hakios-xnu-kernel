@@ -1,0 +1,5 @@
+# soc/drivers/power/conf: the SDM845's temperature sensors.
+
+driver TSENS845
+	file    bsd/dev/hakios.tsens845.c
+	help    tsens v2's 21 sensors, read and logged (thermal=1); reading only. The common THERMAL driver is the SC7280's

@@ -1,0 +1,8 @@
+# soc/drivers/wifi/conf: the SDM845's WCN3990, whose firmware is a domain of the modem's.
+
+driver WIFI6T
+	file    bsd/dev/hakios.wifi6t.c
+	file    bsd/dev/hakios.wlfw10.c
+	requires MODEM QMI WIFI
+	help    ath10k on the WCN3990 (wifi6t=1, with the kernel linked with tools/mk-ath10k.sh's object: ATH=ath10k) and
+	help    a stand-in for its first exchange with the firmware (wifi10=N); started when the modem announces WLFW

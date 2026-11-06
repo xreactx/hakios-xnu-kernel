@@ -2,7 +2,7 @@
 """
 Pack a phone's UEFI (with the hook that starts the XNU loader) and an optional payload
 into an Android boot image for `fastboot boot`. The phone is DEVICE (a directory under devices/,
-as in the Makefile; default poco-x5-pro).
+as in the Makefile; default redwood).
 
   kernel = gzip(BootShim + UEFI FD + ["XNUP" container]) + DTB
 
@@ -20,10 +20,10 @@ MU = os.path.join(HERE, 'Mu-Silicium')
 # devices/<dir>: its Mu-Silicium platform (<name>Pkg, Resources/DTBs/<name>.dtb) and where its UEFI is loaded
 # (Resources/Configs/<name>.toml, [uefi_fd])
 DEVICES = {
-    'poco-x5-pro': ('redwood', 0x9FD00000, 0x200000),
-    'oneplus-6t':  ('fajita',  0x9FC00000, 0x300000),
+    'redwood':     ('redwood', 0x9FD00000, 0x200000),
+    'fajita':      ('fajita',  0x9FC00000, 0x300000),
 }
-DEVICE = os.environ.get('DEVICE', 'poco-x5-pro')
+DEVICE = os.environ.get('DEVICE', 'redwood')
 if DEVICE not in DEVICES:
     sys.exit(f'mkxnuimg.py: DEVICE={DEVICE}: not one of {", ".join(DEVICES)}')
 NAME, FD_BASE, FD_SIZE = DEVICES[DEVICE]

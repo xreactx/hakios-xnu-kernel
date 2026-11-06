@@ -27,7 +27,7 @@
 #define HAKIOS_BUTTON_VOLUME_UP 2
 #define HAKIOS_BUTTON_VOLUME_DOWN 3
 #define HAKIOS_BUTTON_HOME     4
-#define HAKIOS_BUTTON_RINGER   5       /* the ring/silent switch (the OnePlus 6T's alert slider): DOWN = ring, UP = silent, as iOS has it */
+#define HAKIOS_BUTTON_RINGER   5       /* the ring/silent switch (the OnePlus 6T's alert slider): DOWN = ring, UP = silent, as Darwin has it */
 
 struct hakios_touch {
 	uint64_t time;                  /* mach_absolute_time() when the sample was posted */

@@ -55,7 +55,7 @@ void hakios_ipa_modem_endpoints(uint32_t *to_modem, uint32_t *from_modem);
 void hakios_cell_session(bool up, uint32_t address, uint32_t mask, uint32_t gateway, uint32_t dns1, uint32_t dns2, uint32_t mtu);
 /* Make en1 on the IPA's data path once hakios_ipa_data_setup() has succeeded. */
 void hakios_cell_attach(void);
-/* cell_fake=1: en1 at start with a made-up session and no modem, to try iOS's side alone (DHCP, routing). */
+/* cell_fake=1: en1 at start with a made-up session and no modem, to try Darwin's side alone (DHCP, routing). */
 void hakios_cell_fake(void);
 
 /* ---- hakios.mpss.c, for the interface's tests ---- */

@@ -9,7 +9,7 @@ phone is here; the kernel, loader and user space are the common ones. `device.co
 | UEFI for the phone | `uefi/`: `fajitaPkg`, Mu-Silicium's `enchiladaPkg` (OnePlus 6, the same board) with the 6T's name, model and 1080x2340 panel. Its vendor drivers are Mu-Silicium's own `Binaries/enchilada`: nothing to extract from the phone |
 | The phone's device tree | `uefi/files/Resources/DTBs/fajita.dtb`: the phone's own, with `/chosen` emptied (the raw `fdt` pulled over adb carries the serial number and is git-ignored) |
 | SoC boot-args | `soc.args`, from `pull-soc.sh` / `tools/soc-args.py` (13 of the 16; see below) |
-| Run boot-args | `run.args`: added by `xl run` to every run on this phone (`DEVICE=oneplus-6t`), unless `XL_CMDLINE` gives the same name |
+| Run boot-args | `configs/fajita.config` (over `soc/configs/sdm845.config` and `configs/common_defconfig`): `make fajita_defconfig` writes the `.config`, and `xl run` (`DEVICE=fajita`) adds its arguments to every run unless `XL_CMDLINE` gives the same name |
 | The phone's firmware | **not in the repository**: `pull-firmware.sh` pulls it over adb into `fw-*/` at the top |
 
 ## How it differs from redwood
@@ -28,7 +28,7 @@ phone is here; the kernel, loader and user space are the common ones. `device.co
 | Wi-Fi | WCN3990, `icnss` | WCN6750 | Linux's ath10k_snoc, not ath11k: a new back end |
 | Audio | ADSP (TrustZone PAS 1, 26 MB at `0x8c500000`), Q6 APR; the loudspeaker a TFA9894 on QUAT MI2S; WCD934x "tavil" on SLIMbus for the rest | ADSP; AW88261s on TDM | rework of `hakios.adsp.c` / `hakios.sound.c`, a TFA9894 driver (step 10) |
 | Battery, charging | PMI8998 (fuel gauge, SMB2) | through the ADSP | through the loader from UEFI, as redwood's first way was, but with other protocols (step 7) |
-| Haptics | PMI8998 haptics block (slave 3, peripheral `0xc0`), an LRA | Awinic AW86927 on I2C | `hakios.pmi_haptics.c` (`pmi_haptics=4`), through the PMIC arbiter; iOS's side is redwood's (`/dev/hakios-haptic`) |
+| Haptics | PMI8998 haptics block (slave 3, peripheral `0xc0`), an LRA | Awinic AW86927 on I2C | `hakios.pmi_haptics.c` (`pmi_haptics=4`), through the PMIC arbiter; Darwin's side is redwood's (`/dev/hakios-haptic`) |
 | Cellular | IPA 3.5.1; no IPCC; the modem loaded through the MBA (`qcom,pil-q6v55-mss`) | IPA 4.11; IPCC; TrustZone PAS | the largest piece, last |
 
 ## soc.args
@@ -51,13 +51,13 @@ gives the phone back to Android. Before the first one, back up `persist`, `modem
 
 **1. A loader that builds.** The loader needs a newer LLVM than Ubuntu 22.04's clang 14 (its inline assembly fails with
 "fixup value out of range" there, with or without this port): `sudo apt install clang-15 lld-15` and put
-`/usr/lib/llvm-15/bin` first on `PATH`. The kernel (`make kernel`) and the iOS images (`make fetch images`) as in the main
+`/usr/lib/llvm-15/bin` first on `PATH`. The kernel (`make kernel`) and the Darwin images (`make fetch images`) as in the main
 README; check them in QEMU (`make qemu`) before the phone.
 
 **2. The UEFI alone.**
 
 ```sh
-devices/oneplus-6t/uefi/apply.sh        # Mu-Silicium/ with HakiOS's hooks, redwood's and fajita's platforms
+devices/fajita/uefi/apply.sh        # Mu-Silicium/ with HakiOS's hooks, redwood's and fajita's platforms
 sudo apt install python3.11 python3.11-venv     # build_uefi.py needs 3.11 (tomllib); Ubuntu 22.04's python3 is 3.10
 python3.11 -m venv venv && venv/bin/pip install -r Mu-Silicium/pip-requirements.txt
 cd Mu-Silicium && source ../venv/bin/activate && python3 build_uefi.py -d fajita -r RELEASE && cd ..
@@ -72,7 +72,7 @@ Success: the HakiOS logo on the 6T's screen, then the loader's text. If the scre
 **3. The loader on the phone.**
 
 ```sh
-export DEVICE=oneplus-6t
+export DEVICE=fajita
 ./xl enter                  # Android -> fastboot -> UEFI -> the loader, which answers on USB as "xnuloader"
 ./xl memmap                 # the phone's memory map as UEFI reports it: 0xF0000000 must be free memory
 ```
@@ -109,8 +109,8 @@ intid 19, not the architecture's 27, and without it the kernel gets one tick and
 `lo0`, on any other core sooner). Two loader and image fixes came with it: uploads are received 16 KB at a time
 (this driver sends no reply after a receive of 29696 bytes or more), and `userland/build.sh` sets `umask 022`
 (launchd refuses SpringBoard's plist when its group may write it).
-These and everything after are now in `run.args` -- `cpus=8 bootcpu=7 soc_vtimer=19 cpufreq_osm=2 thermal=1
-buttons=2 battery=1 pmi_haptics=4 synaptics=3 slider=3 adsp=1 sound=4` and the audio's `soc_*` -- so `DEVICE=oneplus-6t ./xl run` is enough (`XL_CMDLINE="-v cpus=1"`,
+These and everything after are now in the configuration (`configs/fajita.config`) -- `cpus=8 bootcpu=7 soc_vtimer=19 cpufreq_osm=2 thermal=1
+buttons=2 battery=1 pmi_haptics=4 synaptics=3 slider=3 adsp=1 sound=4` and the audio's `soc_*` -- so `DEVICE=fajita ./xl run` is enough (`XL_CMDLINE="-v cpus=1"`,
 `synaptics=0` and the like still win over them).
 
 The home screen takes a while, and runs shorter than about 2 minutes end before it: the screen shows the Apple
@@ -144,18 +144,18 @@ file's). The OnePlus 6's USB driver loses a question asked while the loader is b
 one asked after is at once -- so xl asks again after each step. An OTA would overwrite system_a; flash it again.
 What it costs: Android's other slot is not an Android any more (no falling back to it until an update rewrites it).
 
-**iOS's data kept between boots** (1 November 2026, runs 033221 and 033818): the 6T has no partition of the
+**Darwin's data kept between boots** (1 November 2026, runs 033221 and 033818): the 6T has no partition of the
 port's own, so the store is the end of `system_a`, behind the image: from its block 629248 (the next MiB after the
 image's 629082 blocks) to its end, 402 MiB, two slots of 201 MiB written in turn. The loader serves a write there
 only after checking `system_a`'s name, both GUIDs, first and last LBA, unit and block size, and only from that
 block on, reading each write back; the kernel (`hakios.ufs.c`) keeps the same bounds and tells `var_store` the
 place (`kern.hakios.var_part`, `var_first`, `var_end`). `build.sh` refuses a 6T `system.apfs` that would reach
-the store. `ufs=2 ufs_write=1 var_store=1` are in `run.args` (every run loads the volume at boot and saves it
+the store. `ufs=2 ufs_write=1 var_store=1` are in the configuration (`configs/fajita.config`) (every run loads the volume at boot and saves it
 at the end; the kernel's and the loader's command line is 1024 bytes now, Apple's 608 having been too small for
 the 6T's own boot-args):
 the first run saved `/private/var` (138 MB), the next put it back at boot (6411 directories, 2492 files) and
 saved into the other slot (165 MB). Flashing a new image into `system_a` leaves the store as it is. Half of
-that was what iOS remakes or only adds to -- the usage-event streams of Siri's suggestions and Biome, the icon
+that was what Darwin remakes or only adds to -- the usage-event streams of Siri's suggestions and Biome, the icon
 cache, diagnostics, every `Library/Caches` -- and is left out now (`var_store.c`, SKIP and `is_skipped()`): the
 volume is 85 MB, 42 % of a slot (runs 125928 and the next). A save that would not fit fails and the older slot
 is kept.
@@ -244,12 +244,12 @@ Done on 30 October 2026. The motor is a linear resonant actuator on the PMI8998'
 `0xc0`; type `0x15`, subtype `0x9`), `hakios.pmi_haptics.c`, in steps as the other drivers: `pmi_haptics=1` reads it
 (arbiter channel 250, ours to write through; UEFI leaves Android's 2088 mV and 4255 us play rate in it), `=2` configures
 it (800 mA, Android's brake pattern, direct play; each write read back, the registers put back at the run's end), `=3`
-plays one pulse (`pmi_haptics_ms`, 100), and `=4` -- in `run.args` -- plays what iOS plays. iOS's side is redwood's: it
+plays one pulse (`pmi_haptics_ms`, 100), and `=4` -- in the configuration (`configs/fajita.config`) -- plays what Darwin plays. Darwin's side is redwood's: it
 plays its haptics as waveforms on the audio plug-in's "Actuator" (`userland/src/audio_plugin.c`), which writes them to
 `/dev/hakios-haptic`. The driver tells taps from vibrations as `hakios.haptic.c` does: a waveform after a pause is a tap,
 a pulse of `pmi_haptics_tap_ms` (30); one going on past 60 ms holds the motor on while it lasts, 1 s at most, then as long
-a rest. The strength is the block's maximum voltage, from five eighths of Android's 2088 mV for iOS's softest up to
-2088 mV. `/dev/hakios-haptic` is made at start-up -- the plug-in opens it once, at iOS's first haptic -- but nothing is
+a rest. The strength is the block's maximum voltage, from five eighths of Android's 2088 mV for Darwin's softest up to
+2088 mV. `/dev/hakios-haptic` is made at start-up -- the plug-in opens it once, at Darwin's first haptic -- but nothing is
 played before the motor is configured at 25 s. Long-pressing icons and flipping switches in Settings, it was felt.
 
 These are the only writes to a PMIC in this kernel. `hakios_spmi_write()` (`hakios.buttons.c`) refuses every
@@ -377,15 +377,15 @@ the zap shader `a630_zap.b02` at `gpu_region` `0x8c415000`, Linux's `hw_init` fo
 GMEM; its thresholds and UBWC, bank bit 15), `CP_ME_INIT`, secure mode left, a word written on command, and three bands
 filled by the 2D engine on the panel.
 
-**iOS draws with the GPU** (`gpu=1`, run 050504, 31 October): Mesa says "OpenGL ES 3.2 Mesa 25.0.7; FD630", CoreAnimation's
+**Darwin draws with the GPU** (`gpu=1`, run 050504, 31 October): Mesa says "OpenGL ES 3.2 Mesa 25.0.7; FD630", CoreAnimation's
 OpenGL ES renderer draws the lock screen and SpringBoard with it -- colours right, touch and scrolling working --,
 with no GPU fault in thousands of frames; beside the audio DSP and the speaker too (run 051145). `gpu=1 soc_gpu=630`
-are in `run.args`; the root must be built `GL=1 ADSP=1 REST=1 userland/build.sh`. Mesa builds on Linux now
+are in the configuration (`configs/fajita.config`); the root must be built `GL=1 ADSP=1 REST=1 userland/build.sh`. Mesa builds on Linux now
 (`tools/mk-mesa.sh` with meson and ninja on `PATH`, e.g. from pip in a python3.11 venv).
 
 Frame pacing (`RC_JOBS=rc.jobs.fps`, `touch_lat=1`, `tools/frames.py`): at the GMU's first level, 257 MHz, 40 % of the
 gestures' frames came over 16.7 ms -- the zooms of opening and closing an app and Control Center waiting 40-50 ms for
-the GPU; at its top, `adreno_speed=7` (710 MHz, now in `run.args`), 28 % (the zooms 19-37 %; the phone at 49 C). The
+the GPU; at its top, `adreno_speed=7` (710 MHz, now in the configuration (`configs/fajita.config`)), 28 % (the zooms 19-37 %; the phone at 49 C). The
 home screen's page swipes looked the same at both (40-46 frames a second, over half slow), but frame by frame they are
 not slow while they move: the page steps at 16-17.6 ms. What frames.py counts there is (1) the home screen, once the
 page has settled (~700 ms on), going on at a steady 33 ms -- an animation at 30 Hz, not a stutter -- and (2) one gap at
@@ -401,7 +401,7 @@ nothing in particular, and never waiting on another process. The touches reach t
 the kernel posting them (every 8 ms). So in that first gap nobody in the port is holding anything up: it is UIKit
 waiting for the gesture to be recognised (and with rwtouch's synthetic swipes); a real finger may differ.
 
-The panel-locked vsync (`fb_scan=1`, in `run.args` since 1 November, run 031204): the firmware leaves the display
+The panel-locked vsync (`fb_scan=1`, in the configuration (`configs/fajita.config`) since 1 November, run 031204): the firmware leaves the display
 controller sending the framebuffer to the panel at 119.93 Hz, and our 60 Hz timer drifted against it (frames 22 ms
 then 11 ms apart while a page moved). Now the vsync is the start of every second scan, by the DSI interface's frame
 and line counters: in the moving part of the home screen's swipes the steps outside 15-19 ms went from 21 % to 16 %,
@@ -413,7 +413,7 @@ On the 6T `gpu=1` runs steps 10 to 12 too: without them, the first bring-up afte
 Qualcomm crash dump, 3 times of 3), with them never (3 of 3). Step 12 -- TrustZone handed the zap shader's header
 while it still has Android's -- is the likely reason; not proven.
 
-**9b. Page flipping** (1 November 2026; `soc_display=845 fb_flip=1 fb_map_mb=30`, in `run.args`). `fb_probe=1` showed
+**9b. Page flipping** (1 November 2026; `soc_display=845 fb_flip=1 fb_map_mb=30`, in the configuration (`configs/fajita.config`)). `fb_probe=1` showed
 what the firmware leaves: the panel in command mode (control path 0's top register, bit 17), fed by source pipe
 VIG0 (`0xae05000`) from the splash memory (`0x9d400000`, 2340 x 1080, rows of 4320 bytes). Frames are drawn into
 one of three buffers 10 MB apart in that 36 MB region, then VIG0's address (`+0x14`) is written and its bit in
@@ -583,14 +583,14 @@ a second; then the amplifier is muted and powered down and everything put back.
       soc_audio_stream=0x1821 soc_smem=0x86000000 soc_cmd_db=0x85fe0000 soc_rsc=0x179e0000 soc_aoss=0xc300000
       soc_adsp_mem=0x8c500000 soc_adsp_mem_size=0x1a00000 soc_apcs_ipc=0x1799000c soc_adsp_cx=1" ./xl run
 
-**iOS's sound through the speaker** (`sound=4`, run 233909 with `RC_JOBS=rc.jobs.speakers`): the amplifier is set up
-once, switched on when iOS writes something that is not silence (29-59 ms after it, register `0x10` at `0x785e` every
+**Darwin's sound through the speaker** (`sound=4`, run 233909 with `RC_JOBS=rc.jobs.speakers`): the amplifier is set up
+once, switched on when Darwin writes something that is not silence (29-59 ms after it, register `0x10` at `0x785e` every
 time) and off after three seconds of silence, as redwood's two are; a tone, the lock sound, keyboard clicks and a
 fanfare, 8162 periods without an error or an underflow. The amplifier has no volume of ours, so the volume
-(`sound_below`, 30 dB under Android's level by default, and iOS's own setting) is applied to the samples after the
+(`sound_below`, 30 dB under Android's level by default, and Darwin's own setting) is applied to the samples after the
 guard (`gain_of()` in `hakios.sound.c`); the speaker's protection is the amplifier's own DSP's.
 
-Since then `adsp=1 sound=4` and the `soc_*` they need are in `run.args`: every run has sound, given a small image
+Since then `adsp=1 sound=4` and the `soc_*` they need are in the configuration (`configs/fajita.config`): every run has sound, given a small image
 built `ADSP=1 REST=1 userland/build.sh` (the DSP's firmware and the amplifier's set-up are in it; without them the DSP
 says so and the rest of the system starts as before). A plain run (234407) brings the DSP up at 30 s and the sound's
 path after it. The amplifier (TFA9894) comes after: a tone through the port with the DSP answering every command is the first mark.
@@ -611,10 +611,10 @@ Then, with `slim=3` (and `adsp_listen=5`: the DSP's hello once took more than a 
   48 kHz, no underflow); heard (run 170252, 1 November).
 - `mic=3 mic_wcd=1`: the handset microphone (Android's `handset-mic` = AMIC4) -- MIC BIAS1 at 2.7 V, ADC4, decimator
   0, the codec's TX0 on bus channel 128, AFE `SLIMBUS_0_TX` (0x4001), the DSP's stream as redwood's. Levels each
-  second in the log (a quiet room: about -70 dBFS). `mic=4 mic_wcd=1` gives it to iOS (`/dev/hakios-mic`): Voice Memos
+  second in the log (a quiet room: about -70 dBFS). `mic=4 mic_wcd=1` gives it to Darwin (`/dev/hakios-mic`): Voice Memos
   records and plays back (1 November).
 
-- `sound_receiver=1` (with `sound=4`): the earpiece for iOS. The plug-in's "Codec" device has an output and a mute
+- `sound_receiver=1` (with `sound=4`): the earpiece for Darwin. The plug-in's "Codec" device has an output and a mute
   control on its element 3, from which VirtualAudio makes the "Built-In Receiver" port (`Device_Codec_Aspen`:
   `'mute' 'outp' 3`; 4 would be a speaker, 5 hearing aid compliance). The DSP's session goes to QUAT MI2S and
   SLIMBUS_0_RX at once; the plug-in says which device plays (`HAKIOS_AUDIO_SET_ROUTE`) and the kernel switches the
@@ -647,7 +647,7 @@ rmtfs and TFTP serve it, the IPA's GSI firmware is loaded through TrustZone (`mo
 streams (0x720, 0x722) mapped through a context of the apps SMMU, the modem accepts the IPA 3.5.1 memory layout
 (`INIT_DRIVER`), DMS puts it online, and NAS sees LTE (-100 to -118 dBm). Without a SIM it registers nowhere
 (UIM: both slots "card error 3", Android says ABSENT). At the end of step 11 it is asked to stop (SMP2P, acknowledged
-in 126 ms), its buses halted, reset, the MBA's region taken back, its clocks and rail given back, and iOS runs on.
+in 126 ms), its buses halted, reset, the MBA's region taken back, its clocks and rail given back, and Darwin runs on.
 With a SIM (slot 1, run 231839, `modem_data_off=1`): UIM reads the card READY (PIN disabled), and **the modem
 registers on LTE** (-105 dBm, 3 bars) 4 s after DMS puts it online. (NAS's network id reads "0-0": not parsed yet.)
 **Mobile data (1 November).** This side of the IPA 3.5.1 is up (`hakios.ipa.c` in its 3.5.1 form, set up as Linux's
@@ -657,10 +657,10 @@ with an address every time. The modem's own counts (WDS 0x24) show our packets g
 coming back -- echoes (`cell_ping=1`, `=N` for size) and DNS queries to the session's server (`cell_dns=1`) alike --
 and Android on this phone gets no data from the same SIM either (its APN `nxtgenphone`; `data.lycamobile.com` is
 refused), though the SIM works in another phone: an APN or network-side question, left for later. On our side en1 is now in
-the IOKit registry as an Ethernet interface (`HakiosEthernetStart()`, beside the Wi-Fi's), and iOS configures it:
+the IOKit registry as an Ethernet interface (`HakiosEthernetStart()`, beside the Wi-Fi's), and Darwin configures it:
 with `cell_fake=1` (en1 at start with a made-up session, no modem) configd asked DHCP on it, took 10.64.0.2 and the
 router, and routed its traffic out through it (run 2 November, 171 packets, dropped for want of a modem behind). Keep `thermal` and
-`bootcpu` in run.args for modem runs: without them the modem stays offline. A run (the line must fit XNU's 1023
+`bootcpu` in the configuration for modem runs: without them the modem stays offline. A run (the line must fit XNU's 1023
 characters: xl refuses one that does not):
 
 ```sh
@@ -687,7 +687,7 @@ loader: one reused after a run stops answering.
 ## Firmware
 
 ```sh
-devices/oneplus-6t/pull-firmware.sh     # the phone in Android, on adb
+devices/fajita/pull-firmware.sh     # the phone in Android, on adb
 ```
 
 Pulls the GPU (`a630_*`), Wi-Fi (`wlanmdsp.mbn`, board files), the audio DSP and the modem (with `mba.mbn` and its TFTP

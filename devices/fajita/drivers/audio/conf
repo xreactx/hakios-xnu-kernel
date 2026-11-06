@@ -1,0 +1,7 @@
+# devices/fajita/drivers/audio/conf: the OnePlus 6T's loudspeaker amplifier.
+
+driver TFA9894
+	file    bsd/dev/hakios.tfa9894.c
+	requires SOUND
+	help    the NXP TFA9894 on bit-banged I2C, set up by replaying what Android's driver did (tfa9894=N; sound=3 and up
+	help    on the 6T's MI2S port switch it on and off). Needs fw/tfa9894-coldboot.replay in the small image

@@ -3,7 +3,7 @@
 
 usage: tools/tfa-trace2replay.py TRACE CONTAINER OUT [FROM TO]
 
-TRACE is the kernel's I2C trace of a cold boot under Android (devices/oneplus-6t/README.md, step 10:
+TRACE is the kernel's I2C trace of a cold boot under Android (devices/fajita/README.md, step 10:
 events i2c_write and i2c_reply on bus 2, the TFA9894 at 0x34, from /sys/kernel/debug/tracing/trace).
 FROM and TO (seconds of that trace, default the first "00=0002" -- the soft reset -- to the first
 "00=a27c" -- the amplifier on) choose the set-up. What NXP's driver sent is its container's patch and

@@ -704,9 +704,9 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# This stages the files; a separate XNU MPSS driver is still required to start the modem.
 	if [ -n "$MODEM" ]; then
 		[ -f ../fw-modem/modem.mdt ] || { echo "build.sh: MODEM=1 needs ../fw-modem/modem.mdt" >&2; exit 1; }
-		# (checked against the phone's own tree: DEVICE=oneplus-6t has its own, where the modem self-authenticates)
+		# (checked against the phone's own tree: DEVICE=fajita has its own, where the modem self-authenticates)
 		MODEM_DTB=../devices/redwood/prebuilt/device-tree.dtb
-		[ "${DEVICE:-}" = oneplus-6t ] && MODEM_DTB=../devices/oneplus-6t/device-tree.dtb
+		[ "${DEVICE:-}" = fajita ] && MODEM_DTB=../devices/fajita/device-tree.dtb
 		../devices/redwood/tools/modem_firmware.py --dtb $MODEM_DTB --firmware-dir ../fw-modem \
 			--node /soc/qcom,mss@4080000 >/dev/null
 		mkdir -p sysroot/fw
@@ -772,7 +772,7 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$DARWIN/system.manifest | tail -1
 	# the OnePlus 6T keeps Darwin's data volume at the end of system_a, from its block 629248 on (drivers/storage/hakios.ufs.c,
 	# xnuloader/loader.c): an image that would reach that block is not one to flash there
-	if [ "${DEVICE:-}" = oneplus-6t ] && [ "$(stat -c %s system.apfs)" -gt $((629248 * 4096)) ]; then
+	if [ "${DEVICE:-}" = fajita ] && [ "$(stat -c %s system.apfs)" -gt $((629248 * 4096)) ]; then
 		echo "build.sh: system.apfs is $(stat -c %s system.apfs) bytes: it would reach the data volume's store at the end of" \
 		    "system_a (from $((629248 * 4096))); not to be flashed there" >&2
 		mv system.apfs system.apfs.too-big

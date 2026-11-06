@@ -1,7 +1,7 @@
 /*
  * tfa_regs: the 16-bit registers of an I2C chip, read on a rooted Android phone -- the OnePlus 6T's
  * TFA9894 amplifier (bus 2, address 0x34) while Android plays, to set it up the same way from HakiOS
- * (devices/oneplus-6t/README.md, step 10). Toybox's i2cget reads bytes only.
+ * (devices/fajita/README.md, step 10). Toybox's i2cget reads bytes only.
  *
  *   tfa_regs BUS ADDRESS [FIRST [COUNT]]      (numbers in hexadecimal; default all 256 registers)
  *   tfa_regs BUS ADDRESS w REG VALUE          one register written

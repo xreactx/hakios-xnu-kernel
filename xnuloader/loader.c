@@ -1738,7 +1738,7 @@ ufs_survey(void)
  * The OnePlus 6T has no partition of the port's own: its store is the end of system_a, the system slot
  * Android does not boot from, which already holds the system image (2576719872 bytes: its blocks 0..629081,
  * flashed from the computer with fastboot). Writes go from block 629248 (the next MiB) to its end: 102912
- * blocks, 402 MiB, two slots of iOS's data volume (userland/src/var_store.c). Its identity as the 6T's GPT
+ * blocks, 402 MiB, two slots of Darwin's data volume (userland/src/var_store.c). Its identity as the 6T's GPT
  * had it on 1 November 2026.
  */
 #define BLOCK_SYSTEM_A_FIRST 85824ULL

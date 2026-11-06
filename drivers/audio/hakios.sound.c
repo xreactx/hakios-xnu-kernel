@@ -65,9 +65,9 @@
  * Another phone's speaker port is given by boot-args over these (soc_sound_port, soc_sound_clock,
  * soc_sound_bits, soc_audio_stream): the OnePlus 6T's is its quaternary MI2S, QUAT_MI2S_RX 0x1006, no
  * group, the AFE's I2S parameter instead (SD1, stereo, 24 bits, our clocks), clock 0x106 at 3.072 MHz,
- * GPIO 58 to 61, stream 0x1821 (devices/oneplus-6t/README.md, step 10). Its amplifier is not redwood's:
+ * GPIO 58 to 61, stream 0x1821 (devices/fajita/README.md, step 10). Its amplifier is not redwood's:
  * there sound=3 sets up and switches on its TFA9894 (hakios.tfa9894.c) for the tone, and sound=4 plays
- * what iOS plays through it, switched on and off as redwood's are; its volume is applied to the samples
+ * what Darwin plays through it, switched on and off as redwood's are; its volume is applied to the samples
  * (gain_of()), the amplifier having none of ours.
  *
  * What is started is stopped, and what is written is put back, when the time is over -- or, if
@@ -425,9 +425,9 @@ static bool mi2s;
 static bool earpiece;
 
 /*
- * The earpiece for iOS (boot-arg sound_receiver=1, with sound=4 on the 6T's MI2S port): the stream goes to both
- * ports at once -- a second device path to SLIMBUS_0_RX, the matrix routing the session to both -- and where iOS
- * plays (HAKIOS_AUDIO_SET_ROUTE: the plug-in's "Speaker" or "Codec", iOS's speaker or receiver port) decides
+ * The earpiece for Darwin (boot-arg sound_receiver=1, with sound=4 on the 6T's MI2S port): the stream goes to both
+ * ports at once -- a second device path to SLIMBUS_0_RX, the matrix routing the session to both -- and where Darwin
+ * plays (HAKIOS_AUDIO_SET_ROUTE: the plug-in's "Speaker" or "Codec", Darwin's speaker or receiver port) decides
  * only which is switched on: the TFA9894, or the codec's EAR path and the bus's channel to it (hakios.slim.c).
  */
 static bool receiver, receiver_port_on, receiver_copp_open, amp_receiver;
@@ -1345,7 +1345,7 @@ guard_say(const char *when, bool quiet)
 
 /*
  * The OnePlus 6T's amplifier has no volume of ours: set up as Android's driver set it up, it plays at
- * Android's level. There the volume (sound_below, and iOS's setting under the loudest) is applied to
+ * Android's level. There the volume (sound_below, and Darwin's setting under the loudest) is applied to
  * the samples instead, after the guard -- whose reckoning of what reaches the speaker is the same
  * either way -- in whole decibels: 1.0 to 0.1 per 20 dB in 16.16 fixed point (no floating point here).
  */
@@ -1372,7 +1372,7 @@ gain_of(uint32_t below_eighths)
 static bool
 amp_start(void)
 {
-	/* (where iOS plays decides, as it is when they start) */
+	/* (where Darwin plays decides, as it is when they start) */
 	amp_receiver = receiver && hakios_audio_route() == HAKIOS_AUDIO_ROUTE_RECEIVER;
 	if (amp_receiver) {
 		say("sound: to the earpiece\n");
@@ -1380,7 +1380,7 @@ amp_start(void)
 			return true;
 		}
 		/* (the codec is not brought up, or did not take it: the speaker, for the rest of the run) */
-		say("sound: THE EARPIECE DID NOT START: what iOS plays there goes to the speaker from here on\n");
+		say("sound: THE EARPIECE DID NOT START: what Darwin plays there goes to the speaker from here on\n");
 		hakios_slim_earpiece(false);
 		amp_receiver = receiver = false;
 	}
@@ -1391,7 +1391,7 @@ static bool
 amp_volume(uint32_t below_eighths, uint32_t step_ms)
 {
 	if (amp_receiver) {
-		/* the earpiece: iOS's own volume, without the speaker's margin under Android's level (sound_below) */
+		/* the earpiece: Darwin's own volume, without the speaker's margin under Android's level (sound_below) */
 		digital_gain = gain_of(below_eighths > below ? below_eighths - below : 0);
 		return true;
 	}
@@ -1591,9 +1591,9 @@ watch(void)
 			}
 		}
 		if (on && receiver && (hakios_audio_route() == HAKIOS_AUDIO_ROUTE_RECEIVER) != amp_receiver) {
-			/* iOS plays elsewhere: what is on is stopped, and started again where it plays */
-			say_when(amp_receiver ? "iOS plays through the speaker now: the earpiece is stopped" :
-			    "iOS plays through the earpiece now: the speaker's amplifier is stopped");
+			/* Darwin plays elsewhere: what is on is stopped, and started again where it plays */
+			say_when(amp_receiver ? "Darwin plays through the speaker now: the earpiece is stopped" :
+			    "Darwin plays through the earpiece now: the speaker's amplifier is stopped");
 			guard_off(true);
 			amp_stop();
 			on = false;
@@ -1868,7 +1868,7 @@ hakios_sound_dsp_up(void)
 			earpiece = true;
 			port = SLIMBUS_0_RX;
 			port_bits = 16;
-			level = ear > 3 ? 3 : ear;      /* (what iOS plays, there, is for later) */
+			level = ear > 3 ? 3 : ear;      /* (what Darwin plays, there, is for later) */
 			say("sound: sound_earpiece=%u: the earpiece, through SLIMBUS_0_RX and the WCD934x, at level %u\n", ear, level);
 		}
 	}
@@ -1878,7 +1878,7 @@ hakios_sound_dsp_up(void)
 
 		receiver = mi2s && level == 4 && PE_parse_boot_argn("sound_receiver", &wanted, sizeof(wanted)) && wanted != 0;
 		if (receiver) {
-			say("sound: sound_receiver=1: the stream goes to the earpiece's port as well; where iOS plays decides which is on\n");
+			say("sound: sound_receiver=1: the stream goes to the earpiece's port as well; where Darwin plays decides which is on\n");
 		}
 	}
 	if (mi2s) {
