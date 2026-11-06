@@ -1,5 +1,5 @@
 /*
- * net_test: bring the network interface up the way iOS itself would, and see whether iOS can
+ * net_test: bring the network interface up the way Darwin itself would, and see whether Darwin can
  * use it. Each step is one layer of what a stock application needs:
  *
  * usage: net_test STEP...
@@ -31,13 +31,13 @@
  *                         (21: a wrong passphrase) and how long it took. The network's name is
  *                         the kernel's (its SSID request) and is not printed.
  *
- * The interface QEMU's network gives (en0, bsd/dev/hakios.net.c) has no IOKit object behind it,
+ * The interface QEMU's network gives (en0, drivers/net/hakios.net.c) has no IOKit object behind it,
  * and configd makes its network services out of those. (The phone's radio has one now:
- * iokit/Kernel/hakios.wlan.cpp, and configd makes a "Wi-Fi" service of it by itself.) But the
+ * drivers/wifi/hakios.wlan.cpp, and configd makes a "Wi-Fi" service of it by itself.) But the
  * plugin that does the configuring keeps its own list
  * of interfaces, straight from the kernel, and has a Mach interface of its own, the one the
  * "ipconfig" command of macOS uses ("ipconfig set en0 DHCP"; the command itself is not part of
- * iOS). "dhcp" is one of its calls: the plugin makes a service for the interface that exists in
+ * Darwin). "dhcp" is one of its calls: the plugin makes a service for the interface that exists in
  * no preferences file, runs DHCP, and publishes what it learns; the rest of configd then treats
  * it like any other service.
  * (Not "ipconfig set", the first call one thinks of: the service that one makes is gone at
@@ -63,7 +63,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-/* not in the iOS SDK's headers, in the libraries all the same */
+/* not in the Darwin SDK's headers, in the libraries all the same */
 extern mach_port_t bootstrap_port;
 extern kern_return_t bootstrap_look_up(mach_port_t bootstrap, const char *name, mach_port_t *service);
 typedef const struct __SCDynamicStore *SCDynamicStoreRef;
@@ -372,7 +372,7 @@ reach(const char *name)
 
 /*
  * With wifi=1 among the kernel's arguments: wait for en0, and for configd's own network service for
- * it ("Wi-Fi", made of the radio's IOKit objects, iokit/Kernel/hakios.wlan.cpp). That service runs
+ * it ("Wi-Fi", made of the radio's IOKit objects, drivers/wifi/hakios.wlan.cpp). That service runs
  * DHCP by itself, and it has to be the one that does: wifid takes the interface for usable only
  * when the address appears under a service whose settings name en0, and the service "dhcp en0"
  * makes has none (Settings then shows a spinner where the tick belongs). Only a kernel without
@@ -501,7 +501,7 @@ wrongjoin(void)
 		return;
 	}
 	length = request.length;
-	/* the layout of iOS 16.5 (bsd/dev/hakios.apple80211.c of the kernel): version, mode, authentication lower and
+	/* the layout of Darwin userland 16.5 (drivers/wifi/hakios.apple80211.c of the kernel): version, mode, authentication lower and
 	 * upper, the name's length and the name, the access point (none: any), the key's version, length and kind (10:
 	 * a passphrase as typed), the key */
 	memset(assoc, 0, sizeof(assoc));

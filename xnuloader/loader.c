@@ -10,7 +10,7 @@
  *   - exits boot services, turns the MMU off and jumps to the kernel entry
  */
 #include "efi.h"
-#include "identity.h"         /* who iOS shall think we are: from the iPhone's own device tree (mkidentity.py) */
+#include "identity.h"         /* who Darwin shall think we are: from the iPhone's own device tree (mkidentity.py) */
 
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
@@ -168,6 +168,13 @@ str_eq(const char *a, const char *b)
  * the screen is left to the kernel (and to "oem screenshot").
  */
 static int screen_quiet;
+/*
+ * And while the kernel runs, whatever started the loader: under HakiOS's U-Boot (the menu of an installed HakiOS) there
+ * is no USB command loop, the text console is U-Boot's, drawn into the framebuffer the kernel shows Darwin in, and every
+ * line core 0 printed during a run (the storage's, the battery's, the watchdog's) ran over the system's screen.
+ * What it was before the run, to go back to.
+ */
+static int screen_quiet_before_run;
 
 static void
 put_char(char c)
@@ -283,9 +290,12 @@ find_log_partition(void)
 			}
 		}
 		if (match && !EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
+			/* (the handle array is pool memory the caller owns; this runs on every log write) */
+			BS->free_pool(handles);
 			return bio;
 		}
 	}
+	BS->free_pool(handles);
 	return NULL;
 }
 
@@ -323,10 +333,17 @@ find_partition(const char *name)
  * last run. It is what gets written to the log partition and what the host
  * fetches over USB (fastboot get_staged).
  */
-static char out_buf[2 * 1024 * 1024];
-/* the storage's reads for the kernel land here (block_poll); also where the log is read back */
+/* aligned for any firmware's block I/O: U-Boot's wants a buffer aligned to the block size (media->io_align) */
+static char out_buf[2 * 1024 * 1024] __attribute__((aligned(0x2000)));
+/* the storage's reads for the kernel land here (block_poll), and nothing else may be put in it */
 #define BLOCK_BUFFER_SIZE  (4u << 20)
 static uint8_t block_buffer[BLOCK_BUFFER_SIZE] __attribute__((aligned(0x2000)));
+/*
+ * Where the log is read back to compare it (write_logs). Not block_buffer: that is the kernel's
+ * mailbox buffer, and a read-back landing in it while the kernel runs on the other core would
+ * overwrite data the kernel is still copying out of it.
+ */
+static uint8_t log_verify[sizeof(out_buf) + 8192] __attribute__((aligned(0x2000)));
 static const char *staged_data = out_buf;   /* what "upload" sends: normally the log in out_buf */
 static uint64_t staged_len;
 /*
@@ -432,9 +449,10 @@ write_logs(const char *klog, uint64_t klog_len)
 		 * driver must leave possible (the controller is shared with this one). The line goes into
 		 * the copy the host fetches over USB, not into the partition, which already has the rest.
 		 */
-		if (len <= sizeof(block_buffer)) {
-			rs = bio->read_blocks(bio, bio->media->media_id, 0, len, block_buffer);
-			same = !EFI_ERROR(rs) && memcmp(block_buffer, out_buf, len) == 0;
+		if (len <= sizeof(log_verify)) {
+			rs = bio->read_blocks(bio, bio->media->media_id, 0, len, log_verify);
+			flush_dcache((uint64_t)(uintptr_t)log_verify, (uint64_t)(uintptr_t)log_verify + len);
+			same = !EFI_ERROR(rs) && memcmp(log_verify, out_buf, len) == 0;
 		}
 	}
 	print("log: %d bytes written to logdump (%x), read back %s (%x)\n", len, ws,
@@ -503,6 +521,9 @@ flush_log(void)
 
 struct dt_writer {
 	uint8_t *base, *cur;
+	uint8_t *end;         /* the first byte after the room reserved for the tree */
+	int overflow;         /* something did not fit: nothing more is written, run_kernel refuses the tree */
+	uint32_t scratch[2];  /* the counts of a node that was not written (after an overflow) */
 	uint32_t *counts[16]; /* [depth] -> {nProperties, nChildren} of the open node */
 	int depth;
 };
@@ -510,12 +531,22 @@ struct dt_writer {
 static void
 dt_prop(struct dt_writer *w, const char *name, const void *data, uint32_t len)
 {
+	uint64_t padded = ((uint64_t)len + 3) & ~3ULL;
+
+	/*
+	 * Not past the room reserved for the tree (boot_args follows it), and not a name longer than the
+	 * 32-byte field: either would overwrite what is next to it with no message.
+	 */
+	if (w->overflow || str_len(name) > 32 ||(uint64_t)(w->end - w->cur) < 36 + padded) {
+		w->overflow = 1;
+		return;
+	}
 	memset(w->cur, 0, 32);
 	memcpy(w->cur, name, str_len(name));
 	*(uint32_t *)(w->cur + 32) = len;
-	memset(w->cur + 36, 0, (len + 3) & ~3u);
+	memset(w->cur + 36, 0, (size_t)padded);
 	memcpy(w->cur + 36, data, len);
-	w->cur += 36 + ((len + 3) & ~3u);
+	w->cur += 36 + padded;
 	w->counts[w->depth - 1][0]++;
 }
 
@@ -573,7 +604,7 @@ dt_prop_padded(struct dt_writer *w, const char *name, const char *value, uint32_
 
 /*
  * Properties copied from the iPhone's device tree (identity.h), but one: the iPhone X's display is a
- * wide-gamut one ("artwork-display-gamut" P3), and with it iOS takes the screen for one that shows
+ * wide-gamut one ("artwork-display-gamut" P3), and with it Darwin takes the screen for one that shows
  * extended colour (MobileGestalt's HasExtendedColorDisplay): WebKit then draws a page's tiles into
  * surfaces of ten bits a colour ('w30r', 'b3a8'), which neither the kernel's surfaces nor the window
  * server's renderer here do (eight bits, BGRA), and every page comes out black. Here the screen is
@@ -609,6 +640,12 @@ dt_begin(struct dt_writer *w, const char *name)
 {
 	if (w->depth > 0) {
 		w->counts[w->depth - 1][1]++;
+	}
+	if (w->overflow || (uint64_t)(w->end - w->cur) < 8) {
+		/* no room: the node is not written, the depth is kept so that dt_end still pairs with it */
+		w->overflow = 1;
+		w->counts[w->depth++] = w->scratch;
+		return;
 	}
 	w->counts[w->depth++] = (uint32_t *)w->cur;
 	memset(w->cur, 0, 8);
@@ -1107,6 +1144,11 @@ static int wdt_armed;
  * for the commands that the host sends meanwhile (usb_poll_command).
  */
 static const struct kernel_live *running_live;
+/*
+ * Set for the whole of run_on_other_cpu(), whether the kernel has a live block or not.
+ * running_live is NULL for a kernel without one, so it cannot say that a kernel is running.
+ */
+static int run_active;
 static uint64_t running_slide;
 static void usb_poll_command(void);
 
@@ -1597,6 +1639,8 @@ ufs_survey(void)
 			    bio->media->read_only ? "read only" : "writable", (uint64_t)bio->media->io_align);
 			ufs_check_gpt(bio, units - 1);
 		}
+		/* (the handle array is pool memory this function owns) */
+		BS->free_pool(handles);
 	}
 	/* the GPT partitions, with the hash of those there are images of */
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
@@ -1628,6 +1672,7 @@ ufs_survey(void)
 			ufs_dump_userdata(bio);
 		}
 	}
+	BS->free_pool(handles);
 	print("ufs: %d raw units, %d partitions\n", units, partitions);
 }
 
@@ -1641,13 +1686,13 @@ ufs_survey(void)
  * resident, and this loader already serves the kernel from core 0 while the kernel runs on another
  * (the battery). So the kernel asks for blocks through a page both can see, and core 0 reads them
  * with that driver's ReadBlocks into a buffer both can see. The kernel's side is
- * bsd/dev/hakios.ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
+ * drivers/storage/hakios.ufs.c; it gets the page's address as ufs_shared_pa= on its command line.
  *
  * Reads, and -- with ufs_write=1 on the command line -- writes into one partition and nowhere
  * else: the port's own darwin, proved by its GPT entry (name, both GUIDs, first and last LBA, its
  * logical unit), and in it only past everything the build writes from the computer, so that no
- * answer to the kernel can reach Android's partitions, the iOS volume or the cryptexes. The
- * refusals are here, in the kernel (bsd/dev/hakios.ufs.c) and in UEFI's own driver, which gives
+ * answer to the kernel can reach Android's partitions, the Darwin volume or the cryptexes. The
+ * refusals are here, in the kernel (drivers/storage/hakios.ufs.c) and in UEFI's own driver, which gives
  * out a partition's BlockIo and bounds it: a request has to pass all three.
  *
  * Each side writes its own cache lines only: the kernel the request, core 0 the answer (and the
@@ -1664,20 +1709,30 @@ ufs_survey(void)
 #define BLOCK_PART_UNIT    1u                          /* the entry is a whole logical unit, not a partition */
 #define BLOCK_OP_READ      0u
 #define BLOCK_OP_WRITE     1u
+/*
+ * The data volume's writes (HFS Plus on /dev/ufs_darwin_data): written and nothing more -- no flush, no read back --
+ * because its journal asks for the flush itself (BLOCK_OP_FLUSH) where the order matters, and a flush and a read
+ * back after every 4 KB of metadata made Darwin crawl. Offered with BLOCK_CAN_FAST in write_caps; the same bounds as
+ * BLOCK_OP_WRITE. /dev/rufs_darwin's writes stay BLOCK_OP_WRITE, flushed and read back.
+ */
+#define BLOCK_OP_WRITE_FAST 2u
+#define BLOCK_OP_FLUSH     3u                          /* the write partition's cache to the flash; one block in bounds */
+#define BLOCK_CAN_FAST     1u
 
 /*
  * The one partition a write may reach, and from which of its blocks. darwin is the port's own
  * 20 GiB at the end of logical unit 0 (README, "The port's partition"); what the build puts there
- * from the computer (tools/darwin-write.py) is the iOS volume at its start and the two cryptexes
- * behind it, and nothing of this port reads or writes the rest -- so the data of iOS lives there
- * and a write is refused before that block. The identity is the whole of darwin-write.py's: the
- * same partition, named the same, of the same size, in the same place, on logical unit 0.
+ * from the computer (tools/darwin-write.py) is the Darwin volume at its start and the two cryptexes
+ * behind it, and nothing of this port reads or writes the rest -- so the data of Darwin lives there
+ * and a write is refused before that block. The identity: the partition named darwin, of the APFS
+ * container type, on logical unit 0, in blocks of 4096 and at least the 20 GiB the port lays out. Not
+ * its place, its exact size or its unique GUID: tools/userdata-carve.py makes darwin at the end of
+ * whatever userdata the phone has, with a GUID of its own (BLOCK_DARWIN_FIRST/LAST and _UNIQ were
+ * the first phone's, and no write was ever served on another); they are printed instead.
  */
 #define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
-#define BLOCK_DARWIN_FIRST 25374720ULL                 /* its first and last LBA of unit 0, as the GPT has them */
-#define BLOCK_DARWIN_LAST  30617594ULL
+#define BLOCK_DARWIN_MIN   5242875ULL                  /* blocks of 4096: the first phone's darwin, the layout's */
 #define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
-#define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
 
 /*
  * The OnePlus 6T has no partition of the port's own: its store is the end of system_a, the system slot
@@ -1698,7 +1753,7 @@ static const struct block_target {
 	efi_guid type, uniq;
 	uint64_t first, last, write_first;
 } block_targets[] = {
-	{ "darwin", BLOCK_DARWIN_TYPE, BLOCK_DARWIN_UNIQ, BLOCK_DARWIN_FIRST, BLOCK_DARWIN_LAST, BLOCK_WRITE_FIRST },
+	{ "darwin", BLOCK_DARWIN_TYPE, { 0 }, 0, 0, BLOCK_WRITE_FIRST },      /* (first 0: the phone's own, at least BLOCK_DARWIN_MIN) */
 	{ "system_a", BLOCK_SYSTEM_A_TYPE, BLOCK_SYSTEM_A_UNIQ, BLOCK_SYSTEM_A_FIRST, BLOCK_SYSTEM_A_LAST, BLOCK_SYSTEM_A_WRITE_FIRST },
 };
 
@@ -1734,7 +1789,7 @@ struct loader_block {
 	 * which is a read, and a loader that does not know them leaves these zero, which is no write.
 	 */
 	uint32_t write_part_plus_one;
-	uint32_t write_reserved;
+	uint32_t write_caps;                   /* BLOCK_CAN_FAST; zero from a loader before it, which a kernel reads as none */
 	uint64_t write_first;
 	/* written by the kernel: what it wants, then request is advanced */
 	struct {
@@ -2042,6 +2097,7 @@ static int
 block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
 {
 	const struct block_target *t = NULL;
+	const uint8_t *u = (const uint8_t *)&info->unique_guid;
 	const char *why = NULL;
 
 	for (unsigned k = 0; k < sizeof(block_targets) / sizeof(block_targets[0]) && t == NULL; k++) {
@@ -2058,16 +2114,19 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 	}
 	if (memcmp(&info->type_guid, &t->type, sizeof(t->type)) != 0) {
 		why = "its type GUID is not the one it had";
-	} else if (memcmp(&info->unique_guid, &t->uniq, sizeof(t->uniq)) != 0) {
+	} else if (t->first != 0 && memcmp(&info->unique_guid, &t->uniq, sizeof(t->uniq)) != 0) {
 		why = "its unique GUID is not the one it had";
-	} else if (info->start_lba != t->first || info->end_lba != t->last) {
+	} else if (t->first != 0 && (info->start_lba != t->first || info->end_lba != t->last)) {
 		why = "it does not begin and end where it did";
 	} else if (bp->unit != 0) {
 		/* the first unit UEFI lists: this firmware's device paths say no logical unit number
 		 * (device_path_print finds no 3.19 node), so bp->lun is 0xff for every unit */
 		why = "it is not on the first logical unit";
-	} else if (bp->block_size != 4096 || bp->blocks != t->last - t->first + 1) {
+	} else if (t->first != 0 && (bp->block_size != 4096 || bp->blocks != t->last - t->first + 1)) {
 		why = "its blocks are not what they were";
+	} else if (t->first == 0 && (bp->block_size != 4096 || bp->blocks < BLOCK_DARWIN_MIN ||
+	    info->end_lba - info->start_lba + 1 != bp->blocks)) {
+		why = "it is not 20 GiB in blocks of 4096";
 	} else if (bio->media->read_only) {
 		why = "UEFI gives it out read only";
 	}
@@ -2075,8 +2134,9 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 		print("ufs: %s: no write will be served: %s\n", t->name, why);
 		return 0;
 	}
-	print("ufs: %s (LBA %d..%d of unit 0): its blocks from %d on may be written this run\n", t->name,
-	    info->start_lba, info->end_lba, t->write_first);
+	print("ufs: %s (LBA %d..%d of unit 0, unique GUID %x...%x): its blocks from %d on may be written this run\n",
+	    t->name, info->start_lba, info->end_lba, (uint64_t)u[3] << 24 | (uint64_t)u[2] << 16 | (uint64_t)u[1] << 8 | u[0],
+	    (uint64_t)u[12] << 24 | (uint64_t)u[13] << 16 | (uint64_t)u[14] << 8 | u[15], t->write_first);
 	block_write_first = t->write_first;
 	return 1;
 }
@@ -2117,6 +2177,8 @@ block_start(void)
 			units[nunits].lun = device_path_print(nunits, dp);
 			nunits++;
 		}
+		/* (the handle array is pool memory this function owns; units[] holds the protocols, not the array) */
+		BS->free_pool(handles);
 	}
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
 		print("ufs: no partition information: the block service is off\n");
@@ -2160,6 +2222,7 @@ block_start(void)
 			block_io2_probe(handles[i], bio);
 		}
 	}
+	BS->free_pool(handles);
 	for (uint64_t u = 0; u < nunits; u++) {
 		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
 		char *n = bp->name;
@@ -2201,6 +2264,7 @@ block_start(void)
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
 		block_shared.write_first = block_write_first;
+		block_shared.write_caps = BLOCK_CAN_FAST;
 	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
@@ -2326,15 +2390,26 @@ block_poll(void)
 			}
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
-		} else if (op == BLOCK_OP_WRITE) {
+		} else if (op == BLOCK_OP_WRITE || op == BLOCK_OP_WRITE_FAST || op == BLOCK_OP_FLUSH) {
 			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < block_write_first) {
-				/* not the store's partition, or not past what the build writes from the computer: never */
+				/* not the store's partition (darwin, system_a), or not past what the build writes from the computer: never */
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
 					    block_shared.part[part].name);
 				}
 				s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 				bytes = 0;
+			} else if (op == BLOCK_OP_FLUSH) {
+				s = bio->flush_blocks(bio);
+				bytes = 0;
+			} else if (op == BLOCK_OP_WRITE_FAST) {
+				flush_dcache((uint64_t)(uintptr_t)block_buffer,
+				    (uint64_t)(uintptr_t)block_buffer + bytes);
+				s = bio->write_blocks(bio, bio->media->media_id, lba, bytes, block_buffer);
+				if (!EFI_ERROR(s)) {
+					block_writes++;
+					block_write_bytes += bytes;
+				}
 			} else {
 				/*
 				 * The kernel filled the buffer and cleaned its lines of it; drop whatever this
@@ -2588,6 +2663,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	int arrived = 0, watching_only = 0;
 
 	running_live = live;
+	run_active = 1;
 	running_slide = slide;
 	other_cpu_start.entry = entry;
 	other_cpu_start.boot_args = boot_args_pa;
@@ -2698,6 +2774,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		}
 	}
 	running_live = NULL;
+	run_active = 0;
 
 	if (watching_only) {
 		__asm__ volatile ("msr S3_0_C12_C12_7, %0\nisb" : : "r" (group1));
@@ -2820,12 +2897,16 @@ install_exception_hook(void)
 
 struct payload_info {
 	const uint8_t *kernel;
+	uint32_t kernel_size;           /* the kernel entry's size: what its Mach-O header may point into */
 	const uint8_t *ramdisk;
 	uint32_t ramdisk_size;
 	const char *cmdline;
 	uint64_t checkpoint;
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
+	const uint8_t *resident;        /* ... or one the payload carries, which the loader puts there itself */
+	uint32_t resident_size;
+	const char *kernel_version;     /* kernel.ver: the version of the kernel in this payload (tools/kernel-version.py) */
 	int usb_mode;
 };
 
@@ -2843,6 +2924,15 @@ parse_number(const char *c, unsigned base)
 	return v;
 }
 
+/* How many bytes after the header the walk over a payload's entries may cover: the header's size, but never more than fits */
+static uint64_t
+payload_walk_size(uint32_t header_size)
+{
+	uint64_t most = PAYLOAD_MAX_SIZE - 0x100000ULL - sizeof(struct payload_header);
+
+	return header_size < most ? header_size : most;
+}
+
 static int
 parse_payload(struct payload_info *pi, int verbose)
 {
@@ -2854,7 +2944,11 @@ parse_payload(struct payload_info *pi, int verbose)
 		print("no payload at %x (magic %x)\n", PAYLOAD_BASE, (uint64_t)ph->magic);
 		return 0;
 	}
-	const uint8_t *p = (const uint8_t *)(ph + 1), *pend = p + ph->size;
+	/*
+	 * The size in the header is not trusted past what the payload region can hold (the file's size is not
+	 * known here), so a wild value cannot send the walk through memory that is not the payload.
+	 */
+	const uint8_t *p = (const uint8_t *)(ph + 1), *pend = p + payload_walk_size(ph->size);
 	while (p + sizeof(struct payload_entry) <= pend) {
 		const struct payload_entry *e = (const struct payload_entry *)p;
 		const char *text = (const char *)(p + sizeof(*e));
@@ -2864,17 +2958,31 @@ parse_payload(struct payload_info *pi, int verbose)
 		if (verbose) {
 			print("payload entry '%s' size %x\n", e->name, (uint64_t)e->size);
 		}
+		/*
+		 * An entry that claims more bytes than are left is a torn or made-up payload: the ramdisk copy would read
+		 * past it, and the 32-bit rounding below would wrap. Not booted, as with a payload of the wrong magic.
+		 */
+		if ((uint64_t)e->size > (uint64_t)(pend - (p + sizeof(*e)))) {
+			print("payload entry is larger than the payload (size %x): not used\n", (uint64_t)e->size);
+			return 0;
+		}
 		if (str_eq(e->name, "ramdisk")) {
 			pi->ramdisk = p + sizeof(*e);             /* becomes /dev/md0, the root device */
 			pi->ramdisk_size = e->size;
 		} else if (str_eq(e->name, "kernel")) {
 			pi->kernel = p + sizeof(*e);
+			pi->kernel_size = e->size;
 		} else if (str_eq(e->name, "cmdline")) {
 			pi->cmdline = text;
 		} else if (str_eq(e->name, "physbase")) {
 			pi->forced_base = parse_number(text, 16); /* testing aid; must be free RAM */
+		} else if (str_eq(e->name, "resident")) {
+			pi->resident = p + sizeof(*e);            /* the image xl ramdisk would send: a boot with no host */
+			pi->resident_size = e->size;
 		} else if (str_eq(e->name, "rdres")) {
 			pi->resident_rd = parse_number(text, 16); /* e.g. loaded there by QEMU; see RESIDENT_RD_OFFSET */
+		} else if (str_eq(e->name, "kernel.ver")) {
+			pi->kernel_version = text;                /* printed under the banner; the kernel gets it as hakios_kver */
 		} else if (str_eq(e->name, "checkpoint")) {
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
 		} else if (str_eq(e->name, "usb")) {
@@ -3094,8 +3202,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	const uint8_t *kernel = pi.kernel;
 	const struct mach_header_64 *mh = (const struct mach_header_64 *)kernel;
-	if (mh->magic != MH_MAGIC_64) {
+	if (pi.kernel_size < sizeof(*mh) || mh->magic != MH_MAGIC_64) {
 		print("kernel is not a 64-bit Mach-O\n");
+		return 0;
+	}
+	/* the load commands must lie inside the kernel entry, or the walk below reads whatever follows it */
+	if (mh->sizeofcmds > pi.kernel_size - sizeof(*mh)) {
+		print("kernel: the load commands are longer than the kernel\n");
 		return 0;
 	}
 
@@ -3103,10 +3216,35 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t vm_lo = ~0ULL, vm_hi = 0, entry_va = 0;
 	const struct load_command *lc = (const struct load_command *)(mh + 1);
 	for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const void *)((const uint8_t *)lc + lc->cmdsize)) {
+		/*
+		 * Every command must fit in the commands the header counts, and be at least its own header long: a
+		 * cmdsize of 0 would keep the walk on one command for up to 2^32 rounds, a huge one would leave the kernel.
+		 */
+		uint64_t at = (uint64_t)((const uint8_t *)lc - (const uint8_t *)(mh + 1));
+
+		if (at > mh->sizeofcmds || sizeof(*lc) > mh->sizeofcmds - at || lc->cmdsize < sizeof(*lc) ||
+		    lc->cmdsize > mh->sizeofcmds - at) {
+			print("kernel: load command %d does not fit in the load commands\n", (uint64_t)i);
+			return 0;
+		}
 		if (lc->cmd == LC_SEGMENT_64) {
 			const struct segment_command_64 *sg = (const void *)lc;
+			if (lc->cmdsize < sizeof(*sg)) {
+				print("kernel: segment command %d is too short\n", (uint64_t)i);
+				return 0;
+			}
 			if (sg->vmsize == 0) {
 				continue;
+			}
+			/*
+			 * What is loaded must be inside the kernel (file) and inside its own extent: a vmaddr + vmsize that
+			 * wraps, a filesize above vmsize, or a file range past the entry would write over, or read from, memory
+			 * that is not the kernel's.
+			 */
+			if (sg->vmaddr + sg->vmsize < sg->vmaddr || sg->filesize > sg->vmsize || sg->fileoff > pi.kernel_size ||
+			    sg->filesize > pi.kernel_size - sg->fileoff) {
+				print("kernel: segment %d is outside the kernel or wraps\n", (uint64_t)i);
+				return 0;
 			}
 			if (sg->vmaddr < vm_lo) {
 				vm_lo = sg->vmaddr;
@@ -3114,13 +3252,15 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			if (sg->vmaddr + sg->vmsize > vm_hi) {
 				vm_hi = sg->vmaddr + sg->vmsize;
 			}
-		} else if (lc->cmd == LC_UNIXTHREAD) {
-			/* cmd, cmdsize, flavor, count, x0..x28, fp, lr, sp, pc */
+		} else if (lc->cmd == LC_UNIXTHREAD && lc->cmdsize >= 16 + 33 * 8) {
+			/* cmd, cmdsize, flavor, count, x0..x28, fp, lr, sp, pc (a command too short to hold pc gives no entry) */
 			entry_va = ((const uint64_t *)((const uint8_t *)lc + 16))[32];
 		}
 	}
 	print("kernel va %x..%x entry %x\n", vm_lo, vm_hi, entry_va);
-	if (vm_lo < KERNEL_VIRT_BASE + KERNEL_LINK_OFFSET || entry_va == 0) {
+	/* (a kernel that reaches more than the largest window past the virtual base is no kernel of this loader's) */
+	if (vm_lo < KERNEL_VIRT_BASE + KERNEL_LINK_OFFSET || entry_va == 0 || vm_hi < vm_lo ||
+	    vm_hi - KERNEL_VIRT_BASE > MAX_MEM_SIZE) {
 		print("unexpected kernel layout\n");
 		return 0;
 	}
@@ -3139,7 +3279,30 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t rd1_pa = 0, rd1_size = 0;
 
 	if (pi.resident_rd != 0) {
+		/*
+		 * The size is the payload's word: one that does not even fit above the resident address would wrap
+		 * the page rounding or the device tree address below, and the room check after them would pass.
+		 * (Whatever fits is still held to the room check as before.)
+		 */
+		if (win_size <= RESIDENT_RD_OFFSET || pi.resident_rd > win_size - RESIDENT_RD_OFFSET) {
+			print("rdres %x does not fit in the memory window\n", pi.resident_rd);
+			return 0;
+		}
 		resident_rd_size = pi.resident_rd;
+	}
+	/*
+	 * The payload's own resident image (a boot from the phone's boot partition, where no host sends one): put where
+	 * "oem ramdisk" puts it, once per run, and taken as if it had been sent.
+	 */
+	if (pi.resident != NULL) {
+		if (win_size <= RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE ||
+		    pi.resident_size > win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE) {
+			print("resident %x does not fit in the memory window\n", (uint64_t)pi.resident_size);
+			return 0;
+		}
+		memcpy((void *)(phys_base + RESIDENT_RD_OFFSET), pi.resident, pi.resident_size);
+		resident_rd_size = pi.resident_size;
+		print("resident image from the payload: %x bytes\n", (uint64_t)pi.resident_size);
 	}
 	if (resident_rd_size != 0) {
 		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
@@ -3195,9 +3358,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t this_mpidr = READ_SYSREG(MPIDR_EL1) & 0xFFFFFF, kernel_mpidr = this_mpidr;
 	/* "cpus=N" or "cpumask=M" there too: the kernel may have more cores than the one it starts on */
 	int more_cores = 0, battery_requested = 0, ufs_requested = 0;
-	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (bsd/dev/hakios.torch.c) */
+	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (drivers/camera/hakios.torch.c) */
 	int torch_requested = 0;
-	/* "cam=5" there too: the phone's wide camera is iOS's (bsd/dev/hakios.camera.c) */
+	/* "cam=5" there too: the phone's wide camera is Darwin's (drivers/camera/hakios.camera.c) */
 	int camera_requested = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
@@ -3206,6 +3369,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	block_write_requested = 0;
 	block_write_part = -1;
 	block_write_first = ~0ull;
+	/*
+	 * the same for the other storage requests (they are only ever OR-ed in below): without this a run
+	 * that did not ask for ufs=2 is still offered a stale page and given its ufs_shared_pa
+	 */
+	hc_requested = 0;
+	block_probe_requested = 0;
+	block_enabled = 0;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
@@ -3366,13 +3536,42 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		}
 		if (n < BOOT_LINE_LENGTH - 1) ba->commandLine[n++] = ' ';
 	}
-	for (const char *c = pi.cmdline; *c && n < BOOT_LINE_LENGTH - 1; c++) {
-		ba->commandLine[n++] = *c;
+	/* the version of this kernel, for sysctl kern.hakios.version and the kernel's log (no spaces in it) */
+	if (pi.kernel_version != NULL && pi.kernel_version[0] != 0) {
+		static const char prefix[] = "hakios_kver=";
+		uint32_t before = n, need = (uint32_t)(sizeof(prefix) - 1 + str_len(pi.kernel_version) + 1);
+
+		if (n + need < BOOT_LINE_LENGTH - 1) {
+			for (const char *c = prefix; *c; c++) {
+				ba->commandLine[n++] = *c;
+			}
+			for (const char *c = pi.kernel_version; *c && *c != ' '; c++) {
+				ba->commandLine[n++] = *c;
+			}
+			ba->commandLine[n++] = ' ';
+		} else {
+			print("WARNING: hakios_kver= does not fit in the kernel command line (%d of %d used)\n", (uint64_t)before,
+			    (uint64_t)(BOOT_LINE_LENGTH - 1));
+		}
 	}
+	/*
+	 * The payload's own command line, last. The kernel's boot_args holds BOOT_LINE_LENGTH characters and the
+	 * copy used to stop at the end without a word: a long line lost its tail (the last argument arrived
+	 * shortened and the kernel took it as that). Now it is said, with how much was lost.
+	 */
+	const char *rest = pi.cmdline;
+	for (; *rest && n < BOOT_LINE_LENGTH - 1; rest++) {
+		ba->commandLine[n++] = *rest;
+	}
+	if (*rest != 0) {
+		print("WARNING: the kernel command line is TRUNCATED: %d characters of the payload's cmdline did not fit in the "
+		    "%d the kernel has; the last argument is cut\n", (uint64_t)str_len(rest), (uint64_t)(BOOT_LINE_LENGTH - 1));
+	}
+	print("cmdline: %d of %d characters\n", (uint64_t)n, (uint64_t)(BOOT_LINE_LENGTH - 1));
 
 	/* --- device tree ---------------------------------------------------- */
 	const struct platform *plat = PLAT;
-	struct dt_writer w = { .base = (uint8_t *)dt_pa, .cur = (uint8_t *)dt_pa, .depth = 0 };
+	struct dt_writer w = { .base = (uint8_t *)dt_pa, .cur = (uint8_t *)dt_pa, .end = (uint8_t *)(dt_pa + dt_max), .depth = 0 };
 	uint64_t cntfrq = READ_SYSREG(CNTFRQ_EL0);
 	uint64_t ranges[3] = { 0, plat->io_base, plat->io_size };
 	uint64_t reg2[2];
@@ -3384,7 +3583,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	dt_begin(&w, "device-tree");
 	/*
-	 * The identity is the iPhone's (model, compatible, target-type ...): iOS user space looks
+	 * The identity is the iPhone's (model, compatible, target-type ...): Darwin user space looks
 	 * its device up by these, and its files -- the dyld shared cache to begin with -- are
 	 * those of that phone. XNU itself does not care; the hardware is described further down.
 	 */
@@ -3483,9 +3682,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_begin(&w, "product");
 	dt_identity(&w, identity_product, sizeof(identity_product) / sizeof(identity_product[0]), identity_product_data);
 	/*
-	 * and its haptics: "closed-loop" (MobileGestalt's DeviceSupportsClosedLoopHaptics) makes iOS play
+	 * and its haptics: "closed-loop" (MobileGestalt's DeviceSupportsClosedLoopHaptics) makes Darwin play
 	 * its vibrations and feedbacks as waveforms on the "Actuator" audio device (the audio plug-in
-	 * hands them to the kernel's motor driver); without it iOS looks for an IOKit vibration motor
+	 * hands them to the kernel's motor driver); without it Darwin looks for an IOKit vibration motor
 	 * that the iPhone X does not have, and nothing vibrates.
 	 */
 	dt_begin(&w, "haptics");
@@ -3610,6 +3809,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 
 	dt_end(&w);
 
+	/* a tree that did not fit in the room before boot_args was cut short by dt_prop: not handed to the kernel */
+	if (w.overflow) {
+		print("device tree does not fit in %x bytes: not started\n", dt_max);
+		return 0;
+	}
 	uint32_t dt_len = (uint32_t)(w.cur - w.base);
 	ba->deviceTreeP = dt_pa - slide;
 	ba->deviceTreeLength = dt_len;
@@ -3620,6 +3824,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	print("jumping to %x\n", entry_va + slide);
 	flush_log();
+	screen_quiet_before_run = screen_quiet;
+	screen_quiet = 1;               /* the screen is the kernel's now; the log still takes every line */
 	/* From here on the kernel feeds the watchdog (boot-arg hv_wdt_pet, see loader_return.c in XNU). */
 	wdt_set_ms(60000);
 
@@ -3654,6 +3860,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		if (kernel_mpidr != this_mpidr) {
 			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
 
+			screen_quiet = screen_quiet_before_run;
 			wdt_set_ms(WDT_BITE_MS);
 			if (status != 0) {
 				/* a kernel that hung may have left its own transfer list in the controller */
@@ -3683,6 +3890,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 
 	/* --- the kernel came back ------------------------------------------- */
+	screen_quiet = screen_quiet_before_run;
 	wdt_set_ms(WDT_BITE_MS);
 	hc_take_back("the kernel came back");   /* before anything here touches the storage */
 	if (hc_known) {
@@ -3996,6 +4204,12 @@ usb_start(void)
 static int usb_rx_queued;       /* usb_poll_command() has left the receive for the next command with the controller */
 static int usb_rx_pending;      /* usb_rx() has a receive with the controller that has not completed (PLAT->usb_old_driver) */
 static int usb_tx_cancel_due;   /* a send was aborted and the driver has yet to say so (PLAT->usb_old_driver) */
+/*
+ * Seconds a download may go without a byte before it is given up (0: wait for ever). A host that is stopped half-way
+ * through a download (a fastboot killed by its timeout) left the loader waiting for the rest for good: every command
+ * after it was taken for data, and only the power button brought the phone back.
+ */
+static uint64_t usb_data_timeout;
 
 static int64_t
 usb_wait(uint8_t endpoint)
@@ -4074,7 +4288,11 @@ usb_wait(uint8_t endpoint)
 			return -1;
 		}
 		/* with a kernel running, a host that went away must not keep this core from watching it */
-		if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
+		if (run_active && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
+			return -1;
+		}
+		if (usb_data_timeout != 0 && READ_SYSREG(CNTVCT_EL0) - began > usb_data_timeout * freq) {
+			USB->abort_xfer(endpoint);
 			return -1;
 		}
 		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
@@ -4163,7 +4381,8 @@ starts_with(const char *s, const char *prefix)
 static void
 fb_command(char *cmd)
 {
-	int busy = running_live != NULL;
+	/* a kernel runs on another core, with a live block or without one (running_live alone is NULL without) */
+	int busy = run_active;
 
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
@@ -4172,7 +4391,7 @@ fb_command(char *cmd)
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
-			if (busy) {
+			if (busy && running_live != NULL) {
 				((struct kernel_live *)(uintptr_t)running_live)->stop = 1;
 			}
 			fb_reply("OKAY", "");
@@ -4204,6 +4423,8 @@ fb_command(char *cmd)
 
 			if (starts_with(cmd, "oem ramdisk none")) {
 				resident_rd_size = 0;
+				/* (an "oem ramdisk" before this one must not leave the next download aimed at the resident area) */
+				download_to_ramdisk = 0;
 				fb_reply("OKAY", "");
 				return;
 			}
@@ -4255,6 +4476,10 @@ fb_command(char *cmd)
 			download_to_ramdisk = 0;
 			if (to_ramdisk) {
 				limit = win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE;
+				/* the answer to "download:" carries the size in 32 bits: a larger one would be answered as another size */
+				if (limit > 0xffffffffULL) {
+					limit = 0xffffffffULL;
+				}
 				dest = (uint8_t *)(win_base + RESIDENT_RD_OFFSET);
 				resident_rd_size = 0;
 			}
@@ -4262,6 +4487,16 @@ fb_command(char *cmd)
 				fb_reply("FAIL", "bad size");
 				return;
 			}
+			/*
+			 * A download over the payload makes the payload no payload until it is whole: the XNUP magic
+			 * is taken out when it arrives and put back at the end, so that a transfer that stops half-way
+			 * leaves something "oem run" refuses, not a mix of the new and the old.
+			 */
+			if (!to_ramdisk) {
+				*(volatile uint32_t *)dest = 0;
+			}
+			uint32_t magic_held = 0;
+			int magic_taken = 0;
 			fb_reply_data(total);
 			if (PLAT->usb_old_driver) {
 				print("download: %x bytes, DATA sent\n", total);
@@ -4271,6 +4506,7 @@ fb_command(char *cmd)
 			 * answered, 29696 never is, every time); the download's own OKAY is one. Smaller receives.
 			 */
 			uint64_t chunk = PLAT->usb_old_driver ? 16384 : USB_CHUNK;
+			usb_data_timeout = 20;
 			while (got < total) {
 				uint64_t want = total - got > chunk ? chunk : total - got;
 				int64_t r = usb_rx(usb_rx_buf, want);
@@ -4280,10 +4516,23 @@ fb_command(char *cmd)
 				if (r <= 0) {
 					break;
 				}
+				/* (a controller that reports more than was asked for must not carry the copy past the end) */
+				if (r > (int64_t)want) {
+					r = (int64_t)want;
+				}
 				memcpy(dest + got, usb_rx_buf, (size_t)r);
+				if (!to_ramdisk && !magic_taken && got + (uint64_t)r >= 4) {
+					magic_held = *(volatile uint32_t *)dest;
+					*(volatile uint32_t *)dest = 0;
+					magic_taken = 1;
+				}
 				got += (uint64_t)r;
 			}
+			usb_data_timeout = 0;
 			if (got == total) {
+				if (magic_taken) {
+					*(volatile uint32_t *)dest = magic_held;
+				}
 				if (to_ramdisk) {
 					resident_rd_size = total;
 				}
@@ -4420,7 +4669,7 @@ fb_command(char *cmd)
 			if (PLAT->usb_old_driver) {
 				fb_reply("OKAY", "");
 			}
-			if (busy) {
+			if (busy && running_live != NULL) {
 				compose_live_log(running_live, running_slide);
 			} else if (returned_log_len != 0) {
 				staged_data = out_buf;
@@ -4513,7 +4762,7 @@ usb_command_loop(void)
  * QEMU's "ramfb" display shows whatever guest memory it is told to, in any size; the firmware
  * only offers a few small landscape modes of it. So we point it at memory of our own with the
  * shape of the iPhone's screen, through the fw_cfg file "etc/ramfb" (the firmware's own mode
- * is simply replaced). In QEMU the display is then exactly what iOS expects; on the real phone
+ * is simply replaced). In QEMU the display is then exactly what Darwin expects; on the real phone
  * the kernel's display driver scales that picture to the panel.
  */
 #define PHONE_WIDTH     1125            /* the screen of the iPhone X, whose identity we carry */
@@ -4544,7 +4793,13 @@ ramfb_phone_screen(void)
 		uint64_t addr;
 		uint32_t fourcc, flags, width, height, stride;
 	} __attribute__((packed)) cfg;
-	static struct {
+	/*
+	 * volatile: QEMU writes `control' back (to 0) when it has done the request, behind the compiler's back. Without the
+	 * qualifier a build is free to keep the value written a few lines below and never look again, and the loader then
+	 * says the request failed, leaves ramfb at the firmware's 800x600 and Darwin draws its 1125x2436 into a corner: a black window
+	 * (it did, with a newer build of this very file; the older one happened to reload).
+	 */
+	static volatile struct {
 		uint32_t control, length;
 		uint64_t address;
 	} dma;
@@ -4578,7 +4833,12 @@ ramfb_phone_screen(void)
 	dma.control = be32(select << 16 | FW_CFG_DMA_SELECT | FW_CFG_DMA_WRITE);
 	dma.length = be32(sizeof(cfg));
 	dma.address = __builtin_bswap64((uint64_t)(uintptr_t)&cfg);
+	__asm__ volatile ("dsb sy" ::: "memory");       /* (cfg and dma are in memory before the device is told to read them) */
 	*(volatile uint64_t *)(FW_CFG_BASE + 16) = __builtin_bswap64((uint64_t)(uintptr_t)&dma);
+	/* the device does it at once; allow it some time all the same instead of reading once */
+	for (uint32_t spin = 0; dma.control != 0 && spin < 1000000; spin++) {
+		__asm__ volatile ("" ::: "memory");
+	}
 	if (dma.control != 0) {
 		print("ramfb: control %x after the request\n", (uint64_t)be32(dma.control));
 		return;
@@ -4615,6 +4875,153 @@ reserve_regions(void)
 	}
 }
 
+/*
+ * UEFI-native boot: a payload from the volume the loader was started from.
+ *
+ * On the phone the payload (the kernel, the small root image, the command line) is put in memory at PAYLOAD_BASE
+ * before the loader runs: by the boot shim behind Project Silicium's image (fastboot boot), or by QEMU's loader
+ * device. This is the other way, the one every UEFI boot loader has: when there is no payload in memory, look for
+ * \EFI\hakios\payload.bin on the volume this image was loaded from (the EFI system partition, where
+ * \EFI\BOOT\BOOTAA64.EFI is the loader itself), read it to PAYLOAD_BASE and go on as if it had been there all along.
+ * That is what lets the kernel start from a boot menu, a USB stick or an SD card, without fastboot.
+ *
+ * It prints nothing (the banner has not been drawn yet): volume_payload_bytes and volume_payload_note say what
+ * happened, and efi_main says it under the banner. The file has to fit in the payload region (less the last MiB,
+ * which holds the panic log), and the region has to be free: where a firmware keeps it reserved, the allocation is
+ * refused and the loader goes on without a payload, as it always did.
+ * Only the kernel and a root image that fits in the payload come this way; the big Darwin system image does not
+ * (docs/uefi-boot.md says what does).
+ */
+static uint64_t volume_payload_bytes;           /* 0: nothing was read; else the payload's size */
+static const char *volume_payload_note;         /* why not, if it was looked for */
+
+static int
+load_payload_from_volume(void)
+{
+	static const efi_guid image_guid = EFI_LOADED_IMAGE_GUID, fs_guid = EFI_SIMPLE_FILE_SYSTEM_GUID,
+	    info_guid = EFI_FILE_INFO_GUID;
+	static const char16 path[] = u"\\EFI\\hakios\\payload.bin";
+	efi_loaded_image *image = NULL;
+	efi_simple_fs *fs = NULL;
+	efi_file *root = NULL, *file = NULL;
+	uint8_t info[512] __attribute__((aligned(8)));
+	uint64_t info_size = sizeof(info), size, done = 0, pages;
+	uint64_t address = PAYLOAD_BASE;
+
+	if (EFI_ERROR(BS->handle_protocol(IMAGE, &image_guid, (void **)&image)) || image == NULL || image->device == NULL ||
+	    EFI_ERROR(BS->handle_protocol(image->device, &fs_guid, (void **)&fs)) || fs == NULL) {
+		volume_payload_note = "the loader was not started from a volume with a file system";
+		return 0;
+	}
+	if (EFI_ERROR(fs->open_volume(fs, &root)) || root == NULL) {
+		volume_payload_note = "the volume cannot be opened";
+		return 0;
+	}
+	if (EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ, 0)) || file == NULL) {
+		volume_payload_note = "there is no \\EFI\\hakios\\payload.bin on the volume";
+		root->close(root);
+		return 0;
+	}
+	if (EFI_ERROR(file->get_info(file, &info_guid, &info_size, info))) {
+		volume_payload_note = "the size of \\EFI\\hakios\\payload.bin cannot be read";
+		goto close;
+	}
+	size = *(uint64_t *)(info + EFI_FILE_INFO_FILE_SIZE_OFFSET);
+	if (size < sizeof(struct payload_header) || size > PAYLOAD_MAX_SIZE - 0x100000ULL) {
+		volume_payload_note = "\\EFI\\hakios\\payload.bin is empty or does not fit in the payload region (63 MiB)";
+		goto close;
+	}
+	/*
+	 * Take the whole payload region, not only the pages the file fills: the rest of it is written later (a payload
+	 * sent over USB with `download:` goes up to the 63 MiB limit, and the panic log lives in the last MiB), and
+	 * memory the firmware has not given to us must not be written.
+	 */
+	pages = PAYLOAD_MAX_SIZE / 0x1000;
+	if (EFI_ERROR(BS->allocate_pages(2 /* AllocateAddress */, 2 /* EfiLoaderData */, pages, &address))) {
+		volume_payload_note = "the payload region is not free (the firmware keeps it reserved)";
+		goto close;
+	}
+	while (done < size) {
+		uint64_t chunk = size - done < 0x100000ULL ? size - done : 0x100000ULL;       /* 1 MiB at a time */
+
+		if (EFI_ERROR(file->read(file, &chunk, (void *)(uintptr_t)(PAYLOAD_BASE + done))) || chunk == 0) {
+			volume_payload_note = "\\EFI\\hakios\\payload.bin could not be read to its end";
+			/* what was read stays in memory after the pages are given back: without this, the first MiB's XNUP
+			 * header would still be there and a half-read payload would be taken for a whole one */
+			((volatile struct payload_header *)PAYLOAD_BASE)->magic = 0;
+			BS->free_pages(PAYLOAD_BASE, pages);
+			goto close;
+		}
+		done += chunk;
+	}
+	if (((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
+		volume_payload_note = "\\EFI\\hakios\\payload.bin is not a payload (no XNUP at its start)";
+		BS->free_pages(PAYLOAD_BASE, pages);
+		goto close;
+	}
+	volume_payload_bytes = size;
+close:
+	file->close(file);
+	root->close(root);
+	return volume_payload_bytes != 0;
+}
+
+/*
+ * The version of the kernel in the payload (the entry kernel.ver, made by xnuloader/mkpayload.py from
+ * tools/kernel-version.py), or NULL if the payload has none. A look at the payload that changes
+ * nothing and prints nothing, so that the banner can use it before the rest of the loader runs.
+ */
+static const char *
+payload_kernel_version(void)
+{
+	const struct payload_header *ph = (const struct payload_header *)PAYLOAD_BASE;
+
+	if (ph->magic != PAYLOAD_MAGIC) {
+		return NULL;
+	}
+	/* (the same limits as parse_payload: a header size or an entry size that reaches past the payload ends the walk) */
+	const uint8_t *p = (const uint8_t *)(ph + 1), *pend = p + payload_walk_size(ph->size);
+	while (p + sizeof(struct payload_entry) <= pend) {
+		const struct payload_entry *e = (const struct payload_entry *)p;
+
+		if (e->name[0] == 0) {
+			break;
+		}
+		if ((uint64_t)e->size > (uint64_t)(pend - (p + sizeof(*e)))) {
+			break;
+		}
+		if (str_eq(e->name, "kernel.ver")) {
+			return (const char *)(p + sizeof(*e));
+		}
+		p += sizeof(*e) + ((e->size + 15) & ~15u);
+	}
+	return NULL;
+}
+
+/*
+ * The greeting. Printed from efi_main, while the UEFI text console is still ours (on the phone that is
+ * Project Silicium's UEFI): the USB command loop that follows sets screen_quiet and leaves the screen
+ * alone, so what is on it now stays there. It also goes into the log, which "xl log" fetches.
+ * The two lines under the letters are the ones the project's banner has: a greeting from the kernel,
+ * and its version, kernel.ver=, as tools/kernel-version.py makes it.
+ */
+static void
+print_banner(void)
+{
+	const char *version = payload_kernel_version();
+
+	print("\n");
+	print("   #   #   ###   #   #  #####   ###    ####\n");
+	print("   #   #  #   #  #  #     #    #   #  #\n");
+	print("   #####  #####  ###      #    #   #   ###\n");
+	print("   #   #  #   #  #  #     #    #   #      #\n");
+	print("   #   #  #   #  #   #  #####   ###   ####\n");
+	print("\n");
+	print("   hello hakios-kernel!\n");
+	print("   kernel.ver=%s\n", version ? version : "unknown");
+	print("\n");
+}
+
 efi_status EFIAPI
 efi_main(efi_handle image, efi_system_table *st)
 {
@@ -4626,7 +5033,18 @@ efi_main(efi_handle image, efi_system_table *st)
 	IMAGE = image;
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+	/* no payload in memory (nobody put one there): the volume this loader came from may have one, as a UEFI boot loader's does */
+	if (((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
+		load_payload_from_volume();
+	}
 	print("== XNULOADER v3 ==\n");
+	print_banner();
+	if (volume_payload_bytes != 0) {
+		print("payload: %d bytes from \\EFI\\hakios\\payload.bin on the volume this loader was started from\n",
+		    volume_payload_bytes);
+	} else if (volume_payload_note != NULL) {
+		print("payload: none in memory, and %s\n", volume_payload_note);
+	}
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 

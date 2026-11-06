@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-font_trim.py: smaller copies of the two fonts iOS has that are too big for a system image kept in
+font_trim.py: smaller copies of the two fonts Darwin has that are too big for a system image kept in
 the phone's memory, made from the files themselves (nothing of them is in the repository).
 
   font_trim.py emoji SRC DST [PPEM,...]
@@ -14,7 +14,7 @@ the phone's memory, made from the files themselves (nothing of them is in the re
       matches REGEX, and only the tables they use.
 
 Both write a TrueType collection that CoreText reads as it reads the original; DST may be SRC.
-sysimage/fetch.sh makes both for the system image this way.
+sysimage/unpack.sh makes both for the system image this way.
 """
 import os
 import re

@@ -14,7 +14,7 @@
 # (toolchain/linux/iphone: the cctools linker) and sdks/iPhoneOS16.5.sdk.
 #
 # What ends up where (all under xnu-deps/, none of it committed):
-#   AvailabilityVersions libdispatch libpthread     Apple open source, at the releases of iOS 16.5
+#   AvailabilityVersions libdispatch libpthread     Apple open source, at the releases of Darwin userland 16.5
 #   mm_bootstrap_cmds tcsh unifdef                  sources of mig, csh and unifdef
 #   MacOSX13.3.sdk                                  only Kernel.framework: the DriverKit headers
 #                                                   that Apple's closed "iig" would generate
@@ -28,7 +28,7 @@ source "$HERE/../xnu-env.sh"
 cd "$XNUDEPS"
 JOBS=${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu)}
 CCTOOLS=$THEOS/toolchain/linux/iphone/bin
-IOS_SDK=$THEOS/sdks/iPhoneOS16.5.sdk
+DARWIN_SDK=$THEOS/sdks/iPhoneOS16.5.sdk
 MACOS_SDK_URL=https://github.com/joseluisq/macosx-sdks/releases/download/13.3/MacOSX13.3.sdk.tar.xz
 
 log() { echo "setup: $*"; }
@@ -102,7 +102,7 @@ stage1() {
 	done
 	[ -z "$missing" ] || die "not installed:$missing"
 	[ -x "$CCTOOLS/ld" ] || die "no cctools in $CCTOOLS: install theos with its Linux toolchain (or set THEOS)"
-	[ -d "$IOS_SDK/usr/include" ] || die "no $IOS_SDK (the SDKs of github.com/theos/sdks go to \$THEOS/sdks)"
+	[ -d "$DARWIN_SDK/usr/include" ] || die "no $DARWIN_SDK (the SDKs of github.com/theos/sdks go to \$THEOS/sdks)"
 
 	# --- sources -------------------------------------------------------------------------------
 	fetch AvailabilityVersions https://github.com/apple-oss-distributions/AvailabilityVersions.git \
@@ -132,9 +132,20 @@ stage1() {
 	if [ "$XNU_HOST_OS" = Darwin ]; then
 		# macOS has it all: mig (Xcode's; it takes $MIGCC and $MIGCOM from the kernel build), unifdef, csh
 		link "$(/usr/bin/xcrun -f mig)" host/bin/mig
-		link "$(/usr/bin/xcrun -f migcom)" host/bin/migcom
+		# with the command-line tools alone, migcom is in usr/libexec, where xcrun does not look (and xcrun must not find
+		# host/bin's own link on the PATH)
+		migcom=$(xcode-select -p)/usr/libexec/migcom
+		[ -x "$migcom" ] || migcom=$(PATH=/usr/bin:/bin /usr/bin/xcrun -f migcom)
+		link "$migcom" host/bin/migcom
 		link /usr/bin/unifdef host/bin/unifdef
 		link /bin/tcsh host/bin/tcsh
+		# what XNU's makefiles call by Linux's names: GNU's nproc (MakeInc.cmd's job count) and python
+		printf '#!/bin/sh\n# nproc as GNU coreutils has it, on macOS\nexec sysctl -n hw.ncpu\n' | update host/bin/nproc
+		chmod +x host/bin/nproc
+		# (a script, not a link: /usr/bin/python3 is a shim that looks for the tool its own name says, and "python" there is none)
+		rm -f host/bin/python
+		printf '#!/bin/sh\nexec python3 "$@"\n' | update host/bin/python
+		chmod +x host/bin/python
 	fi
 	# mig: Apple's own does not build on glibc; this is a port that does
 	if [ ! -x host/bin/migcom ] || [ ! -x host/bin/mig ]; then
@@ -157,7 +168,7 @@ stage1() {
 		cp tcsh/tcsh host/bin/tcsh
 	fi
 	link tcsh host/bin/csh
-	# what 7z leaves undone when it extracts files of the iOS images (see build/lzbitmap/unzbm.c)
+	# what 7z leaves undone when it extracts files of the Darwin images (see build/lzbitmap/unzbm.c)
 	if [ ! -x host/bin/unzbm ]; then
 		cc -O2 -w -o host/bin/unzbm build/lzbitmap/unzbm.c build/lzbitmap/libzbitmap.c
 	fi
@@ -177,9 +188,9 @@ stage1() {
 	# The makefiles ask xcrun (ours: host/bin/xcrun) for an SDK and a platform directory.
 	mkdir -p sdk/Platforms/iPhoneOS.platform
 	if [ ! -d "$XNU_SDK_PATH/usr/include" ]; then
-		log "making the SDK: links to $IOS_SDK"
+		log "making the SDK: links to $DARWIN_SDK"
 		rm -rf "$XNU_SDK_PATH"
-		linktree "$(cd "$IOS_SDK" && pwd -P)" "$XNU_SDK_PATH"
+		linktree "$(cd "$DARWIN_SDK" && pwd -P)" "$XNU_SDK_PATH"
 	fi
 	local sdk_local=$XNU_SDK_PATH/usr/local
 	mkdir -p $sdk_local/include/kernel/os $sdk_local/include/os $sdk_local/lib/kernel $sdk_local/libexec

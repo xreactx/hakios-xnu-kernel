@@ -19,11 +19,20 @@ to the next one or 2.5 s later -- is a segment; for each:
     copy      the display driver's copy into the panel's memory
 
 The thresholds are as the coordinator asked for them; 18.0 rather than 16.7 because a frame of a steady
-60 comes 16.6 to 16.8 ms after the one before.
+60 comes 16.6 to 16.8 ms after the one before. Beside them, the share over 8.3 ms (from 9.0: a 120 Hz frame
+missed), what a run at fb_hz=120 is measured by.
+
+A window server drawing through Metal says no "tl: g" (that is eagl.c's, the OpenGL ES road): its frames are
+counted all the same, by the swap that handed each over, and draw and idle are then unknown (0).
 """
+import os
 import sys
 
 OVER_ONE, OVER_TWO, SEGMENT_US = 18000, 34500, 2500000
+OVER_120 = 9000
+# the first cpu-id of a small core: the loader lists the boot core, then the big ones, then the small (xnuloader/loader.c);
+# on the phone with cpus=7 the Cortex-A55s are 4, 5 and 6 (FRAMES_SMALL_FROM= for another layout)
+SMALL_FROM = int(os.environ.get('FRAMES_SMALL_FROM', '4'))
 
 
 def lines_of(paths):
@@ -52,7 +61,8 @@ def main():
             if w[1] == 'p' and len(w) >= 8 and int(w[2]) in (1, 4):
                 gestures.append((int(w[7]), int(w[2]), int(w[3]), int(w[4]), int(w[5])))
             elif w[1] == 'g' and len(w) >= 8:
-                frames.append((int(w[4]), int(w[6]), int(w[7])))
+                # (and the core it ended on, "cpu N", where eagl.c says it: -1 where it does not)
+                frames.append((int(w[4]), int(w[6]), int(w[7]), int(w[9]) if len(w) >= 10 and w[8] == 'cpu' else -1))
             elif w[1] == 's' and len(w) >= 5:
                 swaps[int(w[2])] = int(w[4])
             elif w[1] == 'v' and len(w) >= 9:
@@ -72,11 +82,15 @@ def main():
             continue
         swap = swaps[sid]
         drawn = [f for f in frames if f[1] <= swap]
-        if not drawn:
+        if drawn:
+            began, ended, draws, cpu = drawn[-1]
+        elif not frames:
+            began = ended = swap            # the Metal road: no "tl: g", the swap is where its frame ended
+            cpu = -1
+        else:
             continue
-        began, ended, draws = drawn[-1]
         ready, shown, done = shows[sid]
-        timeline.append(dict(began=began, ended=ended, swap=swap, ready=ready, shown=shown, done=done))
+        timeline.append(dict(began=began, ended=ended, swap=swap, ready=ready, shown=shown, done=done, cpu=cpu))
     timeline.sort(key=lambda f: f['done'])
     all_counts = [0, 0, 0]
     kinds, previous = {}, ''          # the same gesture done more than once: its frames together
@@ -96,6 +110,7 @@ def main():
         span = sum(g[0] for g in moving)
         over1 = [g for g in moving if g[0] > OVER_ONE]
         over2 = [g for g in moving if g[0] > OVER_TWO]
+        over120 = [g for g in moving if g[0] > OVER_120]
         all_counts[0] += len(moving)
         all_counts[1] += len(over1)
         all_counts[2] += len(over2)
@@ -107,6 +122,7 @@ def main():
         k[4] += len(over2)
         fps = len(moving) * 1e6 / span if span else 0
         line = (f'{i + 1:2}. {start / 1e6:9.3f} s {what}: {len(moving)} frames at {fps:4.1f} a second; '
+                f'over 8.3 ms {100 * len(over120) / max(1, len(moving)):3.0f}%, '
                 f'over 16.7 ms {100 * len(over1) / max(1, len(moving)):3.0f}%, over 33 ms {100 * len(over2) / max(1, len(moving)):3.0f}%')
         if over1:
             # where the slow frames' time went (means over them)
@@ -117,6 +133,9 @@ def main():
             idle = mean([b['began'] - a['ready'] for _, a, b in over1])
             copy = mean([b['done'] - b['shown'] for _, a, b in over1])
             line += f'; the slow ones: draw {draw:4.1f}, gpu {gpu:4.1f}, idle before {idle:5.1f}, copy {copy:3.1f} ms'
+            known = [b for _, a, b in over1 if b['cpu'] >= 0]
+            if known:
+                line += f', {100 * sum(b["cpu"] >= SMALL_FROM for b in known) / len(known):.0f}% drawn on small cores'
             stalls = [w for w in waits if start <= w[0] < end]
             if stalls:
                 line += f'; {len(stalls)} waits for the GPU ({sum(w[2] for w in stalls) / 1000:.0f} ms)'
@@ -134,6 +153,15 @@ def main():
     if all_counts[0]:
         print(f'all gestures: {all_counts[0]} frame steps, over 16.7 ms {100 * all_counts[1] / all_counts[0]:.0f}%, '
               f'over 33 ms {100 * all_counts[2] / all_counts[0]:.0f}%')
+    # the window server's drawing by the kind of core it ended on (eagl.c's "cpu N")
+    known = [f for f in timeline if f['cpu'] >= 0]
+    if known:
+        small = [f['ended'] - f['began'] for f in known if f['cpu'] >= SMALL_FROM]
+        big = [f['ended'] - f['began'] for f in known if f['cpu'] < SMALL_FROM]
+        def avg(values):
+            return sum(values) / len(values) / 1000 if values else 0
+        print(f'drawing: {len(big)} frames on big cores ({avg(big):.1f} ms each), {len(small)} on small ones '
+              f'({avg(small):.1f} ms each)')
 
 
 if __name__ == '__main__':

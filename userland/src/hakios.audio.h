@@ -1,7 +1,7 @@
 /*
- * /dev/hakios-audio: the sound iOS plays, on its way to whatever can make it heard.
+ * /dev/hakios-audio: the sound Darwin plays, on its way to whatever can make it heard.
  *
- * iOS expects its output devices from Apple's audio drivers through IOAudio2; neither exists
+ * Darwin expects its output devices from Apple's audio drivers through IOAudio2; neither exists
  * here. Instead the audio server (mediaserverd) is given a plug-in of ours that presents one
  * stereo output device, and the plug-in writes what the server has mixed for that device
  * here. In the kernel the samples go to a sink -- a driver for something that plays them --
@@ -24,9 +24,9 @@
 #define HAKIOS_AUDIO_FRAME     4       /* bytes */
 
 /*
- * ioctl(HAKIOS_AUDIO_SET_VOLUME): the speakers' volume, as iOS sets it on the plug-in's volume
+ * ioctl(HAKIOS_AUDIO_SET_VOLUME): the speakers' volume, as Darwin sets it on the plug-in's volume
  * control -- how many eighths of a dB under the loudest they may play, and whether they are
- * muted (iOS's volume at 0). The loudest is the kernel's to say (on the phone: Android's own
+ * muted (Darwin's volume at 0). The loudest is the kernel's to say (on the phone: Android's own
  * level less sound_below, hakios.sound.c); the plug-in only says how far under it.
  */
 #include <sys/ioccom.h>
@@ -57,7 +57,7 @@ typedef uint32_t (*hakios_audio_sink_t)(const int16_t *frames, uint32_t count);
 void hakios_audio_set_sink(const char *name, hakios_audio_sink_t sink);
 /* The route the plug-in has said last (HAKIOS_AUDIO_SET_ROUTE); the speaker until it says one. */
 uint32_t hakios_audio_route(void);
-/* The volume iOS has set last (HAKIOS_AUDIO_SET_VOLUME): false if it has set none; *generation counts the settings. */
+/* The volume Darwin has set last (HAKIOS_AUDIO_SET_VOLUME): false if it has set none; *generation counts the settings. */
 bool hakios_audio_volume(uint32_t *below, bool *muted, uint32_t *generation);
 void hakios_audio_init(void);
 void hakios_virtio_sound_init(void);   /* boot-arg virtio_sound=1: QEMU's virtio sound device */
@@ -71,7 +71,7 @@ void hakios_camera_init(void);         /* boot-arg cam=N: the phone's cameras (b
 void hakios_camera_quiesce(void);      /* whatever of them was switched on, off: at the run's end and on a panic's way out */
 
 /*
- * The phone's speakers (bsd/dev/hakios.speaker.c): its two Awinic amplifiers, set up as
+ * The phone's speakers (drivers/audio/hakios.speaker.c): its two Awinic amplifiers, set up as
  * Android's driver sets them up, from Android's own configuration file (see there).
  */
 bool hakios_speaker_prepare(const uint8_t *acf, uint64_t size);       /* found, reset, configured: powered down, muted */
@@ -119,7 +119,7 @@ bool hakios_audio_recording_fed(void);
 void hakios_audio_record_fed(const int16_t *frames, uint32_t count);
 
 /*
- * The audio DSP's services, for the sound's path (bsd/dev/hakios.adsp.c, bsd/dev/hakios.sound.c).
+ * The audio DSP's services, for the sound's path (drivers/audio/hakios.adsp.c, drivers/audio/hakios.sound.c).
  * hakios_adsp_apr() sends one APR packet to a service of the DSP (AFE 4, ASM 7, ADM 8) with the
  * given port and token (0: one of its own) and, with wait_ms, waits for the packet that carries
  * that token back. What is not waited for goes to the handler of events, if there is one and it

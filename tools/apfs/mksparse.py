@@ -3,7 +3,7 @@
 # plus a table saying where each of them went.
 #
 # Why: the phone has no driver for its own storage, so a volume there has to live in a RAM
-# disk, and the whole iOS root volume is 5368 MB against the 4288 MB the phone's firmware
+# disk, and the whole Darwin root volume is 5368 MB against the 4288 MB the phone's firmware
 # leaves usable.  Most of those blocks are never read by a given walk, though, so this
 # writes out the ones that are and the driver cannot tell the difference -- every block it
 # asks for is there.
@@ -13,7 +13,7 @@
 # touches.  A cache of a different size only changes how often a block is re-read, not
 # which blocks are needed, so the set is safe to hand to the kernel.
 #
-# Layout of what comes out (little-endian), as bsd/dev/hakios.sparse.c reads it:
+# Layout of what comes out (little-endian), as drivers/storage/hakios.sparse.c reads it:
 #
 #   header, one block:  "REDWOODSPARSE1\0\0", block size, block count of the container,
 #                       how many blocks are present, the offsets of the table and the data

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Choose the part of the iOS root filesystem that goes into the in-memory system image.
+"""Choose the part of the Darwin root filesystem that goes into the in-memory system image.
 
 usage: select-system.py rootfs.slt system.files system.manifest
 
@@ -16,7 +16,7 @@ The whole root is 7.9 GB and the kernel on the phone has about 4 GB of RAM for e
   - from the framework directories (the code itself is in the dyld shared cache) what a
     program may open at run time and is not huge: property lists, string tables, resources,
     plug-ins, and the XPC services and helper executables bundled with frameworks;
-  - the applications (the home screen is made of their icons), without their media; those that iOS
+  - the applications (the home screen is made of their icons), without their media; those that Darwin
     keeps in /private/var/staged_system_apps until its first boot installs them (Maps, Notes,
     Weather, ...) are put straight into /Applications, where they are system applications like
     the rest: system.files names them where they are in the image, system.manifest where they go
@@ -25,7 +25,7 @@ The whole root is 7.9 GB and the kernel on the phone has about 4 GB of RAM for e
     are left out, and so are a few very big daemons that have nothing to do with the display;
   - /Library (the wallpapers, regional tables) without its sounds;
   - of pictures, what the user interface itself is drawn with: small images, asset catalogs of
-    moderate size; the fonts, the two biggest (colour emoji and Chinese) made smaller by fetch.sh;
+    moderate size; the fonts, the two biggest (colour emoji and Chinese) made smaller by unpack.sh;
   - the empty LANGUAGE.lproj directories of the bundles whose strings are in one .loctable file
     for all languages: they are how CoreFoundation knows which languages a bundle has, and
     without them every string comes out as its key.
@@ -64,7 +64,7 @@ SKIP_APP_EXT = ('.mov', '.mp4', '.m4a', '.caf', '.wav', '.heic', '.aiff', '.meta
 # (the one with all the SF Symbols alone is 170 MB and is left out)
 MAX_ASSET_CATALOG = 4 << 20
 # fonts: all but the very big ones; those two -- the colour emoji, 130 MB, and PingFang, the Chinese faces, 74 MB --
-# are taken and made smaller after extraction (fetch.sh, ../tools/font_trim.py): the emoji without their biggest
+# are taken and made smaller after extraction (unpack.sh, ../tools/font_trim.py): the emoji without their biggest
 # bitmaps (59 MB), PingFang with the regular and semibold faces for simplified, traditional and Hong Kong Chinese,
 # both those programs name and the hidden ones (".PingFangSC-Regular") the system font falls back to
 # (26 MB). Without them Safari and the rest drew emoji and Chinese characters as boxes with a question mark.

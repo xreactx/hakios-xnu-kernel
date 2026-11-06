@@ -36,7 +36,7 @@ index e78d8476c346..03fc3ff646b8 100644
  
  TOP_TARGETS = \
 diff --git a/SETUP/config/doconf b/SETUP/config/doconf
-index 222158a93918..68bb0f3e56bf 100755
+index 222158a93918..030e55b82ac1 100755
 --- a/SETUP/config/doconf
 +++ b/SETUP/config/doconf
 @@ -1,4 +1,4 @@
@@ -45,6 +45,45 @@ index 222158a93918..68bb0f3e56bf 100755
  set path = ($path .)
  ######################################################################
  # HISTORY
+@@ -184,6 +184,13 @@ if ($?beverbose) then
+     echo MASTER_CPU=$MASTER_CPU
+ endif
+ 
++# HakiOS: the drivers a configuration builds (CONFIG_HAKIOS_*), as tools/hakios-config.py kernel writes them: a list
++# HAKIOS_DRIVERS of attributes, which the configurations of MASTER.arm64.bcm2837 include, and an `options` line for each
++set MASTER_HAKIOS = /dev/null
++if (-f ${MASTER_DIR}/MASTER.hakios) then
++    set MASTER_HAKIOS = ${MASTER_DIR}/MASTER.hakios
++endif
++
+ foreach SYS ($argv)
+     set SYSID=${SYS}_${ID}
+     set SYSCONF=$OBJDIR/config.$SYSID
+@@ -193,8 +200,8 @@ foreach SYS ($argv)
+     endif
+     echo +$SYS \
+     | \
+-    cat $MASTER $MASTER_CPU - \
+-        $MASTER $MASTER_CPU \
++    cat $MASTER $MASTER_CPU $MASTER_HAKIOS - \
++        $MASTER $MASTER_CPU $MASTER_HAKIOS \
+     | \
+     unifdef -t -DPLATFORM_${PLATFORM} -DCPU_$cpu -DSOC_CONFIG_${SOC_CONFIG} -DSYS_${SYS} $DEF_AVP $DEF_SEED - \
+     | \
+diff --git a/bsd/conf/Makefile b/bsd/conf/Makefile
+index 050f34a53c49..c58ff62cd419 100644
+--- a/bsd/conf/Makefile
++++ b/bsd/conf/Makefile
+@@ -17,6 +17,9 @@ MASTERCONFDIR = $(SRCROOT)/config
+ DOCONFDEPS = $(addprefix $(MASTERCONFDIR)/, MASTER MASTER.$(DOCONF_ARCH_CONFIG_LC)) \
+ 	$(addprefix $(SOURCE)/, Makefile.template Makefile.$(DOCONF_ARCH_CONFIG_LC) files files.$(DOCONF_ARCH_CONFIG_LC))
+ 
++# HakiOS: the drivers' choice (tools/hakios-config.py kernel); a new choice makes the configuration again
++DOCONFDEPS += $(wildcard $(MASTERCONFDIR)/MASTER.hakios)
++
+ ifneq (,$(wildcard $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)))
+ DOCONFDEPS += $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)
+ endif
 diff --git a/bsd/conf/Makefile.arm64 b/bsd/conf/Makefile.arm64
 index a4d25040f38f..aad72993d139 100644
 --- a/bsd/conf/Makefile.arm64
@@ -61,61 +100,81 @@ index a4d25040f38f..aad72993d139 100644
  kern_csr.o_INCFLAGS += -I$(SRCROOT)/osfmk
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index 4b83160780c3..8997af1f0e1b 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -588,5 +588,13 @@ do_build_all:: do_all
+ 
+ %RULES
+ 
++# HakiOS: HFS Plus built in (bsd/hfs, Apple's hfs-627.100.6), compiled as its kext was: against the kernel's KPI,
++# not its insides (no XNU/BSD/MACH_KERNEL_PRIVATE), kext-config.h first, its own headers beside it, and its warnings
++# its own (it is Apple's code as it was published, not this kernel's)
++HFS_OBJS = $(patsubst %.c,%.o,$(notdir $(wildcard $(SRCROOT)/bsd/hfs/*.c)))
++$(foreach o,$(HFS_OBJS),$(eval $(o)_CFLAGS_ADD += -UXNU_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UMACH_KERNEL_PRIVATE \
++	-include $(SRCROOT)/bsd/hfs/kext-config.h -I$(SRCROOT)/bsd/hfs -idirafter $(SDKROOT)/usr/include))
++$(foreach o,$(HFS_OBJS),$(eval $(o)_CWARNFLAGS_ADD += -w))
++
+ include $(MakeInc_rule)
+ include $(MakeInc_dir)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..9a4df8282540 100644
+index 44274016a4cf..27cccab98c8e 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,49 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,51 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
-+bsd/dev/hakios.input.c		standard
-+bsd/dev/hakios.virtio_input.c	standard
-+bsd/dev/hakios.goodix.c	standard
-+bsd/dev/hakios.synaptics.c	standard
-+bsd/dev/hakios.buttons.c	standard
-+bsd/dev/hakios.battery.c	standard
-+bsd/dev/hakios.ufs.c	standard
-+bsd/dev/hakios.ufshc.c	standard
-+bsd/dev/hakios.net.c		standard
-+bsd/dev/hakios.ipa.c		standard
-+bsd/dev/hakios.cell.c		standard
-+bsd/dev/hakios.virtio_net.c	standard
-+bsd/dev/hakios.apple80211.c	standard
-+bsd/dev/hakios.cpufreq.c	standard
-+bsd/dev/hakios.thermal.c	standard
-+bsd/dev/hakios.pmi_haptics.c	standard
-+bsd/dev/hakios.slider.c	standard
-+bsd/dev/hakios.tfa9894.c	standard
-+bsd/dev/hakios.adreno.c	standard
-+bsd/dev/hakios.audio.c		standard
-+bsd/dev/hakios.virtio_sound.c	standard
-+bsd/dev/hakios.speaker.c	standard
-+bsd/dev/hakios.guard.c		standard
-+bsd/dev/hakios.haptic.c		standard
-+bsd/dev/hakios.torch.c		standard
-+bsd/dev/hakios.camera.c	standard
-+bsd/dev/hakios.mic.c		standard
-+bsd/dev/hakios.wifi.c		standard
-+bsd/dev/hakios.adsp.c		standard
-+bsd/dev/hakios.slim.c		standard
-+bsd/dev/hakios.wlfw10.c		standard
-+bsd/dev/hakios.wifi6t.c		standard
-+bsd/dev/hakios.mpss.c		standard
-+bsd/dev/hakios.image.c		standard
-+bsd/dev/hakios.virtio_blk.c	standard
-+bsd/dev/hakios.sparse.c	standard
-+bsd/dev/hakios.apfs_check.c	optional apfs
-+bsd/dev/hakios.sound.c		standard
-+bsd/dev/hakios.qmi.c		standard
-+bsd/dev/hakios.nas.c		standard
-+bsd/dev/hakios.wlfw.c		standard
-+bsd/dev/hakios.lx.c		standard
-+bsd/dev/hakios.sta.c		standard
++# HakiOS drivers: made by tools/hakios-config.py kernel from drivers/*/conf. Edit those, not these lines.
++bsd/dev/hakios.audio.c                   standard
++bsd/dev/hakios.version.c                 standard
++bsd/dev/hakios.platform.c                standard
++bsd/dev/hakios.stubs.c                   standard
++bsd/dev/hakios.input.c                   standard
++bsd/dev/hakios.net.c                     standard
++bsd/dev/hakios.image.c                   standard
++bsd/dev/hakios.sparse.c                  standard
++bsd/dev/hakios.apfs_check.c              optional apfs
++bsd/dev/hakios.adsp.c                    optional hakios_adsp
++bsd/dev/hakios.speaker.c                 optional hakios_speaker
++bsd/dev/hakios.sound.c                   optional hakios_sound
++bsd/dev/hakios.guard.c                   optional hakios_sound
++bsd/dev/hakios.mic.c                     optional hakios_mic
++bsd/dev/hakios.virtio_sound.c            optional hakios_virtio_sound
++bsd/dev/hakios.bt.c                      optional hakios_bt
++bsd/dev/hakios.camera.c                  optional hakios_camera
++bsd/dev/hakios.torch.c                   optional hakios_torch
++bsd/dev/hakios.socinfo.c                 optional hakios_socinfo
++bsd/dev/hakios.adreno.c                  optional hakios_adreno
++bsd/dev/hakios.haptic.c                  optional hakios_haptic
++bsd/dev/hakios.virtio_input.c            optional hakios_virtio_input
++bsd/dev/hakios.goodix.c                  optional hakios_goodix
++bsd/dev/hakios.buttons.c                 optional hakios_buttons
++bsd/dev/hakios.qmi.c                     optional hakios_qmi
++bsd/dev/hakios.mpss.c                    optional hakios_modem
++bsd/dev/hakios.cell.c                    optional hakios_modem
++bsd/dev/hakios.nas.c                     optional hakios_modem
++bsd/dev/hakios.ipa.c                     optional hakios_modem
++bsd/dev/hakios.virtio_net.c              optional hakios_virtio_net
++bsd/dev/hakios.battery.c                 optional hakios_battery
++bsd/dev/hakios.cpufreq.c                 optional hakios_cpufreq
++bsd/dev/hakios.thermal.c                 optional hakios_thermal
++bsd/dev/hakios.pmic.c                    optional hakios_pmic
++bsd/dev/hakios.battguard.c               optional hakios_battguard
++bsd/dev/hakios.ufs.c                     optional hakios_ufs
++bsd/dev/hakios.ufshc.c                   optional hakios_ufs
++bsd/dev/hakios.virtio_blk.c              optional hakios_virtio_blk
++bsd/dev/hakios.wifi.c                    optional hakios_wifi
++bsd/dev/hakios.wlfw.c                    optional hakios_wifi
++bsd/dev/hakios.lx.c                      optional hakios_wifi
++bsd/dev/hakios.sta.c                     optional hakios_wifi
++bsd/dev/hakios.apple80211.c              optional hakios_wifi
++# end of the HakiOS drivers
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +198,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +200,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -127,10 +186,48 @@ index 44274016a4cf..9a4df8282540 100644
 +bsd/miscfs/apfs/apfs_vfsops.c		optional apfs
 +bsd/miscfs/apfs/apfs_vnops.c		optional apfs
 +bsd/miscfs/ramfs/ramfs.c			optional ramfs
++bsd/hfs/BTree.c		optional hfs
++bsd/hfs/BTreeAllocate.c		optional hfs
++bsd/hfs/BTreeMiscOps.c		optional hfs
++bsd/hfs/BTreeNodeOps.c		optional hfs
++bsd/hfs/BTreeNodeReserve.c		optional hfs
++bsd/hfs/BTreeScanner.c		optional hfs
++bsd/hfs/BTreeTreeOps.c		optional hfs
++bsd/hfs/BTreeWrapper.c		optional hfs
++bsd/hfs/CatalogUtilities.c		optional hfs
++bsd/hfs/FileExtentMapping.c		optional hfs
++bsd/hfs/FileIDsServices.c		optional hfs
++bsd/hfs/MacOSStubs.c		optional hfs
++bsd/hfs/UnicodeWrappers.c		optional hfs
++bsd/hfs/VolumeAllocation.c		optional hfs
++bsd/hfs/hfs_attrlist.c		optional hfs
++bsd/hfs/hfs_btreeio.c		optional hfs
++bsd/hfs/hfs_builtin.c		optional hfs
++bsd/hfs/hfs_catalog.c		optional hfs
++bsd/hfs/hfs_chash.c		optional hfs
++bsd/hfs/hfs_cnode.c		optional hfs
++bsd/hfs/hfs_cprotect.c		optional hfs
++bsd/hfs/hfs_endian.c		optional hfs
++bsd/hfs/hfs_extents.c		optional hfs
++bsd/hfs/hfs_fsinfo.c		optional hfs
++bsd/hfs/hfs_hotfiles.c		optional hfs
++bsd/hfs/hfs_journal.c		optional hfs
++bsd/hfs/hfs_link.c		optional hfs
++bsd/hfs/hfs_lookup.c		optional hfs
++bsd/hfs/hfs_notification.c		optional hfs
++bsd/hfs/hfs_quota.c		optional hfs
++bsd/hfs/hfs_readwrite.c		optional hfs
++bsd/hfs/hfs_resize.c		optional hfs
++bsd/hfs/hfs_search.c		optional hfs
++bsd/hfs/hfs_vfsops.c		optional hfs
++bsd/hfs/hfs_vfsutils.c		optional hfs
++bsd/hfs/hfs_vnops.c		optional hfs
++bsd/hfs/hfs_xattr.c		optional hfs
++bsd/hfs/rangelist.c		optional hfs
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +412,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +452,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -138,7 +235,7 @@ index 44274016a4cf..9a4df8282540 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +435,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +475,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -365,10 +462,10 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..4a6e0ccfc590 100644
+index 4df41ba1f61b..b5a79a02a3f5 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,13 @@
+@@ -147,6 +147,14 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
@@ -376,13 +473,14 @@ index 4df41ba1f61b..4a6e0ccfc590 100644
 +#include <sys/hakios.audio.h>
 +#include <sys/hakios.virtio_blk.h>
 +#include <sys/hakios.sparse.h>
++#include <sys/hakios.version.h>
 +#if APFS
 +#include <sys/hakios.apfs_check.h>
 +#endif
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +497,7 @@ bsd_init(void)
+@@ -490,7 +498,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -391,10 +489,11 @@ index 4df41ba1f61b..4a6e0ccfc590 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +983,14 @@ bsd_init(void)
+@@ -976,6 +984,15 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
++		hakios_version_init();         /* kern.hakios.version, and the version in the boot log */
 +		hakios_input_init();           /* /dev/hakios-touch */
 +		hakios_audio_init();           /* /dev/hakios-audio */
 +		hakios_virtio_blk_init();      /* /dev/rvblk0, a disk image of the host (QEMU) */
@@ -420,7 +519,7 @@ index 95192dd62449..b00da803b5b4 100644
  
  	/*
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 1d71c66629fb..1d5025f32b88 100644
+index 1d71c66629fb..a22095ccf5f0 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -1157,6 +1157,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
@@ -571,7 +670,7 @@ index 1d71c66629fb..1d5025f32b88 100644
 +	if (persona == NULL) {
 +		/*
 +		 * hakios: there are no personas in this port -- nothing makes them, and
-+		 * kpersona_find_by_type() answers "no such process" to everyone who asks. iOS's own
++		 * kpersona_find_by_type() answers "no such process" to everyone who asks. Darwin's own
 +		 * programs get along without them, but a package manager becomes root by way of one:
 +		 * Sileo asks posix_spawn for persona 99 with OVERRIDE and uid 0 (its APTWrapper), and
 +		 * that is how it runs apt and dpkg. With the persona missing the lookup failed, the
@@ -823,7 +922,7 @@ index 1750d3a52d3c..0373d0dd160f 100644
  }
  
 diff --git a/bsd/kern/kern_priv.c b/bsd/kern/kern_priv.c
-index 88adf2dda936..e29e09fc0f0b 100644
+index 88adf2dda936..168384889bc1 100644
 --- a/bsd/kern/kern_priv.c
 +++ b/bsd/kern/kern_priv.c
 @@ -82,6 +82,19 @@ priv_check_cred(kauth_cred_t cred, int priv, int flags)
@@ -832,7 +931,7 @@ index 88adf2dda936..e29e09fc0f0b 100644
  
 +	/*
 +	 * hakios: nothing is signed here and no process carries an entitlement (AMFI is a stub), so
-+	 * every privilege that an entitlement would answer for is refused -- and iOS leans on one of
++	 * every privilege that an entitlement would answer for is refused -- and Darwin leans on one of
 +	 * them for ordinary work. A daemon that goes to the network on behalf of an application
 +	 * (trustd checking the certificate for whoever opened the connection, nsurlsessiond carrying
 +	 * out its downloads) describes the connection to NECP as delegated, and without this
@@ -919,7 +1018,7 @@ index 4ca22ee4371a..e95e618b4cb6 100644
  	int spacetype = IS_64BIT_PROCESS(p) ? UIO_USERSPACE64 : UIO_USERSPACE32;
  
 diff --git a/bsd/kern/sys_work_interval.c b/bsd/kern/sys_work_interval.c
-index b544bf307dfe..85e34caf9f62 100644
+index b544bf307dfe..a06cbc68ffdb 100644
 --- a/bsd/kern/sys_work_interval.c
 +++ b/bsd/kern/sys_work_interval.c
 @@ -265,6 +265,22 @@ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
@@ -931,7 +1030,7 @@ index b544bf307dfe..85e34caf9f62 100644
 +	case 8:
 +		/*
 +		 * (redwood) Not in the open source: what os_workgroup_interval_start(), _update() and
-+		 * _finish() of iOS send, for the performance controller, which is not here either.
++		 * _finish() of Darwin send, for the performance controller, which is not here either.
 +		 * CoreAudio does it in every I/O cycle and logs an error each time it is refused: fifty
 +		 * lines a second from the audio server's real-time thread. For its threads, and only
 +		 * for them, there is nothing to do and nothing wrong. (The window server asks for its
@@ -959,7 +1058,7 @@ index dce802fc36f1..e2e6b3a3f3db 100644
  		user_ssize_t    rlen;
  		off_t   pgoff;
 diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
-index 412f9ecfc22c..1788b8698ebd 100644
+index 412f9ecfc22c..c88c240d4262 100644
 --- a/bsd/miscfs/bindfs/bind_vfsops.c
 +++ b/bsd/miscfs/bindfs/bind_vfsops.c
 @@ -139,8 +139,12 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
@@ -970,7 +1069,7 @@ index 412f9ecfc22c..1788b8698ebd 100644
 -	if (!IOCurrentTaskHasEntitlement(BINDFS_ENTITLEMENT)) {
 +	/*
 +	 * check entitlement -- hakios: or process 1, the port's own init, unsigned, which binds
-+	 * its choice of launchd jobs and the like onto the read-only iOS root volume before it
++	 * its choice of launchd jobs and the like onto the read-only Darwin root volume before it
 +	 * hands over to launchd (userland/src/init.c, root_apfs=)
 +	 */
 +	if (!IOCurrentTaskHasEntitlement(BINDFS_ENTITLEMENT) && proc_getpid(current_proc()) != 1) {
@@ -1154,16 +1253,20 @@ index cbaa0b221894..78315a2d54cf 100644
  	int eofflag;
  	uint64_t options;
 diff --git a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
-index bae70cda3a96..031613b10643 100644
+index bae70cda3a96..63814100c68f 100644
 --- a/bsd/vfs/vfs_conf.c
 +++ b/bsd/vfs/vfs_conf.c
-@@ -103,6 +103,15 @@ extern  struct vfsops mockfs_vfsops;
+@@ -103,6 +103,19 @@ extern  struct vfsops mockfs_vfsops;
  extern  int mockfs_mountroot(mount_t, vnode_t, vfs_context_t);
  #endif /* MOCKFS */
  
 +#if RAMFS
 +extern  struct vfsops ramfs_vfsops;
 +#endif /* RAMFS */
++
++#if HFS
++extern  struct vfsops hfs_vfsops;
++#endif /* HFS */
 +
 +#if APFS
 +extern  struct vfsops apfs_vfsops;
@@ -1173,18 +1276,19 @@ index bae70cda3a96..031613b10643 100644
  enum fs_type_num {
  	FT_NFS = 2,
  	FT_DEVFS = 19,
-@@ -110,7 +119,9 @@ enum fs_type_num {
+@@ -110,7 +123,10 @@ enum fs_type_num {
  	FT_ROUTEFS = 21,
  	FT_NULLFS = 22,
  	FT_BINDFS = 23,
 -	FT_MOCKFS  = 0x6D6F636B
 +	FT_MOCKFS  = 0x6D6F636B,
 +	FT_RAMFS   = 0x72616D66,
++	FT_HFS     = 0x11,
 +	FT_APFS    = 0x61706673
  };
  
  int fstypenumstart = FT_BINDFS + 1;
-@@ -194,6 +205,54 @@ static struct vfstable vfstbllist[] = {
+@@ -194,6 +210,79 @@ static struct vfstable vfstbllist[] = {
  	},
  #endif /* BINDFS */
  
@@ -1206,6 +1310,31 @@ index bae70cda3a96..031613b10643 100644
 +		.vfc_sysctl = NULL
 +	},
 +#endif /* RAMFS */
++
++#if HFS
++	/*
++	 * HFS Plus, read-write, built in rather than a kext (bsd/hfs, Apple's hfs-627.100.6): the data volume on the
++	 * phone's flash, /private/var, where ramfs keeps it in memory.  Its own arguments (struct hfs_mount_args) and
++	 * local ones, as the kext registered itself (no VFS_TBLGENERICMNTARGS): the kernel looks up the device named
++	 * by their first field and hands its vnode to hfs_mount().  Mounted by init, from user space.
++	 */
++	{
++		.vfc_vfsops = &hfs_vfsops,
++		.vfc_name = "hfs",
++		.vfc_typenum = FT_HFS,
++		.vfc_refcount = 0,
++		.vfc_flags = MNT_LOCAL | MNT_DOVOLFS,
++		.vfc_mountroot = NULL,
++		.vfc_next = NULL,
++		.vfc_reserved1 = 0,
++		.vfc_reserved2 = 0,
++		.vfc_vfsflags = VFC_VFSLOCALARGS | VFC_VFSREADDIR_EXTENDED | VFC_VFS64BITREADY | VFC_VFSVNOP_PAGEOUTV2 |
++		    VFC_VFSVNOP_PAGEINV2 | VFC_VFSNATIVEXATTR,
++		.vfc_descptr = NULL,
++		.vfc_descsize = 0,
++		.vfc_sysctl = NULL
++	},
++#endif /* HFS */
 +
 +#if APFS
 +	/*
@@ -1239,7 +1368,7 @@ index bae70cda3a96..031613b10643 100644
  #if MOCKFS
  	/* If we are configured for it, mockfs should always be the last standard entry (and thus the last FS we attempt mountroot with) */
  	{
-@@ -298,6 +357,15 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
+@@ -298,6 +387,21 @@ extern const struct vnodeopv_desc devfs_fdesc_vnodeop_opv_desc;
  extern const struct vnodeopv_desc mockfs_vnodeop_opv_desc;
  #endif /* MOCKFS */
  
@@ -1248,6 +1377,12 @@ index bae70cda3a96..031613b10643 100644
 +extern const struct vnodeopv_desc ramfs_vnodeop_opv_desc;
 +#endif /* RAMFS */
 +
++#if HFS
++extern const struct vnodeopv_desc hfs_vnodeop_opv_desc;
++extern const struct vnodeopv_desc hfs_specop_opv_desc;
++extern const struct vnodeopv_desc hfs_fifoop_opv_desc;
++#endif /* HFS */
++
 +#if APFS
 +extern const struct vnodeopv_desc apfs_vnodeop_opv_desc;
 +#endif /* APFS */
@@ -1255,13 +1390,18 @@ index bae70cda3a96..031613b10643 100644
  extern const struct vnodeopv_desc nullfs_vnodeop_opv_desc;
  extern const struct vnodeopv_desc bindfs_vnodeop_opv_desc;
  
-@@ -327,5 +395,11 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
+@@ -327,5 +431,16 @@ const struct vnodeopv_desc *vfs_opv_descs[] = {
  #if MOCKFS
  	&mockfs_vnodeop_opv_desc,
  #endif /* MOCKFS */
 +#if RAMFS
 +	&ramfs_vnodeop_opv_desc,
 +#endif /* RAMFS */
++#if HFS
++	&hfs_vnodeop_opv_desc,
++	&hfs_specop_opv_desc,
++	&hfs_fifoop_opv_desc,
++#endif /* HFS */
 +#if APFS
 +	&apfs_vnodeop_opv_desc,
 +#endif /* APFS */
@@ -1441,7 +1581,7 @@ index 5b51e9c46a8d..6872b94631c9 100644
  	context.vc_thread = current_thread();
  	context.vc_ucred = cred;
 diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
-index 60c8b9eedd50..b0029de5ef21 100644
+index 60c8b9eedd50..4384b6fec634 100644
 --- a/bsd/vm/vm_unix.c
 +++ b/bsd/vm/vm_unix.c
 @@ -2538,7 +2538,19 @@ after_root_check:
@@ -1450,7 +1590,7 @@ index 60c8b9eedd50..b0029de5ef21 100644
  			error = vnode_lookup(PREBOOT_CRYPTEX_PATH, 0, &preboot_vp, vfs_context_current());
 -			if (error || srfmp->vp->v_mount != preboot_vp->v_mount) {
 +			/*
-+			 * (redwood) Or a volume of its own mounted on a directory right inside it: iOS
++			 * (redwood) Or a volume of its own mounted on a directory right inside it: Darwin
 +			 * grafts each cryptex image into the Preboot volume (graftdmg), so its files are
 +			 * that volume's; this port mounts the image there as it is (bsd/miscfs/apfs), a
 +			 * mount of its own whose covered directory is Preboot's Cryptexes/<name>.
@@ -1466,20 +1606,21 @@ index 60c8b9eedd50..b0029de5ef21 100644
  					("shared_region: %p [%d(%s)] map(%p:'%s'): "
  					"not on process' root volume nor preboot volume\n",
 diff --git a/config/MASTER b/config/MASTER
-index 07147cb3188b..e937e62bf4c3 100644
+index 07147cb3188b..86e9eefb5ec7 100644
 --- a/config/MASTER
 +++ b/config/MASTER
-@@ -113,6 +113,8 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
+@@ -113,6 +113,9 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
  #	4.4 filesystems
  #
  options		MOCKFS		# Boot from an executable	# <mockfs>
 +options		APFS		# Apple File System, read only	# <apfs>
 +options		RAMFS		# Read-write filesystem in memory	# <ramfs>
++options		HFS		# HFS Plus, read-write: the data volume on the flash	# <hfs>
  options		FIFO		# fifo support			# <fifo>
  options		FDESC		# fdesc_fs support		# <fdesc>
  options		DEVFS		# devfs support			# <devfs>
 diff --git a/config/MASTER.arm64.bcm2837 b/config/MASTER.arm64.bcm2837
-index 1ed75eea2052..54c5e12d2271 100644
+index 1ed75eea2052..4c67d211fb60 100644
 --- a/config/MASTER.arm64.bcm2837
 +++ b/config/MASTER.arm64.bcm2837
 @@ -16,15 +16,15 @@
@@ -1498,7 +1639,7 @@ index 1ed75eea2052..54c5e12d2271 100644
 -#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs]
 +#  BSD_DEV =        [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
 +#  BSD_DEBUG =      [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
-+#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs mockfs ramfs apfs ]
++#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs mockfs ramfs apfs hfs ]
  #  FILESYS_RELEASE= [ FILESYS_BASE ]
  #  FILESYS_DEV =    [ FILESYS_BASE config_union_mounts fdesc ]
  #  FILESYS_DEBUG =  [ FILESYS_BASE config_union_mounts fdesc ]
@@ -1513,6 +1654,21 @@ index 1ed75eea2052..54c5e12d2271 100644
  #  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_library_validation config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_service_port_info ]
  #  MACH_RELEASE =   [ MACH_BASE config_skip_precise_user_kernel_time debugger_for_zone_info ]
  #  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace ]
+@@ -70,10 +70,10 @@
+ #  SECURITY_DEV =     [ SECURITY_BASE config_setuid config_kas_info ]
+ #  SECURITY_DEBUG =   [ SECURITY_BASE config_setuid config_kas_info ]
+ #  BASE =           [ MULTIPATH PF VPN ]
+-#  RELEASE =        [ BASE KERNEL_RELEASE BSD_RELEASE FILESYS_RELEASE             SKYWALK_RELEASE NETWORKING_RELEASE IOKIT_RELEASE LIBKERN_RELEASE PERF_DBG_RELEASE MACH_RELEASE SCHED_RELEASE VM_RELEASE SECURITY_RELEASE ]
+-#  DEVELOPMENT =    [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     NFS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV     PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     SECURITY_DEV     ]
+-#  DEBUG =          [ BASE KERNEL_DEBUG   BSD_DEBUG   FILESYS_DEBUG               SKYWALK_DEBUG   NETWORKING_DEBUG   IOKIT_DEBUG   LIBKERN_DEBUG   PERF_DBG_DEBUG   MACH_DEBUG   SCHED_DEBUG   VM_DEBUG   SECURITY_DEBUG   ]
+-#  KASAN =          [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     NFS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV     PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_KASAN   SECURITY_DEV     ]
++#  RELEASE =        [ BASE KERNEL_RELEASE BSD_RELEASE FILESYS_RELEASE             SKYWALK_RELEASE NETWORKING_RELEASE IOKIT_RELEASE LIBKERN_RELEASE PERF_DBG_RELEASE MACH_RELEASE SCHED_RELEASE VM_RELEASE SECURITY_RELEASE HAKIOS_DRIVERS ]
++#  DEVELOPMENT =    [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     NFS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV     PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     SECURITY_DEV HAKIOS_DRIVERS     ]
++#  DEBUG =          [ BASE KERNEL_DEBUG   BSD_DEBUG   FILESYS_DEBUG               SKYWALK_DEBUG   NETWORKING_DEBUG   IOKIT_DEBUG   LIBKERN_DEBUG   PERF_DBG_DEBUG   MACH_DEBUG   SCHED_DEBUG   VM_DEBUG   SECURITY_DEBUG HAKIOS_DRIVERS   ]
++#  KASAN =          [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     NFS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV     PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_KASAN   SECURITY_DEV HAKIOS_DRIVERS     ]
+ #
+ ######################################################################
+ #
 diff --git a/iokit/Kernel/IOPMrootDomain.cpp b/iokit/Kernel/IOPMrootDomain.cpp
 index 4a06407aea5f..2d2383953f7f 100644
 --- a/iokit/Kernel/IOPMrootDomain.cpp
@@ -1729,25 +1885,56 @@ index 5219fb0d9ed6..29978e9cff43 100644
  			regEntry->release();                                                            /* Toss the entry */
  		}
  	}
+diff --git a/iokit/conf/Makefile b/iokit/conf/Makefile
+index 83259ebf9835..8864e5c7cc41 100644
+--- a/iokit/conf/Makefile
++++ b/iokit/conf/Makefile
+@@ -16,6 +16,9 @@ endif
+ MASTERCONFDIR = $(SRCROOT)/config
+ DOCONFDEPS = $(addprefix $(MASTERCONFDIR)/, MASTER MASTER.$(DOCONF_ARCH_CONFIG_LC)) \
+ 	$(addprefix $(SOURCE)/, Makefile.template Makefile.$(DOCONF_ARCH_CONFIG_LC) files files.$(DOCONF_ARCH_CONFIG_LC))
++# HakiOS: the drivers' choice (tools/hakios-config.py kernel); a new choice makes the configuration again
++DOCONFDEPS += $(wildcard $(MASTERCONFDIR)/MASTER.hakios)
++
+ ifneq (,$(wildcard $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)))
+ DOCONFDEPS += $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)
+ endif
 diff --git a/iokit/conf/files b/iokit/conf/files
-index 5fb0a52062e0..c07be8d9e0b0 100644
+index 5fb0a52062e0..7cfee3142b5b 100644
 --- a/iokit/conf/files
 +++ b/iokit/conf/files
-@@ -79,6 +79,14 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+@@ -79,6 +79,17 @@ iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
  iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
  
  iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
 +iokit/Kernel/GenericARMPE.cpp			optional iokitcpp
 +iokit/Kernel/MiniIOSurface.cpp			optional iokitcpp
 +iokit/Kernel/MiniIOMobileFramebuffer.cpp		optional iokitcpp
-+iokit/Kernel/hakios.gpu.cpp				optional iokitcpp
-+iokit/Kernel/hakios.wlan.cpp			optional iokitcpp
-+iokit/Kernel/hakios.battery.cpp			optional iokitcpp
++# HakiOS drivers: made by tools/hakios-config.py kernel from drivers/*/conf. Edit those, not these lines.
++iokit/Kernel/hakios.stubs.cpp            optional iokitcpp
++iokit/Kernel/hakios.gpu.cpp              optional hakios_adreno iokitcpp
++iokit/Kernel/hakios.battery.cpp          optional hakios_battery iokitcpp
++iokit/Kernel/hakios.wlan.cpp             optional hakios_wifi iokitcpp
++# end of the HakiOS drivers
 +iokit/Kernel/MiniAppleKeyStore.cpp			optional iokitcpp
 +iokit/Kernel/MiniIONetworkStack.cpp			optional iokitcpp
  iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
  
  iokit/Kernel/IOCPU.cpp					optional iokitcpp
+diff --git a/libkern/conf/Makefile b/libkern/conf/Makefile
+index 050f34a53c49..c58ff62cd419 100644
+--- a/libkern/conf/Makefile
++++ b/libkern/conf/Makefile
+@@ -17,6 +17,9 @@ MASTERCONFDIR = $(SRCROOT)/config
+ DOCONFDEPS = $(addprefix $(MASTERCONFDIR)/, MASTER MASTER.$(DOCONF_ARCH_CONFIG_LC)) \
+ 	$(addprefix $(SOURCE)/, Makefile.template Makefile.$(DOCONF_ARCH_CONFIG_LC) files files.$(DOCONF_ARCH_CONFIG_LC))
+ 
++# HakiOS: the drivers' choice (tools/hakios-config.py kernel); a new choice makes the configuration again
++DOCONFDEPS += $(wildcard $(MASTERCONFDIR)/MASTER.hakios)
++
+ ifneq (,$(wildcard $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)))
+ DOCONFDEPS += $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)
+ endif
 diff --git a/libkern/conf/files b/libkern/conf/files
 index ece14c7d41d3..4a903f73a9ef 100644
 --- a/libkern/conf/files
@@ -1774,6 +1961,20 @@ index 28ea44c2ae9d..9c7a1fe9e23e 100644
  		    "only plain data types can be contained (consider using OSValueObject)");
  		return 0; // C++11 does not support void-returning constexpr functions
  	}
+diff --git a/libsa/conf/Makefile b/libsa/conf/Makefile
+index 050f34a53c49..c58ff62cd419 100644
+--- a/libsa/conf/Makefile
++++ b/libsa/conf/Makefile
+@@ -17,6 +17,9 @@ MASTERCONFDIR = $(SRCROOT)/config
+ DOCONFDEPS = $(addprefix $(MASTERCONFDIR)/, MASTER MASTER.$(DOCONF_ARCH_CONFIG_LC)) \
+ 	$(addprefix $(SOURCE)/, Makefile.template Makefile.$(DOCONF_ARCH_CONFIG_LC) files files.$(DOCONF_ARCH_CONFIG_LC))
+ 
++# HakiOS: the drivers' choice (tools/hakios-config.py kernel); a new choice makes the configuration again
++DOCONFDEPS += $(wildcard $(MASTERCONFDIR)/MASTER.hakios)
++
+ ifneq (,$(wildcard $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)))
+ DOCONFDEPS += $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)
+ endif
 diff --git a/makedefs/MakeInc.cmd b/makedefs/MakeInc.cmd
 index bc39e19b3b8e..0a72a2d43908 100644
 --- a/makedefs/MakeInc.cmd
@@ -2730,6 +2931,20 @@ index e5336e5a1cce..a54e35035cde 100644
  
  #if !VMAPPLE
  	MOV64   x1, SCTLR_EL1_DEFAULT
+diff --git a/osfmk/conf/Makefile b/osfmk/conf/Makefile
+index 050f34a53c49..c58ff62cd419 100644
+--- a/osfmk/conf/Makefile
++++ b/osfmk/conf/Makefile
+@@ -17,6 +17,9 @@ MASTERCONFDIR = $(SRCROOT)/config
+ DOCONFDEPS = $(addprefix $(MASTERCONFDIR)/, MASTER MASTER.$(DOCONF_ARCH_CONFIG_LC)) \
+ 	$(addprefix $(SOURCE)/, Makefile.template Makefile.$(DOCONF_ARCH_CONFIG_LC) files files.$(DOCONF_ARCH_CONFIG_LC))
+ 
++# HakiOS: the drivers' choice (tools/hakios-config.py kernel); a new choice makes the configuration again
++DOCONFDEPS += $(wildcard $(MASTERCONFDIR)/MASTER.hakios)
++
+ ifneq (,$(wildcard $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)))
+ DOCONFDEPS += $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)
+ endif
 diff --git a/osfmk/conf/files b/osfmk/conf/files
 index 9d98c50094a0..9e3476124e54 100644
 --- a/osfmk/conf/files
@@ -3128,29 +3343,6 @@ index 3ad743fc3efb..ce036c5a2c26 100644
  #else
  void
  pe_init_fiq()
-diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
-index c622b4cc84ab..aa67c8772fb3 100644
---- a/pexpert/arm/pe_init.c
-+++ b/pexpert/arm/pe_init.c
-@@ -414,6 +414,18 @@ PE_init_platform(boolean_t vm_initialized, void *args)
- 		PE_state.video.v_scale = ((boot_args_ptr->Video.v_depth >> kBootVideoDepthScaleShift) & kBootVideoDepthMask) + 1;
- 		PE_state.video.v_display = boot_args_ptr->Video.v_display;
- 		strlcpy(PE_state.video.v_pixelFormat, "BBBBBBBBGGGGGGGGRRRRRRRR", sizeof(PE_state.video.v_pixelFormat));
-+		{
-+			/*
-+			 * hakios: boot-arg fb_map_mb=N -- the console maps N MB of video memory, not one frame: room
-+			 * for a second buffer beside the first (the OnePlus 6T's fb_flip=1, iokit's MiniIOMobileFramebuffer),
-+			 * mapped now, while the kernel's address space has room for it.
-+			 */
-+			uint32_t map_mb = 0;
-+
-+			if (PE_parse_boot_argn("fb_map_mb", &map_mb, sizeof(map_mb)) && map_mb != 0 && map_mb <= 64) {
-+				PE_state.video.v_length = (unsigned long)map_mb << 20;
-+			}
-+		}
- 	}
- 	if (!vm_initialized) {
- 		/*
 diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
 index 65144c74239c..ab6260d52d84 100644
 --- a/pexpert/arm/pe_kprintf.c
@@ -3171,6 +3363,20 @@ index 65144c74239c..ab6260d52d84 100644
  	uart_putc(c);
  }
  
+diff --git a/pexpert/conf/Makefile b/pexpert/conf/Makefile
+index 050f34a53c49..c58ff62cd419 100644
+--- a/pexpert/conf/Makefile
++++ b/pexpert/conf/Makefile
+@@ -17,6 +17,9 @@ MASTERCONFDIR = $(SRCROOT)/config
+ DOCONFDEPS = $(addprefix $(MASTERCONFDIR)/, MASTER MASTER.$(DOCONF_ARCH_CONFIG_LC)) \
+ 	$(addprefix $(SOURCE)/, Makefile.template Makefile.$(DOCONF_ARCH_CONFIG_LC) files files.$(DOCONF_ARCH_CONFIG_LC))
+ 
++# HakiOS: the drivers' choice (tools/hakios-config.py kernel); a new choice makes the configuration again
++DOCONFDEPS += $(wildcard $(MASTERCONFDIR)/MASTER.hakios)
++
+ ifneq (,$(wildcard $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)))
+ DOCONFDEPS += $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)
+ endif
 diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
 index d9f0723244e5..53fe4f371d7f 100644
 --- a/pexpert/pexpert/arm64/BCM2837.h
@@ -3226,19 +3432,34 @@ index c84b2100bc19..aaad5cd2e8c6 100644
  #define MAX_CPU_CLUSTERS               1
  
  #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
-diff --git a/pexpert/pexpert/arm64/boot.h b/pexpert/pexpert/arm64/boot.h
-index 2c2186ffbca5..0dacde2b8c47 100644
---- a/pexpert/pexpert/arm64/boot.h
-+++ b/pexpert/pexpert/arm64/boot.h
-@@ -23,7 +23,7 @@
-  * This value matches iBoot's IBOOT_MAX_ENV_VAR_DATA_SIZE.
-  * There are no iBoot headers so have to duplicate it here for now.
-  */
--#define BOOT_LINE_LENGTH        608
-+#define BOOT_LINE_LENGTH        1024            /* HakiOS: 608 in Apple's; our loader fills it (xnuloader/loader.c) */
+diff --git a/san/conf/Makefile b/san/conf/Makefile
+index 050f34a53c49..c58ff62cd419 100644
+--- a/san/conf/Makefile
++++ b/san/conf/Makefile
+@@ -17,6 +17,9 @@ MASTERCONFDIR = $(SRCROOT)/config
+ DOCONFDEPS = $(addprefix $(MASTERCONFDIR)/, MASTER MASTER.$(DOCONF_ARCH_CONFIG_LC)) \
+ 	$(addprefix $(SOURCE)/, Makefile.template Makefile.$(DOCONF_ARCH_CONFIG_LC) files files.$(DOCONF_ARCH_CONFIG_LC))
  
- /*
-  * Video information..
++# HakiOS: the drivers' choice (tools/hakios-config.py kernel); a new choice makes the configuration again
++DOCONFDEPS += $(wildcard $(MASTERCONFDIR)/MASTER.hakios)
++
+ ifneq (,$(wildcard $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)))
+ DOCONFDEPS += $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)
+ endif
+diff --git a/security/conf/Makefile b/security/conf/Makefile
+index 2efc18a7a9d6..04fc48e02ccb 100644
+--- a/security/conf/Makefile
++++ b/security/conf/Makefile
+@@ -17,6 +17,9 @@ MASTERCONFDIR = $(SRCROOT)/config
+ DOCONFDEPS = $(addprefix $(MASTERCONFDIR)/, MASTER MASTER.$(DOCONF_ARCH_CONFIG_LC)) \
+ 	$(addprefix $(SOURCE)/, Makefile.template Makefile.$(DOCONF_ARCH_CONFIG_LC) files files.$(DOCONF_ARCH_CONFIG_LC))
+ 
++# HakiOS: the drivers' choice (tools/hakios-config.py kernel); a new choice makes the configuration again
++DOCONFDEPS += $(wildcard $(MASTERCONFDIR)/MASTER.hakios)
++
+ ifneq (,$(wildcard $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)))
+ DOCONFDEPS += $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)
+ endif
 diff --git a/security/mac_vfs_subr.c b/security/mac_vfs_subr.c
 index 97028c06bb92..0daad830d0c0 100644
 --- a/security/mac_vfs_subr.c
@@ -3281,3 +3502,39 @@ index 3ebc295117a3..de101eafc83b 100755
  def find_non_ascii(s):
      for c in s:
          if ord(c) >= 0x80: return True
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index c622b4cc84ab..aa67c8772fb3 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -414,6 +414,18 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 		PE_state.video.v_scale = ((boot_args_ptr->Video.v_depth >> kBootVideoDepthScaleShift) & kBootVideoDepthMask) + 1;
+ 		PE_state.video.v_display = boot_args_ptr->Video.v_display;
+ 		strlcpy(PE_state.video.v_pixelFormat, "BBBBBBBBGGGGGGGGRRRRRRRR", sizeof(PE_state.video.v_pixelFormat));
++		{
++			/*
++			 * hakios: boot-arg fb_map_mb=N -- the console maps N MB of video memory, not one frame: room
++			 * for a second buffer beside the first (the OnePlus 6T's fb_flip=1, iokit's MiniIOMobileFramebuffer),
++			 * mapped now, while the kernel's address space has room for it.
++			 */
++			uint32_t map_mb = 0;
++
++			if (PE_parse_boot_argn("fb_map_mb", &map_mb, sizeof(map_mb)) && map_mb != 0 && map_mb <= 64) {
++				PE_state.video.v_length = (unsigned long)map_mb << 20;
++			}
++		}
+ 	}
+ 	if (!vm_initialized) {
+ 		/*
+diff --git a/pexpert/pexpert/arm64/boot.h b/pexpert/pexpert/arm64/boot.h
+index 2c2186ffbca5..0dacde2b8c47 100644
+--- a/pexpert/pexpert/arm64/boot.h
++++ b/pexpert/pexpert/arm64/boot.h
+@@ -23,7 +23,7 @@
+  * This value matches iBoot's IBOOT_MAX_ENV_VAR_DATA_SIZE.
+  * There are no iBoot headers so have to duplicate it here for now.
+  */
+-#define BOOT_LINE_LENGTH        608
++#define BOOT_LINE_LENGTH        1024            /* HakiOS: 608 in Apple's; our loader fills it (xnuloader/loader.c) */
+ 
+ /*
+  * Video information..

@@ -1,6 +1,16 @@
 # Metal
 
-Разбор: что в iOS 16.5 просит Metal, где проходит граница, которую пришлось бы реализовать, и
+> **Обновление, 4 ноября 2026.** Этот разбор написан в октябре, и вывода раздела 4 («(В): ни то, ни другое») больше нет: теперь оконный
+> сервер рисует через Metal на Adreno 642L телефона, двумя путями, и оба рисуют правильно. **hakios-metal** (близко к пути (А) раздела 4,
+> без Vulkan: AIR через NIR в ir3, собственные пакеты PM4): перелистывание страниц 100–104 кадра в секунду, прокрутка Settings около 90, кнопка «домой» около 90.
+> **metal2vulkan** (стек UniXNU: фронтенд AdrenoMetal, metal2vulkan, Turnip — пути, которого в разделе 4 не было): перелистывание 50–57,
+> прокрутка 41. Панель 120 Гц; **120 кадров в секунду не достигнуто**. Без `metal=1` система по-прежнему рисует через OpenGL ES. Стена с
+> `default.metallib` снята не плагином: `tools/ca-metallib.py` делает эту библиотеку на вашей машине из того, что вы даёте сами. Что
+> осталось верным: игры не заявляются (раздел 9.4), драйвер AGX переиспользовать нельзя. Сборка, аргументы
+> загрузки, измерения: [Metal on the Adreno](../reference/metal.md), [Metal measurements](../reference/metal-measurements.md). Всё ниже — запись того,
+> что было известно на те даты.
+
+Разбор: что в Darwin userland 16.5 просит Metal, где проходит граница, которую пришлось бы реализовать, и
 стоит ли её переходить. Всё, что ниже, проверено по извлечённой системе
 (`sysimage/rootfs`, кэш `sysimage/20F66__iPhone10,3_6/dyld_shared_cache_arm64`), по исходникам порта и
 по журналам прогонов; адреса — невыровненные (unslid) адреса этого кэша.
@@ -14,13 +24,13 @@
   сопротивляется** (обычный битовый код LLVM, 456 модулей системы из 456 читает готовый `llvm-dis`).
   Измерено в разделе 9, и вывод там: «игры» — твёрдое нет, «один системный шейдер на нашем GPU» —
   достижимо.
-- **Половина потерь — «пока», а не «нельзя».** У CoreImage в iOS 16.5 есть полный задний конец на
+- **Половина потерь — «пока», а не «нельзя».** У CoreImage в Darwin userland 16.5 есть полный задний конец на
   OpenGL ES, у движка CoreML — 127 процессорных ядер и ни одного металлического. Разбор — раздел 7.
 - **Первый шаг оказался уже сделанным** (раздел 2), поэтому сделан другой: `metal_test`
   (`userland/src/metal_test.m`), который наконец отвечает, что система про Metal думает, — и первым
   же запуском исправил два моих утверждения.
 
-## 1. Как iOS находит Metal
+## 1. Как Darwin находит Metal
 
 Вся процедура — пять шагов, и ни один из них не спрашивает ни про возможности устройства, ни про
 что-либо ещё, кроме реестра IOKit.
@@ -56,8 +66,8 @@
 `MTLCreateSystemDefaultDevice` (`0x181a34b3c`) выдаёт одно устройство из этого списка под
 `dispatch_once` (сторож `0x1e1efe9b8`, блок `0x181a3442c`, массив `0x1e1efe9a0`). **Пустой список —
 ответ, данный один раз и сохранённый до конца процесса, молча**: ни строки в журнал, ни кода
-ошибки, ни причины. В iOS 16.5 второго способа спросить нет: `MTLCopyAllDevices` объявлен
-`API_UNAVAILABLE(ios)` и в двоичном файле отсутствует.
+ошибки, ни причины. В Darwin userland 16.5 второго способа спросить нет: `MTLCopyAllDevices` объявлен
+`API_UNAVAILABLE(darwin)` и в двоичном файле отсутствует.
 
 ## 2. Что здесь есть вместо этого
 
@@ -77,16 +87,16 @@ metal_test:   IOAcceleratorES "sgx": MetalPluginName (none), MetalPluginClassNam
 > the properties that name its Metal and OpenGL ES drivers is passed over by both, which leaves
 > CoreAnimation with its software renderer, as before.
 
-То есть **шаг, который напрашивается как «первый» — сказать iOS правду, чтобы она пошла работающей
+То есть **шаг, который напрашивается как «первый» — сказать Darwin правду, чтобы она пошла работающей
 дорогой, — в порте уже сделан, и сделан именно так**: служба есть, чтобы CoreAnimation не ждал
 полминуты, и нарочно без двух свойств, чтобы и Metal, и OpenGL ES прошли мимо. Цепочка из раздела 1
 обрывается не на шаге 1, а на шаге 2.
 
-Adreno же отдаётся userland'у отдельно и под своим именем: `iokit/Kernel/hakios.gpu.cpp`
+Adreno же отдаётся userland'у отдельно и под своим именем: `drivers/gpu/hakios.gpu.cpp`
 (строки 289–307) регистрирует `HakiosGPU : IOService`, `setName("HakiosGPU")`,
 `kIOUserClientClassKey = "HakiosGPUUserClient"` — это то, с чем говорит freedreno из Mesa, и к
 `IOAcceleratorES` оно отношения не имеет. Причём `HakiosGPUStart()` зовётся из
-`bsd/dev/hakios.adreno.c` (строка 3858) только когда GPU действительно поднялся, так что в QEMU
+`drivers/gpu/hakios.adreno.c` (строка 3858) только когда GPU действительно поднялся, так что в QEMU
 `metal_test` и не нашёл ничего (`what the registry has that is a GPU: none`).
 
 **Что из этого следует для раздела 4.** Границу стерегут не IOKit и не ядро: класс нужной службы в
@@ -140,7 +150,7 @@ CoreAnimation спросил и получил отказ только по дв
 | `IOGPU` — обёртка над клиентом IOKit | 461 664 | 2 266 | 711 | 36 |
 | `MTLCompiler` — передняя часть компилятора шейдеров | 983 544 | 2 971 | — | — |
 | `AGXCompilerCore` — его задняя часть под AGX | 2 680 736 | 7 509 | — | — |
-| `AppleMetalGLRenderer` — OpenGL ES **поверх** Metal, как это делает сама iOS | 258 256 | 1 092 | 2 | 1 |
+| `AppleMetalGLRenderer` — OpenGL ES **поверх** Metal, как это делает сама Darwin | 258 256 | 1 092 | 2 | 1 |
 
 Для сравнения — чем порт заменяет графическую библиотеку сейчас: `userland/src/eagl.c` — 3 685
 строк, `src/eagl_slots.txt` — 409 записей таблицы, из которых помечено используемыми QuartzCore
@@ -194,7 +204,7 @@ AGXA11FamilyDevice  ->  IOGPUMetalDevice (IOGPU.framework)  ->  _MTLDevice (Meta
 
 **(А) Поверхность Metal над Mesa.** Дописать на уже существующую службу `IOAcceleratorES` (раздел 2)
 два свойства, положить в образ `/System/Library/Extensions/HakiosMetal.bundle`
-(место открыто: `userland/build.sh` собирает корень из файлов iOS по их настоящим путям и уже
+(место открыто: `userland/build.sh` собирает корень из файлов Darwin по их настоящим путям и уже
 кладёт туда свои — например `/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver`) и реализовать
 граф объектов Metal на Mesa. Цена: ~53 класса и ~1 200 методов драйвера **плюс компилятор
 AIR→NIR**, которого не существует. В единицах этого проекта — не файл и не два, а ещё одна Mesa, и
@@ -204,7 +214,7 @@ AIR→NIR**, которого не существует. В единицах э�
 `_MTLDevice` приходится решать целиком, AIR остаётся на входе (то есть нужен AIR→GLSL), а
 единственное, что экономится, — задняя часть под Adreno, то есть именно та часть, которую Mesa и
 так даёт бесплатно. Заодно GLES2/3 не выражает вычислительные конвейеры, argument buffers и
-значительную часть того, за чем Metal и зовут. Показательно, что сама iOS переводит в обратную
+значительную часть того, за чем Metal и зовут. Показательно, что сама Darwin переводит в обратную
 сторону: `AppleMetalGLRenderer.bundle` — это GLES поверх Metal, один класс и 1 092 символа.
 Дешёвое направление — GL→Metal, а у порта уже есть то, что делает его ненужным: настоящий GLES.
 
@@ -265,7 +275,7 @@ CoreAnimation — рендерер OpenGL ES, который порт уже и 
    шаге всё обрывается;
 4. что получает программа: `MTLCreateSystemDefaultDevice()`, а при удаче — имя, `registryID` и
    поддерживаемые семейства;
-5. что iOS всё равно рассказывает про графику (раздел 5): `GraphicsFeatureSetClass`,
+5. что Darwin всё равно рассказывает про графику (раздел 5): `GraphicsFeatureSetClass`,
    `GraphicsFeatureSetFallbacks` и рядом — чтобы было видно, что ответ `APPLE4` не зависит ни от
    чего;
 6. умеет ли работать фреймворк, у которого путь без Metal есть: CoreImage прогоняет `CIColorInvert` по четырём
@@ -286,7 +296,7 @@ called. We cannot safely call it or ignore it in the fork() child process. Crash
 было больше одного потока, а у `metal_test` их больше (довольно слинковаться с CoreImage и
 OpenGLES). Прогон, сделанный так, не говорит о CoreImage ничего. Теперь `metal_test` запускает себя
 заново (`posix_spawn` с именем вопроса в аргументе: `ci-eagl`, `ci-default`, …), потому что `exec`
-начинает среду с нуля. Урок общий: **в этом проекте нельзя проверять что-либо из iOS в потомке
+начинает среду с нуля. Урок общий: **в этом проекте нельзя проверять что-либо из Darwin в потомке
 `fork` — только в новом процессе.**
 
 Проверка бандлов идёт **последней** нарочно: взять принципиальный класс — значит загрузить код
@@ -305,12 +315,12 @@ OpenGLES). Прогон, сделанный так, не говорит о CoreI
 
 ```sh
 userland/build.sh                       # obj/metal_test -> root/bin/metal_test
-RC_JOBS=rc.jobs.metal qemu/run-ios.sh 240                    # в QEMU
+RC_JOBS=rc.jobs.metal qemu/run-darwin.sh 240                    # в QEMU
 XL_CMDLINE="... gpu=1" RC_JOBS=rc.jobs.metal ./xl run        # на телефоне
 ```
 
 **Разница между QEMU и телефоном ровно одна**, и её стоит знать, читая вывод: пункт 2 показывает
-`HakiosGPU` только на телефоне. `HakiosGPUStart()` зовётся из `bsd/dev/hakios.adreno.c` (строка
+`HakiosGPU` только на телефоне. `HakiosGPUStart()` зовётся из `drivers/gpu/hakios.adreno.c` (строка
 3858) лишь тогда, когда GPU действительно поднялся (`done >= 21 && core_runs`, то есть `gpu=1` и
 прошивки из `fw-gpu/`); в QEMU GPU нет вовсе, и служб не будет никаких. Про само Metal ответ
 одинаков: устройства нет ни там, ни там.
@@ -324,7 +334,7 @@ metal_test: what the registry has that is a GPU
 metal_test:   none
 metal_test: the device a program gets
 metal_test:   MTLCreateSystemDefaultDevice() = nil (and says nothing about why)
-metal_test: what iOS publishes about graphics (artwork, not rendering)
+metal_test: what Darwin publishes about graphics (artwork, not rendering)
 metal_test:   GraphicsFeatureSetClass = (none)
 metal_test:   GraphicsFeatureSetFallbacks = (none)
 metal_test:   ArtworkDeviceSubType = (none)
@@ -382,7 +392,7 @@ metal_test:   AGXMetalA11.bundle: executable AGXMetalA11, principal class AGXPri
 
 ### CoreImage — не Metal-only; у него **два** полных задних конца
 
-Самая важная находка всего разбора. В iOS 16.5 CoreImage несёт две параллельных реализации:
+Самая важная находка всего разбора. В Darwin userland 16.5 CoreImage несёт две параллельных реализации:
 
 | OpenGL ES | Metal |
 | --- | --- |
@@ -431,7 +441,7 @@ OpenGL ES, а не на Metal.** Он идёт прямо в `internalContextWit
 работу, когда никакого контекста OpenGL ES ему не дали**: по этой дороге `EAGLContext` — `nil`.
 
 И `kCIContextUseSoftwareRenderer: @YES` идёт **тем же путём, с тем же стеком и той же смертью**:
-на iOS 16.5 этот ключ ничего не значит, программного растеризатора у CoreImage нет.
+на Darwin userland 16.5 этот ключ ничего не значит, программного растеризатора у CoreImage нет.
 
 Значит вопрос «достижимо ли это» получает хороший ответ: дорога, которой CoreImage и так хочет
 идти, — ровно та, что у порта есть. Не хватает ей того единственного, чего она просит: контекста
