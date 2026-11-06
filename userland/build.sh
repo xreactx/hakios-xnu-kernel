@@ -704,10 +704,11 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# This stages the files; a separate XNU MPSS driver is still required to start the modem.
 	if [ -n "$MODEM" ]; then
 		[ -f ../fw-modem/modem.mdt ] || { echo "build.sh: MODEM=1 needs ../fw-modem/modem.mdt" >&2; exit 1; }
-		# (checked against the phone's own tree: DEVICE=fajita has its own, where the modem self-authenticates)
-		MODEM_DTB=../devices/redwood/prebuilt/device-tree.dtb
-		[ "${DEVICE:-}" = fajita ] && MODEM_DTB=../devices/fajita/device-tree.dtb
-		../devices/redwood/tools/modem_firmware.py --dtb $MODEM_DTB --firmware-dir ../fw-modem \
+		# (checked against the phone's own tree, by the phone's own checker: DEVICE=fajita has both, its modem
+		# self-authenticating -- through its MBA, with no PAS id, which redwood's checker refuses)
+		MODEM_DTB=../devices/redwood/prebuilt/device-tree.dtb MODEM_CHECK=../devices/redwood/tools/modem_firmware.py
+		[ "${DEVICE:-}" = fajita ] && MODEM_DTB=../devices/fajita/device-tree.dtb MODEM_CHECK=../devices/fajita/tools/modem_firmware.py
+		$MODEM_CHECK --dtb $MODEM_DTB --firmware-dir ../fw-modem \
 			--node /soc/qcom,mss@4080000 >/dev/null
 		mkdir -p sysroot/fw
 		cp ../fw-modem/modem.mdt ../fw-modem/modem.b[0-9][0-9] sysroot/fw/
