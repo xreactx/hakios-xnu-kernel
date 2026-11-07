@@ -138,7 +138,9 @@ firmware() {
 	case "${XL_FIRMWARE:-}" in
 	u-boot|silicium) echo "$XL_FIRMWARE"; return ;;
 	esac
-	if [ -f Mu-Silicium/Build/redwoodPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd ] || [ -f devices/redwood/prebuilt/SILICIUM_UEFI.fd ]; then
+	# (the phone's own: Mu-Silicium's package for DEVICE has the device's name, as in mkxnuimg.py's DEVICES)
+	local d=${DEVICE:-redwood}
+	if [ -f Mu-Silicium/Build/${d}Pkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd ] || [ -f devices/$d/prebuilt/SILICIUM_UEFI.fd ]; then
 		echo silicium
 	else
 		echo u-boot
