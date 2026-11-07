@@ -28,6 +28,8 @@
 #include "debug.h"
 #include "snoc.h"
 #include "qmi.h"
+#include "ce.h"
+#include "hif.h"
 
 #include <lx_os.h>
 #include "lx.h"
@@ -244,6 +246,7 @@ static struct {
 	void *argument;
 	int disabled;			/* disable_irq() depth */
 	bool attached;
+	volatile unsigned arrived;	/* how many times it has come (told when the driver stops its bus) */
 } line[RADIO_IRQS];
 
 static void
@@ -254,6 +257,7 @@ irq_arrived(void *argument)
 	if (!line[v].attached) {
 		return;
 	}
+	line[v].arrived++;
 	line[v].handler(RADIO_FIRST_INTID + v, line[v].argument);
 	if (line[v].disabled == 0) {
 		lx_os_irq_enable(v);
@@ -318,6 +322,8 @@ lkpi_free_irq(unsigned int irq, void *device)
 
 /* ---- NAPI: a poll run on a thread of its own until it says it is done --------------------------------- */
 
+#define LX_NAPI_MISSED	4	/* (a bit of napi->state beside LinuxKPI's 0..3: Linux's NAPI_STATE_MISSED) */
+
 static struct napi_struct *volatile napi_wanted[4];
 
 static void
@@ -370,7 +376,14 @@ linuxkpi_netif_napi_del(struct napi_struct *napi)
 bool
 linuxkpi_napi_schedule_prep(struct napi_struct *napi)
 {
-	return (!test_bit(LKPI_NAPI_FLAG_DISABLE_PENDING, &napi->state) && !test_and_set_bit(NAPI_STATE_SCHED, &napi->state));
+	if (test_bit(LKPI_NAPI_FLAG_DISABLE_PENDING, &napi->state)) {
+		return (false);
+	}
+	if (test_and_set_bit(NAPI_STATE_SCHED, &napi->state)) {
+		set_bit(LX_NAPI_MISSED, &napi->state);	/* (a poll is running: it runs again before it completes) */
+		return (false);
+	}
+	return (true);
 }
 
 void
@@ -401,7 +414,20 @@ linuxkpi_napi_reschedule(struct napi_struct *napi)
 bool
 linuxkpi_napi_complete_done(struct napi_struct *napi, int done)
 {
+	/*
+	 * Linux's NAPIF_STATE_MISSED: a schedule that came while the poll ran (snoc.c's interrupt handler, an engine's
+	 * interrupt for the next message) was turned away by napi_schedule_prep(); the poll is then run again instead
+	 * of being completed (napi_runs() goes on while NAPI_STATE_SCHED is set), as Linux reschedules it. Without
+	 * this the firmware's answer to the HTT connect lay unread in copy engine 2 while its interrupt had come.
+	 */
+	if (test_and_clear_bit(LX_NAPI_MISSED, &napi->state)) {
+		return (false);
+	}
 	clear_bit(NAPI_STATE_SCHED, &napi->state);
+	/* (one that came between the two: it found the poll scheduled, so take it back up) */
+	if (test_and_clear_bit(LX_NAPI_MISSED, &napi->state) && !test_and_set_bit(NAPI_STATE_SCHED, &napi->state)) {
+		return (false);
+	}
 	return (true);
 }
 
@@ -434,6 +460,30 @@ linuxkpi_napi_synchronize(struct napi_struct *napi)
 	}
 }
 
+/*
+ * What the copy engines hold when the driver stops its bus: its hif_stop() comes right after a failed start
+ * (a service connect that timed out, ...) and before the radio is powered down, so the registers can still be
+ * read. The driver's own ops, with stop() wrapped: each engine's source and destination ring indices
+ * (ath10k_ce_dump_registers: base, src write, src read, dst write, dst read), and how often each interrupt came.
+ */
+static const struct ath10k_hif_ops *driver_hif_ops;
+static struct ath10k_hif_ops looked_at_hif_ops;
+
+static void
+hif_stop_looked_at(struct ath10k *ar)
+{
+	if (!lx_os_option("wifi_quiet")) {
+		mutex_lock(&ar->dump_mutex);
+		ath10k_ce_dump_registers(ar, NULL);
+		mutex_unlock(&ar->dump_mutex);
+		lx_tell("lx: the bus stops; the radio's interrupts came (vector: times): 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u "
+		    "6:%u 7:%u 8:%u 9:%u 10:%u 11:%u\n", line[0].arrived, line[1].arrived, line[2].arrived, line[3].arrived,
+		    line[4].arrived, line[5].arrived, line[6].arrived, line[7].arrived, line[8].arrived, line[9].arrived,
+		    line[10].arrived, line[11].arrived);
+	}
+	driver_hif_ops->stop(ar);
+}
+
 /* ---- the entries ---------------------------------------------------------------------------------- */
 
 static struct ath10k *volatile driver;	/* the driver, while it is up: between lx_start() and lx_stop() */
@@ -458,7 +508,7 @@ lx_start(void)
 		return (ENOMEM);
 	}
 	if (!lx_os_option("wifi_quiet")) {
-		ath10k_debug_mask = ATH10K_DBG_SNOC | ATH10K_DBG_QMI | ATH10K_DBG_BOOT;
+		ath10k_debug_mask = ATH10K_DBG_SNOC | ATH10K_DBG_QMI | ATH10K_DBG_BOOT | ATH10K_DBG_HTC;
 	}
 	for (unsigned i = 0; i < RADIO_IRQS; i++) {
 		irqs[i] = RADIO_FIRST_INTID + i;
@@ -478,6 +528,11 @@ lx_start(void)
 	}
 	ar = platform_get_drvdata(&radio);
 	ar_snoc = ath10k_snoc_priv(ar);
+	/* (before its register work, which starts the bus: the QMI exchange with the firmware comes first) */
+	driver_hif_ops = ar->hif.ops;
+	looked_at_hif_ops = *driver_hif_ops;
+	looked_at_hif_ops.stop = hif_stop_looked_at;
+	ar->hif.ops = &looked_at_hif_ops;
 
 	/* the rest happens on the driver's threads: its exchange with the firmware, then its start (snoc.c, core.c) */
 	began = lx_os_nanoseconds();
@@ -490,6 +545,21 @@ lx_start(void)
 	if (!up) {
 		return (ETIMEDOUT);
 	}
+	/*
+	 * ATH10K_SNOC_FLAG_REGISTERED only says ath10k_core_register() has queued its work: the work itself
+	 * (core.c, ath10k_core_register_work) fetches firmware-N.bin, starts the firmware's WMI and registers the
+	 * radio with mac80211 after that, and sets ATH10K_FLAG_CORE_REGISTERED last. A scan before it has no radio.
+	 */
+	began = lx_os_nanoseconds();
+	while (!test_bit(ATH10K_FLAG_CORE_REGISTERED, &ar->dev_flags) && lx_os_nanoseconds() - began < 60000000000ull) {
+		lx_pause_ms(10);
+	}
+	if (!test_bit(ATH10K_FLAG_CORE_REGISTERED, &ar->dev_flags)) {
+		lx_tell("lx: the driver's register work HAS NOT FINISHED in 60 s (core.c: its firmware files, WMI, mac80211)\n");
+		return (ETIMEDOUT);
+	}
+	lx_tell("lx: %llu ms later its register work is done: the radio is mac80211's\n",
+	    (lx_os_nanoseconds() - began) / 1000000ull);
 	driver = ar;
 	if (lx_os_option("wifi_scan")) {
 		lx_station_scan();

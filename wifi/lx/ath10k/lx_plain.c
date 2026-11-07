@@ -121,10 +121,22 @@ struct lx_va_format {
 	va_list *va;
 };
 
+/* the first "%pV" in a format (the kernel has no strstr(), and the object may ask it only for mk-ath10k.sh's KERNEL) */
+static const char *
+find_pV(const char *format)
+{
+	for (const char *c = format; *c != 0; c++) {
+		if (c[0] == '%' && c[1] == 'p' && c[2] == 'V') {
+			return c;
+		}
+	}
+	return NULL;
+}
+
 static void
 expand(char *line, size_t size, const char *format, va_list list)
 {
-	const char *at = strstr(format, "%pV");
+	const char *at = find_pV(format);
 	size_t before;
 
 	for (const char *c = format; at != NULL && *c != 0; c++) {
