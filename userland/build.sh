@@ -718,6 +718,14 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		# the phone's /vendor/firmware_mnt/image into ../fw-modem/image), which the modem reads over TFTP (hakios.mpss.c)
 		if [ -d ../fw-modem/image ]; then
 			rm -rf sysroot/fw/image && cp -R ../fw-modem/image sysroot/fw/image
+			# (on the 6T that partition also holds the modem's and the audio DSP's own images, 69 MB, already in
+			# /fw above, where the kernel loads them from; the modem never asks for them over TFTP (it reads
+			# modem_pr/mcfg, wlanmdsp.mbn; the kernel the *.jsn), and without them the image fits before the
+			# data volume's store at the end of system_a)
+			if [ "${DEVICE:-}" = fajita ]; then
+				rm -f sysroot/fw/image/modem.mdt sysroot/fw/image/modem.b[0-9][0-9] \
+					sysroot/fw/image/adsp.mdt sysroot/fw/image/adsp.b[0-9][0-9]
+			fi
 		fi
 	fi
 	# ... and the speaker amplifiers' configuration, the phone's /vendor/etc/aw882xx_acf.bin (drivers/audio/hakios.speaker.c,
