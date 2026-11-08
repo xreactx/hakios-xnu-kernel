@@ -3727,7 +3727,7 @@ static struct {
 	uint32_t service, instance, port;
 } our_servers[4];
 static uint32_t rmtfs_requests, rmtfs_reads, rmtfs_writes, rmtfs_sectors_read, rmtfs_sectors_written, rmtfs_refused;
-static uint32_t tftp_requests, tftp_served, tftp_refused, servreg_requests;
+static uint32_t tftp_requests, tftp_served, tftp_refused, tftp_reclaimed, servreg_requests;
 
 /* One datagram out, of any type. */
 static int
@@ -4124,8 +4124,8 @@ link_stop(void)
 		    "GLINK %u, SMP2P %u; rmtfs: %u requests, %u reads (%u sectors), %u writes (%u sectors), %u refused\n", link_runs ?
 		    "THE THREAD DOES NOT END" : "down", glink.said, glink.heard, qrtr_out, qrtr_in, doorbell.glink, doorbell.smp2p,
 		    rmtfs_requests, rmtfs_reads, rmtfs_sectors_read, rmtfs_writes, rmtfs_sectors_written, rmtfs_refused);
-		printf("mpss: link: tftp: %u requests, %u served whole, %u refused; the registry: %u questions\n", tftp_requests, tftp_served,
-		    tftp_refused, servreg_requests);
+		printf("mpss: link: tftp: %u requests, %u served whole, %u refused, %u taken back idle; the registry: %u questions\n",
+		    tftp_requests, tftp_served, tftp_refused, tftp_reclaimed, servreg_requests);
 	}
 	lck_mtx_lock(&glink_lock);
 	glink.up = false;
@@ -5135,6 +5135,7 @@ struct tftp_transfer {
 	bool done, writing, borrowed;           /* borrowed: data is a tftp_files entry's, not to be freed */
 	uint8_t *written;                       /* a write: what has come, up to TFTP_WRITE_MAX */
 	uint32_t written_size, expected;
+	uint64_t active_us;                     /* when the modem last said something to it (now_us()) */
 	char name[96];
 };
 static struct tftp_transfer tftp_transfers[4];
@@ -5236,6 +5237,7 @@ tftp_transfer_receive(void *context, uint32_t node, uint32_t port, const void *d
 	if (t->done || node != t->node || port != t->peer || length < 4) {
 		return;
 	}
+	t->active_us = now_us();
 	opcode = (uint16_t)(m[0] << 8 | m[1]);
 	block = (uint16_t)(m[2] << 8 | m[3]);
 	if (t->writing && opcode == TFTP_DATA) {
@@ -5421,6 +5423,31 @@ tftp_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 			t = &tftp_transfers[i];
 		}
 	}
+	/*
+	 * None free: the one the modem has said nothing to for longest, if that is more than 5 s, is taken back. A
+	 * transfer ends only at its last block or an error, and the modem may give one up half way or ask again
+	 * before our answer reaches it; four such and every later request was refused for the rest of the run
+	 * (1016 times one boot: "server_check.txt"), the Wi-Fi's firmware (wlanmdsp.mbn) among them, so wlan_pd
+	 * never started.
+	 */
+	if (t == NULL) {
+		struct tftp_transfer *idle = NULL;
+		uint64_t now = now_us();
+
+		for (unsigned i = 0; i < sizeof(tftp_transfers) / sizeof(tftp_transfers[0]); i++) {
+			if (idle == NULL || tftp_transfers[i].active_us < idle->active_us) {
+				idle = &tftp_transfers[i];
+			}
+		}
+		if (idle != NULL && now - idle->active_us > 5000000ull) {
+			printf("mpss: tftp: \"%s\" said nothing for %llu ms: taken back for \"%s\"\n", idle->name,
+			    (now - idle->active_us) / 1000, name);
+			tftp_transfer_end(idle);
+			idle->port = NULL;
+			tftp_reclaimed++;
+			t = idle;
+		}
+	}
 	if (t == NULL) {
 		printf("mpss: tftp: the modem %s \"%s\": NO FREE TRANSFER\n", writing ? "writes" : "reads", name);
 		tftp_error(tftp_port, node, port, TFTP_ENOENT, "busy");
@@ -5438,6 +5465,7 @@ tftp_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 		}
 		t->node = node;
 		t->peer = port;
+		t->active_us = now_us();
 		t->writing = true;
 		t->expected = 1;
 		t->blksize = blksize;
@@ -5498,6 +5526,7 @@ tftp_receive(__unused void *context, uint32_t node, uint32_t port, const void *d
 	}
 	t->node = node;
 	t->peer = port;
+	t->active_us = now_us();
 	t->data = file;
 	t->size = size;
 	t->blksize = blksize;
