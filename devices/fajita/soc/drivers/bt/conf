@@ -1,0 +1,5 @@
+# soc/drivers/bt/conf: the SDM845's WCN3990, its Bluetooth half (a UART on QUP0 SE6).
+
+driver BT6T
+	file    bsd/dev/hakios.bt6t.c
+	help    the WCN3990's Bluetooth: step one, a read-only look at its UART's pins, clocks and serial engine (bt6t=1)
