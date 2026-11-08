@@ -25,7 +25,7 @@ phone is here; the kernel, loader and user space are the common ones. `device.co
 | CPU clocks | the older OSM (`0x17d43000` small, `0x17d45800` big): big cores left at 825 MHz | EPSS | `hakios.cpufreq.c`'s `cpufreq_osm=2` |
 | Temperatures | tsens v2, 21 sensors (TM `0xc263000`, `0xc265000`) | | `hakios.thermal.c` (`thermal=1`), reading only |
 | GPU | Adreno 630 (chipid `0x6030001`) | Adreno 642L | `hakios.adreno.c`'s steps hold; registers, GMU firmware and RPMh levels are a630's (Linux `a6xx_gmu.c`, the a630 paths) |
-| Wi-Fi | WCN3990, `icnss` | WCN6750 | Linux's ath10k_snoc, not ath11k: a new back end |
+| Wi-Fi | WCN3990, `icnss`; its firmware a domain of the modem's (`wlan_pd`) | WCN6750 | Linux's ath10k_snoc on the LinuxKPI layer redwood's ath11k uses (`tools/mk-ath10k.sh`, `wifi/lx/ath10k/`, the kernel built `ATH=ath10k`); joins WPA2 and carries iOS's traffic (step 11) |
 | Audio | ADSP (TrustZone PAS 1, 26 MB at `0x8c500000`), Q6 APR; the loudspeaker a TFA9894 on QUAT MI2S; WCD934x "tavil" on SLIMbus for the rest | ADSP; AW88261s on TDM | rework of `hakios.adsp.c` / `hakios.sound.c`, a TFA9894 driver (step 10) |
 | Battery, charging | PMI8998 (fuel gauge, SMB2) | through the ADSP | through the loader from UEFI, as redwood's first way was, but with other protocols (step 7) |
 | Haptics | PMI8998 haptics block (slave 3, peripheral `0xc0`), an LRA | Awinic AW86927 on I2C | `hakios.pmi_haptics.c` (`pmi_haptics=4`), through the PMIC arbiter; Darwin's side is redwood's (`/dev/hakios-haptic`) |
@@ -53,6 +53,15 @@ gives the phone back to Android. Before the first one, back up `persist`, `modem
 "fixup value out of range" there, with or without this port): `sudo apt install clang-15 lld-15` and put
 `/usr/lib/llvm-15/bin` first on `PATH`. The kernel (`make kernel`) and the Darwin images (`make fetch images`) as in the main
 README; check them in QEMU (`make qemu`) before the phone.
+
+On a newer Ubuntu (25.04 on 7 November 2026) a few more are needed: `bison flex uuid-dev lld lz4` for the kernel's
+host tools; the build calls `clang`, `llvm-objcopy`, `llvm-nm`, `llvm-size` (and `llvm-ar`, `-as`, `-dis`, `-ranlib`,
+`-strip`) and `python` by those names, so link them from `/usr/lib/llvm-15/bin` and to `python3` somewhere on `PATH`
+(`~/.local/bin`); and Python 3.11 for the venvs is not packaged there: `pipx install uv && uv python install 3.11`.
+After moving the tree to another machine or home directory, the build's own records still name the old paths:
+`git worktree repair`, re-point absolute symlinks, recreate the venvs, and build the kernel clean (move
+`xnu-src/*/BUILD` and `xnu-deps/build/ath10k/obj` aside): `mk-ath10k.sh` takes an object whose `.d` names missing
+files as up to date, so edits were silently not compiled.
 
 **2. The UEFI alone.**
 
@@ -110,8 +119,10 @@ intid 19, not the architecture's 27, and without it the kernel gets one tick and
 (this driver sends no reply after a receive of 29696 bytes or more), and `userland/build.sh` sets `umask 022`
 (launchd refuses SpringBoard's plist when its group may write it).
 These and everything after are now in the configuration (`configs/fajita.config`) -- `cpus=8 bootcpu=7 soc_vtimer=19 cpufreq_osm=2 thermal=1
-buttons=2 battery=1 pmi_haptics=4 synaptics=3 slider=3 adsp=1 sound=4` and the audio's `soc_*` -- so `DEVICE=fajita ./xl run` is enough (`XL_CMDLINE="-v cpus=1"`,
-`synaptics=0` and the like still win over them).
+buttons=2 battery=1 pmi_haptics=4 synaptics=3 slider=3 adsp=1 sound=4`, the audio's `soc_*`, and since 8 November the
+modem (`modem=1` and its regions) and the Wi-Fi (`wifi6t=1 wifi_join=1`) beside the GPU and the audio -- so
+`DEVICE=fajita ./xl run` is enough (`XL_CMDLINE="-v cpus=1"`, `synaptics=0` and the like still win over them;
+`make fajita_defconfig` after changing the configuration). The line is 953 of XNU's 1023 characters.
 
 The home screen takes a while, and runs shorter than about 2 minutes end before it: the screen shows the Apple
 logo with the boot's text over it until SpringBoard checks in. That wait is SpringBoard's Control Center
@@ -622,7 +633,31 @@ Then, with `slim=3` (and `adsp_listen=5`: the DSP's hello once took more than a 
 
 Every run needs `xl ramdisk-flash system_a` first: the loader keeps the system image only for one run.
 
-**11. Then** Wi-Fi; cellular last.
+**11. Wi-Fi** (done 8 November 2026). The WCN3990's firmware runs in the modem's `wlan_pd`, so the Wi-Fi needs the
+modem (step 12) up to step 10: once it announces the WLFW service (69), `hakios.wifi6t.c` starts Linux's ath10k
+(snoc and QMI back end, unmodified: `tools/mk-ath10k.sh` builds it on redwood's LinuxKPI tree, run
+`tools/mk-ath11k.sh` first on a fresh machine; then the kernel with `ATH=ath10k tools/make-kernel.sh`). The radio's
+stream (`0x40`) goes through context 5 of the apps SMMU (bypass is refused by the hypervisor), its copy engines at
+`0x18800000`, interrupts SPI 414-425. Files, none in the repository: `fw-wifi/ath10k-wcn3990-firmware-5.bin` (linux-firmware's
+60-byte feature table; the firmware itself is the modem's, `bdwlan.bin` from its image), `fw-wifi/network` (the
+network's name on the first line, its WPA2 passphrase on the second; `userland/build.sh` puts it into the small image,
+`SHARE=1` leaves it out) and `fw-wifi/mac` (the radio's address, one line, e.g. a locally administered one: the
+phone's own is not readable without root and `persist`'s `wlan_mac.bin` is empty; without it a new one each boot).
+
+What it took, each found in a run's log: the scan waited for `ATH10K_SNOC_FLAG_REGISTERED`, which only says the
+register work is queued -- it now waits for `ATH10K_FLAG_CORE_REGISTERED`; the glue's NAPI lost a schedule that came
+while a poll ran (Linux's `NAPIF_STATE_MISSED`), so the firmware's answer to the HTT connect lay in copy engine 2 with
+its interrupt come and gone (`lx_snoc.c` logs every engine's ring indices and each interrupt's count when the bus
+stops, which showed it); ath10k on this chip has no Ethernet frame mode, so `lx_80211.c` makes the 802.11 data header
+itself, and marks it protected once the key is set (ath10k has the firmware cipher only what is marked: unmarked,
+every frame after the handshake went out in the clear and the access point dropped it -- DHCP discovers acknowledged
+on the air, no offer); ath10k's per-frame debugging is cleared once it is registered (`wifi_debug=1` keeps it).
+
+Where it stands (run 080135, `RC_JOBS=rc.jobs.net`): authenticated, associated, the four-way handshake and the group's
+rekeys, DHCP from the access point, DNS, TCP and HTTPS (`net_test`: example.com and Apple's success page, 200), 28 MB
+in; with the GPU and the audio on (run 082014) Safari loads pages over it. A wrong passphrase shows as our message 2
+acknowledged on the air and message 1 again, then deauthentication reason 15. Not done: 40 MHz and wider, power
+saving, roaming, Wi-Fi without the modem.
 
 **12. The modem** (started 31 October 2026). Backed up first, read only through the loader (`xl flash-read`, from a
 fresh loader: with the system image resident the uploads come back empty): `modemst1`, `modemst2`, `fsg` (2 MB each;
@@ -660,8 +695,11 @@ refused), though the SIM works in another phone: an APN or network-side question
 the IOKit registry as an Ethernet interface (`HakiosEthernetStart()`, beside the Wi-Fi's), and Darwin configures it:
 with `cell_fake=1` (en1 at start with a made-up session, no modem) configd asked DHCP on it, took 10.64.0.2 and the
 router, and routed its traffic out through it (run 2 November, 171 packets, dropped for want of a modem behind). Keep `thermal` and
-`bootcpu` in the configuration for modem runs: without them the modem stays offline. A run (the line must fit XNU's 1023
-characters: xl refuses one that does not):
+`bootcpu` in the configuration for modem runs: without them the modem stays offline. Since 8 November the configuration
+starts the modem on every run (`modem=1`: all the steps on a thread of their own, kept, no pauses), beside the GPU and
+the audio: the `gpu=0 adsp=0 sound=0` and the `XL_DROP` below were for the first runs (the GPU's hand-over stalled the
+modem's thread before `modem_pause=0`, and the line held 607 characters then). To go step by step instead (the line
+must fit XNU's 1023 characters: xl refuses one that does not):
 
 ```sh
 XL_DROP="soc_sound_port soc_sound_clock soc_sound_bits soc_audio_stream soc_adsp_mem soc_adsp_mem_size soc_adsp_cx soc_gpu adreno_speed battery pmi_haptics slider" \
