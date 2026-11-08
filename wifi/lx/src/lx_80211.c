@@ -489,6 +489,8 @@ linuxkpi_ieee80211_handle_wake_tx_queue(struct ieee80211_hw *hw, struct ieee8021
  * of 24 bytes, or at 12 in an Ethernet frame): whether our message 2 reached the access point is what tells a
  * wrong passphrase (it came, and the AP asks again) from a frame that never got there.
  */
+static unsigned dhcp_type(const uint8_t *ip, unsigned length);
+
 static void
 sent_status(struct ieee80211_hw *hw, struct sk_buff *skb, const struct ieee80211_tx_info *info)
 {
@@ -505,6 +507,10 @@ sent_status(struct ieee80211_hw *hw, struct sk_buff *skb, const struct ieee80211
 		radio->acked++;
 	} else {
 		radio->unacked++;
+	}
+	if (skb->len >= 32 + 20 && (f[0] & 0x0c) == 0x08 && f[24] == 0xaa && f[30] == 0x08 && f[31] == 0x00 &&
+	    dhcp_type(f + 32, skb->len - 32) != 0) {
+		lx_tell("lx: DHCP: our frame was %s by the access point\n", ack ? "ACKNOWLEDGED" : "NOT acknowledged");
 	}
 	if (eapol) {
 		if (ack) {
@@ -769,6 +775,59 @@ management(struct lx_radio *radio, uint8_t *frame, unsigned kind)
 	return (frame + 24);
 }
 
+/*
+ * DHCP as it passes (not with wifi_quiet): an IPv4 packet at `ip`,
+ * of `length` bytes, that is UDP between ports 67 and 68 is told with its message type (option 53: 1 discover,
+ * 2 offer, 3 request, 5 ack, 6 nak) -- no addresses. Returns the type, 0 if it is not DHCP.
+ */
+static unsigned
+dhcp_type(const uint8_t *ip, unsigned length)
+{
+	unsigned header, at;
+
+	if (length < 20 || (ip[0] >> 4) != 4 || ip[9] != 17) {
+		return (0);
+	}
+	header = (ip[0] & 0x0f) * 4u;
+	if (length < header + 8 + 240) {
+		return (0);
+	}
+	{
+		const uint8_t *udp = ip + header;
+		unsigned from = udp[0] << 8 | udp[1], to = udp[2] << 8 | udp[3];
+
+		if (!((from == 67 || from == 68) && (to == 67 || to == 68))) {
+			return (0);
+		}
+		for (at = header + 8 + 240; at + 2 < length && ip[at] != 255;) {
+			if (ip[at] == 0) {
+				at++;
+				continue;
+			}
+			if (ip[at] == 53 && ip[at + 1] >= 1) {
+				return (ip[at + 2]);
+			}
+			at += 2u + ip[at + 1];
+		}
+	}
+	return (0);
+}
+
+static void
+dhcp_tell(const char *what, const uint8_t *ip, unsigned length, bool broadcast)
+{
+	static unsigned told;
+	static const char *const names[] = { "?", "DISCOVER", "OFFER", "REQUEST", "DECLINE", "ACK", "NAK", "RELEASE", "INFORM" };
+	unsigned type = dhcp_type(ip, length);
+
+	if (type == 0 || told >= 40 || lx_os_option("wifi_quiet")) {
+		return;
+	}
+	told++;
+	lx_tell("lx: DHCP %s %s (%u bytes of IP, %s)\n", what, type < 9 ? names[type] : "?", length,
+	    broadcast ? "to everybody" : "to one");
+}
+
 /* An Ethernet frame, through the driver's data path: the firmware makes 802.11 of it, and ciphers it once there is a key. */
 static bool
 ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length)
@@ -788,12 +847,22 @@ ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 		radio->sent_lost++;
 		return (false);
 	}
+	if (frame[12] == 0x08 && frame[13] == 0x00) {
+		dhcp_tell("goes out:", frame + 14, length - 14, (frame[0] & 1) != 0);
+	}
 	if (native) {
 		static const uint8_t llc_snap[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
 
 		bzero(bytes, 24);
 		bytes[0] = 0x08;			/* data */
-		bytes[1] = 0x01;			/* to the distribution system */
+		/*
+		 * To the distribution system; and protected once our key with the access point is the driver's, as mac80211
+		 * marks every data frame then: ath10k has the firmware cipher only what is marked (mac.c:
+		 * ath10k_tx_h_use_hwcrypto()), and leaves the room for the CCMP header to it (no GENERATE_IV/PUT_IV_SPACE).
+		 * Unmarked, the frames went out in the clear and the access point dropped them: 16 DHCP discovers, each
+		 * acknowledged on the air, no offer.
+		 */
+		bytes[1] = (uint8_t)(0x01 | (radio->pairwise_key != NULL ? 0x40 : 0));
 		memcpy(bytes + 4, radio->target.address, ETH_ALEN);
 		memcpy(bytes + 10, radio->vif->addr, ETH_ALEN);
 		memcpy(bytes + 16, frame, ETH_ALEN);
@@ -895,6 +964,9 @@ ethernet_received(struct lx_radio *radio, struct sk_buff *skb)
 	if (skb->len >= 14 && skb->data[12] == 0x88 && skb->data[13] == 0x8e) {
 		handshake_message(radio, skb->data, skb->len);
 	} else if (radio->joined && skb->len >= 14) {
+		if (skb->data[12] == 0x08 && skb->data[13] == 0x00) {
+			dhcp_tell("comes in:", skb->data + 14, skb->len - 14, (skb->data[0] & 1) != 0);
+		}
 		*(skb->data[0] & 1 ? &radio->received_group : &radio->received) += 1;
 		lx_os_net_input(skb->data, skb->len);
 	}
