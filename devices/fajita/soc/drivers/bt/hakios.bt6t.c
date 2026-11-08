@@ -30,8 +30,11 @@
  *   bt6t=1        the look
  *   bt6t=2        the UART's clock and pins set, then the look at the engine
  *   bt6t=3        and the engine as a UART, the WCN3990's power pulses, and its version asked for (HCI)
+ *   bt6t=4        and its firmware (fw/crbtfw21.tlv, fw/crnv21.bin of the small image), HCI_Reset, its address, an inquiry
  */
 #include <kern/startup.h>
+#include <kern/thread_call.h>
+#include <kern/thread.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
@@ -228,6 +231,7 @@ uart_clock_and_pins(void)
 #define SE_DMA_RX_IRQ_CLR       0xd44
 #define SE_GSI_EVENT_EN         0xe18
 #define SE_IRQ_EN               0xe1c
+#define SE_GENI_IOS             0x908
 #define SE_HW_PARAM_0           0xe24
 #define SE_HW_PARAM_1           0xe28
 #define SE_DMA_GENERAL_CFG      0xe30
@@ -303,23 +307,43 @@ uart_write(const uint8_t *bytes, uint32_t length)
 	return true;
 }
 
-/* What has come in, up to `size` bytes, within `us`; the count. */
+/*
+ * What has come in, up to `size` bytes, within `us`; the count. The RX FIFO gives words of four bytes: what a read does
+ * not take of a word is kept for the next (a read of one byte used to drop the other three -- every event read a byte at
+ * a time came out as a byte of every fourth, and looked like no answer at all: runs 154612 to 160629).
+ */
+static uint8_t rx_kept[4 * 64];
+static uint32_t rx_kept_at, rx_kept_count;
+
 static uint32_t
 uart_read(uint8_t *bytes, uint32_t size, uint32_t us)
 {
 	uint32_t got = 0;
 
 	for (uint32_t t = 0; t <= us && got < size; t += 100) {
-		uint32_t status = rd(se6 + SE_GENI_RX_FIFO_STATUS), words = status & 0x01ffffffu;
+		uint32_t status, words;
 
-		for (uint32_t w = 0; w < words && got < size; w++) {
+		while (got < size && rx_kept_count != 0) {
+			bytes[got++] = rx_kept[rx_kept_at++];
+			rx_kept_count--;
+		}
+		if (got == size) {
+			break;
+		}
+		rx_kept_at = 0;
+		status = rd(se6 + SE_GENI_RX_FIFO_STATUS);
+		words = status & 0x01ffffffu;
+		if (words > sizeof(rx_kept) / 4) {
+			words = sizeof(rx_kept) / 4;
+		}
+		for (uint32_t w = 0; w < words; w++) {
 			uint32_t word = rd(se6 + SE_GENI_RX_FIFOn), n = 4;
 
 			if (w == words - 1 && (status & (1u << 31)) && ((status >> 28) & 7) != 0) {
 				n = (status >> 28) & 7;                     /* RX_LAST: a last word only partly filled */
 			}
-			for (uint32_t b = 0; b < n && got < size; b++) {
-				bytes[got++] = (uint8_t)(word >> (8 * b));
+			for (uint32_t b = 0; b < n; b++) {
+				rx_kept[rx_kept_count++] = (uint8_t)(word >> (8 * b));
 			}
 		}
 		if (words == 0) {
@@ -377,7 +401,525 @@ uart_setup(void)
 	return true;
 }
 
+extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern void *rootvnode;
+
+static uint32_t bt_level;
+static thread_call_t later;
+
+/* Bytes as hex into a line, at most `max` of them. */
 static void
+hex_line(char *line, size_t size, const uint8_t *bytes, uint32_t count, uint32_t max)
+{
+	line[0] = 0;
+	for (uint32_t i = 0; i < count && i < max && 3 * i + 4 < size; i++) {
+		snprintf(line + 3 * i, size - 3 * i, "%02x ", bytes[i]);
+	}
+}
+
+/*
+ * Qualcomm's in-band sleep (hci_qca.c, HCI_IBS_*): single bytes between the H4 packets. The controller says 0xfe when
+ * it goes to sleep, and takes no command then until it is sent 0xfd and has answered 0xfc; when it has something to
+ * send it says 0xfd first and waits for 0xfc. It runs on the ROM already: the controller answered the version request
+ * and then neither HCI_Reset nor the rampatch's last segment (runs 155555, 155906) -- asleep, and waiting to be
+ * answered.
+ */
+#define IBS_SLEEP_IND           0xfe
+#define IBS_WAKE_IND            0xfd
+#define IBS_WAKE_ACK            0xfc
+
+static bool ibs_asleep, ibs_acked;
+static uint32_t ibs_sleeps, ibs_wakes_ours, ibs_wakes_theirs, ibs_acks;
+
+/* A byte outside a packet: in-band sleep's, or not (returns false: junk). */
+static bool
+ibs_byte(uint8_t byte)
+{
+	static const uint8_t ack = IBS_WAKE_ACK;
+
+	switch (byte) {
+	case IBS_SLEEP_IND:
+		ibs_asleep = true;
+		ibs_sleeps++;
+		return true;
+	case IBS_WAKE_IND:
+		ibs_wakes_theirs++;
+		uart_write(&ack, 1);
+		ibs_asleep = false;
+		return true;
+	case IBS_WAKE_ACK:
+		ibs_acked = true;
+		ibs_acks++;
+		ibs_asleep = false;
+		return true;
+	}
+	return false;
+}
+
+/* The controller woken if it said it sleeps: 0xfd until it answers 0xfc (100 ms, three times). */
+static bool
+ibs_wake(void)
+{
+	static const uint8_t wake = IBS_WAKE_IND;
+
+	if (!ibs_asleep) {
+		return true;
+	}
+	for (int tries = 0; tries < 3; tries++) {
+		ibs_acked = false;
+		ibs_wakes_ours++;
+		uart_write(&wake, 1);
+		for (uint32_t t = 0; t < 100000 && !ibs_acked; t += 100) {
+			uint8_t byte;
+
+			if (uart_read(&byte, 1, 0) == 1) {
+				ibs_byte(byte);
+			} else {
+				delay(100);
+			}
+		}
+		if (ibs_acked) {
+			return true;
+		}
+	}
+	say("bt6t: the controller does not wake (0xfd sent three times, no 0xfc)\n");
+	return false;
+}
+
+/* Sends an H4 command (01, opcode, length, parameters), waking the controller first if it sleeps. */
+static bool
+hci_command(uint16_t opcode, const uint8_t *parameters, uint8_t length)
+{
+	static uint8_t packet[4 + 255];
+	uint8_t pending[16];
+	uint32_t n;
+
+	/* (what has come since, first: a 0xfe still in the FIFO says the controller sleeps) */
+	while ((n = uart_read(pending, sizeof(pending), 0)) != 0) {
+		for (uint32_t b = 0; b < n; b++) {
+			ibs_byte(pending[b]);
+		}
+	}
+	if (!ibs_wake()) {
+		return false;
+	}
+
+	packet[0] = 0x01;
+	packet[1] = (uint8_t)opcode;
+	packet[2] = (uint8_t)(opcode >> 8);
+	packet[3] = length;
+	memcpy(packet + 4, parameters, length);
+	return uart_write(packet, 4u + length);
+}
+
+/*
+ * One H4 event, read whole (04, code, length, parameters) within `us`: the bytes into `event`, the count returned (0:
+ * nothing, or not an event). Bytes before an 04 are dropped and counted in *junk.
+ */
+static uint32_t
+hci_event(uint8_t *event, uint32_t size, uint32_t us, uint32_t *junk)
+{
+	uint32_t got = 0, need = 3;
+	uint64_t spent = 0;
+
+	while (got < need && spent <= us) {
+		uint32_t n = uart_read(event + got, 1, 0);
+
+		if (n == 0) {
+			delay(50);
+			spent += 50;
+			continue;
+		}
+		if (got == 0 && event[0] != 0x04) {
+			if (!ibs_byte(event[0]) && junk != NULL) {
+				(*junk)++;
+			}
+			continue;
+		}
+		got++;
+		if (got == 3) {
+			need = 3u + event[2];
+			if (need > size) {
+				return 0;
+			}
+		}
+	}
+	return got == need ? got : 0;
+}
+
+/* A command and its Command Complete (04 0e len ncmd opcode-lo opcode-hi status ...); the status, or -1. */
+static int
+hci_command_complete(uint16_t opcode, const uint8_t *parameters, uint8_t length, uint8_t *event, uint32_t size, uint32_t us)
+{
+	if (!hci_command(opcode, parameters, length)) {
+		return -1;
+	}
+	for (int tries = 0; tries < 8; tries++) {
+		uint32_t got = hci_event(event, size, us, NULL);
+
+		if (got == 0) {
+			return -1;
+		}
+		if (got >= 7 && event[1] == 0x0e && (event[4] | event[5] << 8) == opcode) {
+			return event[6];
+		}
+	}
+	return -1;
+}
+
+/*
+ * A firmware file into the controller as btqca.c qca_download_firmware() sends it: 243-byte segments, each the vendor
+ * command 0xfc00 with EDL_PATCH_TLV_REQ_CMD 0x1e and the segment's length; in download mode 0 every segment is answered
+ * with a vendor event 04 ff 03 00 04 <result> (EDL_TVL_DNLD_RES_EVT), in modes 1 and 3 (skip the VSE / the VSE and the
+ * Command Complete) only the last segment is.
+ */
+static bool
+tlv_download(const char *what, const uint8_t *data, uint32_t size, uint8_t mode)
+{
+	static uint8_t segment[2 + 243];
+	uint8_t event[64];
+	uint32_t sent = 0, segments = 0, acked = 0, junk = 0, ccs = 0;
+	uint64_t began = mach_absolute_time(), ns;
+
+	while (sent < size) {
+		uint32_t n = size - sent < 243 ? size - sent : 243;
+		bool last = sent + n == size || n < 243;
+
+		segment[0] = 0x1e;
+		segment[1] = (uint8_t)n;
+		memcpy(segment + 2, data + sent, n);
+		if (!hci_command(0xfc00, segment, (uint8_t)(2 + n))) {
+			say("bt6t: %s: segment %u could not be sent\n", what, segments);
+			return false;
+		}
+		segments++;
+		sent += n;
+		if (mode == 0 || last) {
+			uint32_t got = hci_event(event, sizeof(event), 10000000, &junk);    /* (HCI_INIT_TIMEOUT: 10 s) */
+
+			/* (mode 0: the vendor event and the Command Complete of 0xfc00, 04 0e 04 01 00 fc 00, in either order) */
+			for (int more = 0; more < 4 && got >= 6 && event[1] == 0x0e && event[4] == 0x00 && event[5] == 0xfc; more++) {
+				ccs++;
+				got = hci_event(event, sizeof(event), 10000000, &junk);
+			}
+			if (got < 6 || event[1] != 0xff || event[3] != 0x00 || event[4] != 0x04) {
+				char line[3 * 16 + 1];
+
+				hex_line(line, sizeof(line), event, got, 16);
+				absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+				say("bt6t: %s: segment %u (%u of %u bytes) NOT ANSWERED as expected: %u bytes: %s (%u stray bytes before; "
+				    "%llu ms since the first segment, ~%llu ms the bytes need at 115200)\n", what, segments, sent, size, got,
+				    got ? line : "(nothing in 10 s)", junk, ns / 1000000, (uint64_t)sent * 10 * 1000 / 115200);
+				/* (and what follows, raw: lost bytes or a different event?) */
+				got = uart_read(event, 32, 200000);
+				hex_line(line, sizeof(line), event, got, 16);
+				say("bt6t: %s: then, raw in 200 ms: %u bytes: %s (%u Command Completes skipped before)\n", what, got,
+				    got ? line : "(nothing)", ccs);
+				return false;
+			}
+			if (event[5] != 0) {
+				say("bt6t: %s: segment %u: THE CONTROLLER REFUSES IT (result 0x%02x)\n", what, segments, event[5]);
+				return false;
+			}
+			acked++;
+			/* (its Command Complete, when it comes after: read now, not drained half-way by the next command) */
+			if (mode == 0 && !last) {
+				uint8_t cc[16];
+				uint32_t n = hci_event(cc, sizeof(cc), 100000, &junk);
+
+				if (n >= 6 && cc[1] == 0x0e && cc[4] == 0x00 && cc[5] == 0xfc) {
+					ccs++;
+				} else if (n != 0) {
+					static bool told;
+					char line[3 * 16 + 1];
+
+					if (!told) {
+						told = true;
+						hex_line(line, sizeof(line), cc, n, 16);
+						say("bt6t: %s: after an answer, another event: %s\n", what, line);
+					}
+					junk += n;
+				}
+			}
+		} else {
+			/* (nothing is to come but in-band sleep's bytes: read off, answered, the rest counted) */
+			uint8_t drop[16];
+			uint32_t n = uart_read(drop, sizeof(drop), 0);
+
+			for (uint32_t b = 0; b < n; b++) {
+				if (!ibs_byte(drop[b])) {
+					junk++;
+				}
+			}
+		}
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	say("bt6t: %s: %u bytes in %u segments (download mode %u), %u answered (%u Command Completes too), all well; %u stray "
+	    "bytes; %llu ms; in-band sleep so far: %u sleeps, %u wakes by us, %u by it, %u acks\n", what, size, segments, mode,
+	    acked, ccs, junk, ns / 1000000,
+	    ibs_sleeps, ibs_wakes_ours, ibs_wakes_theirs, ibs_acks);
+	return true;
+}
+
+/*
+ * The NVM's tags edited as this side can stand them (btqca.c qca_tlv_check_data() edits them for Linux, which runs
+ * the in-band sleep protocol): tag 17 (EDL_TAG_ID_HCI) byte 0 bit 7 off -- no in-band sleep, which this driver does
+ * not speak -- and byte 2, the UART rate the controller goes to, 0 (QCA_BAUDRATE_115200; the file's is 0x11,
+ * 3.2 Mbit/s); tag 27 (EDL_TAG_ID_DEEP_SLEEP) 0. Type 4 wraps a type 2 set of tags (12-byte tag headers).
+ */
+static void
+nvm_edit(uint8_t *nvm, uint32_t size)
+{
+	uint32_t at = 0, type_len, length;
+
+	if (size < 8) {
+		return;
+	}
+	type_len = nvm[0] | nvm[1] << 8 | nvm[2] << 16 | (uint32_t)nvm[3] << 24;
+	if ((type_len & 0xff) == 4) {
+		at = 4;
+		type_len = nvm[4] | nvm[5] << 8 | nvm[6] << 16 | (uint32_t)nvm[7] << 24;
+	}
+	if ((type_len & 0xff) != 2) {
+		say("bt6t: the NVM's tags are not of type 2 (0x%x): left as they are\n", type_len & 0xff);
+		return;
+	}
+	length = type_len >> 8;
+	at += 4;
+	for (uint32_t i = 0; i + 12 <= length && at + i + 12 <= size;) {
+		uint8_t *tag = nvm + at + i;
+		uint16_t id = tag[0] | tag[1] << 8, tag_length = tag[2] | tag[3] << 8;
+
+		if (at + i + 12 + tag_length > size) {
+			break;
+		}
+		if (id == 17 && tag_length >= 3) {
+			say("bt6t: NVM tag 17 (HCI): %02x %02x %02x -> %02x %02x 00 (no in-band sleep, 115200)\n", tag[12], tag[13],
+			    tag[14], tag[12] & 0x7f, tag[13]);
+			tag[12] &= 0x7f;
+			tag[14] = 0;
+		} else if (id == 27 && tag_length >= 1) {
+			say("bt6t: NVM tag 27 (deep sleep): %02x -> 00\n", tag[12]);
+			tag[12] = 0;
+		} else if (id == 2 && tag_length == 6) {
+			say("bt6t: NVM tag 2 (the address it gives itself): %02x:%02x:%02x:%02x:%02x:%02x\n", tag[17], tag[16], tag[15],
+			    tag[14], tag[13], tag[12]);
+		}
+		i += 12u + tag_length;
+	}
+}
+
+/* (the file stays hakios.image.c's: it keeps one copy per file for every caller, so it is never given back here) */
+static const uint8_t *
+wait_file(const char *name, uint64_t *size)
+{
+	for (int i = 0; i < 120; i++) {
+		const uint8_t *data = hakios_image_file("fw", name, size, NULL);
+
+		if (data != NULL) {
+			return data;
+		}
+		delay(500000);
+	}
+	return NULL;
+}
+
+/*
+ * Level 4: btqca.c qca_uart_setup() for the WCN3990 at ROM 2.1, at 115200: the rampatch crbtfw21.tlv (its download
+ * mode is in its header), 10 ms, the NVM crnv21.bin (edited, every segment answered), HCI_Reset; then
+ * HCI_Read_Local_Version_Information and HCI_Read_BD_ADDR, and a classic inquiry of 10 s (GIAC 9e8b33, 8 x 1.28 s):
+ * how many devices answer, and how strongly. Addresses of other people's devices are not written down whole.
+ */
+static void
+hci_firmware_and_scan(void)
+{
+	const uint8_t *file;
+	uint8_t *copy, event[260];
+	uint64_t size = 0;
+	int status;
+
+	/* (first: does a plain command get through (flow control off)? HCI_Reset on the ROM, answered by Command Complete) */
+	status = hci_command_complete(0x0c03, NULL, 0, event, sizeof(event), 3000000);
+	say("bt6t: HCI_Reset before the rampatch (ROM firmware): %s (status %d); in-band sleep so far: %u sleeps, %u wakes by us, "
+	    "%u by it, %u acks\n", status == 0 ? "DONE" : "NOT ANSWERED", status, ibs_sleeps, ibs_wakes_ours, ibs_wakes_theirs,
+	    ibs_acks);
+	file = wait_file("crbtfw21.tlv", &size);
+	if (file == NULL || size < 24) {
+		say("bt6t: no fw/crbtfw21.tlv in the small image (../fw-bt, userland/build.sh)\n");
+		return;
+	}
+	/* (struct tlv_type_hdr, then tlv_type_patch: total_size 4, data_length 4, format_version, signature, download_mode) */
+	if (!tlv_download("the rampatch crbtfw21.tlv", file, (uint32_t)size, file[14])) {
+		/* (alive and in step? the version request again, which the ROM answered before the rampatch) */
+		static const uint8_t version[] = { 0x19 };
+		uint32_t got, junk = 0;
+		char line[3 * 24 + 1];
+
+		hci_command(0xfc00, version, sizeof(version));
+		got = hci_event(event, sizeof(event), 2000000, &junk);
+		hex_line(line, sizeof(line), event, got, 24);
+		say("bt6t: after the rampatch, the version request again: %u bytes: %s (%u stray)\n", got,
+		    got ? line : "(nothing in 2 s: the controller is not listening, or not in step)", junk);
+		return;
+	}
+	delay(10000);
+	file = wait_file("crnv21.bin", &size);
+	if (file == NULL || size < 8) {
+		say("bt6t: no fw/crnv21.bin in the small image\n");
+		return;
+	}
+	copy = kalloc_data(size, Z_WAITOK);
+	if (copy == NULL) {
+		return;
+	}
+	memcpy(copy, file, size);
+	nvm_edit(copy, (uint32_t)size);
+	if (!tlv_download("the NVM crnv21.bin", copy, (uint32_t)size, 0)) {
+		kfree_data(copy, size);
+		return;
+	}
+	kfree_data(copy, size);
+	status = hci_command_complete(0x0c03, NULL, 0, event, sizeof(event), 3000000);
+	say("bt6t: HCI_Reset: %s (status %d)\n", status == 0 ? "DONE" : "FAILED", status);
+	if (status != 0) {
+		return;
+	}
+	status = hci_command_complete(0x1001, NULL, 0, event, sizeof(event), 1000000);
+	if (status == 0 && event[2] >= 9) {
+		say("bt6t: HCI_Read_Local_Version: HCI %u rev 0x%04x, LMP %u subversion 0x%04x, manufacturer %u (29: Qualcomm)\n",
+		    event[7], event[8] | event[9] << 8, event[10], event[13] | event[14] << 8, event[11] | event[12] << 8);
+	}
+	status = hci_command_complete(0x1009, NULL, 0, event, sizeof(event), 1000000);
+	if (status == 0 && event[2] >= 10) {
+		say("bt6t: HCI_Read_BD_ADDR: THE CONTROLLER IS %02x:%02x:%02x:%02x:%02x:%02x\n", event[12], event[11], event[10],
+		    event[9], event[8], event[7]);
+	}
+	{
+		static const uint8_t inquiry[] = { 0x33, 0x8b, 0x9e, 0x08, 0x00 };    /* GIAC, 8 x 1.28 s, no limit */
+		uint32_t results = 0, got, junk = 0;
+		int strongest = -128;
+		uint64_t start = mach_absolute_time(), ns = 0;
+
+		if (!hci_command(0x0401, inquiry, sizeof(inquiry))) {
+			return;
+		}
+		while (ns < 15000000000ull) {
+			got = hci_event(event, sizeof(event), 1000000, &junk);
+			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+			if (got == 0) {
+				continue;
+			}
+			if (event[1] == 0x0f) {
+				say("bt6t: HCI_Inquiry: command status 0x%02x\n", event[3]);
+			} else if (event[1] == 0x02 || event[1] == 0x22 || event[1] == 0x2f) {
+				/* Inquiry Result / with RSSI / Extended: address at +4 (the first response), RSSI per kind */
+				int rssi = event[1] == 0x02 ? 0 : (int8_t)event[1 + 2 + 1 + 6 + 1 + 1 + 3 + 2 + 1];
+
+				results++;
+				if (rssi > strongest && event[1] != 0x02) {
+					strongest = rssi;
+				}
+				say("bt6t: a device answers (event 0x%02x): xx:xx:xx:xx:%02x:%02x%s%d dBm\n", event[1], event[5], event[4],
+				    event[1] == 0x02 ? ", no RSSI in this kind" : ", ", event[1] == 0x02 ? 0 : rssi);
+			} else if (event[1] == 0x01) {
+				say("bt6t: HCI_Inquiry complete (status 0x%02x): %u answers%s\n", event[3], results,
+				    results ? "" : " -- nothing in Bluetooth range is discoverable, or the radio does not hear");
+				goto le;
+			}
+		}
+		say("bt6t: HCI_Inquiry: no Inquiry Complete within 15 s (%u answers)\n", results);
+	}
+le:
+	/*
+	 * A passive LE scan of 10 s: LE gadgets advertise all the time, so this says whether the radio hears at all. The
+	 * LE Meta event (bit 61) into the event mask first; then Set Scan Parameters (passive, 60 ms / 30 ms) and Scan
+	 * Enable (no duplicate filter). Advertisers are counted by address; addresses are not written down whole.
+	 */
+	{
+		static const uint8_t mask[] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0x1f, 0x00, 0x20 };
+		static const uint8_t parameters[] = { 0x00, 0x60, 0x00, 0x30, 0x00, 0x00, 0x00 };
+		static const uint8_t enable[] = { 0x01, 0x00 }, disable[] = { 0x00, 0x00 };
+		static uint8_t seen[64][6];
+		uint32_t heard = 0, reports = 0, junk = 0, got;
+		int strongest = -128, weakest = 127;
+		uint64_t start, ns = 0;
+
+		status = hci_command_complete(0x0c01, mask, sizeof(mask), event, sizeof(event), 1000000);
+		if (status == 0) {
+			status = hci_command_complete(0x200b, parameters, sizeof(parameters), event, sizeof(event), 1000000);
+		}
+		if (status == 0) {
+			status = hci_command_complete(0x200c, enable, sizeof(enable), event, sizeof(event), 1000000);
+		}
+		if (status != 0) {
+			say("bt6t: LE scan: not started (status %d)\n", status);
+			return;
+		}
+		start = mach_absolute_time();
+		while (ns < 10000000000ull) {
+			got = hci_event(event, sizeof(event), 500000, &junk);
+			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+			if (got < 15 || event[1] != 0x3e || event[3] != 0x02) {
+				continue;
+			}
+			/* (LE Advertising Report, the first of its reports: type, address type, address at +7, data length, data, RSSI) */
+			uint32_t data_length = event[13], k;
+			int rssi = 14u + data_length < got ? (int8_t)event[14 + data_length] : 0;
+
+			reports++;
+			if (rssi > strongest) {
+				strongest = rssi;
+			}
+			if (rssi < weakest) {
+				weakest = rssi;
+			}
+			for (k = 0; k < heard && memcmp(seen[k], event + 7, 6) != 0; k++) {
+			}
+			if (k == heard && heard < 64) {
+				memcpy(seen[heard++], event + 7, 6);
+				if (heard <= 6) {
+					say("bt6t: LE advertiser %u: xx:xx:xx:xx:%02x:%02x (address type %u), %d dBm\n", heard, event[8], event[7],
+					    event[6], rssi);
+				}
+			}
+		}
+		(void)hci_command_complete(0x200c, disable, sizeof(disable), event, sizeof(event), 1000000);
+		if (reports != 0) {
+			say("bt6t: LE scan of 10 s: THE RADIO HEARS: %u advertisers, %u reports, %d to %d dBm\n", heard, reports, weakest,
+			    strongest);
+		} else {
+			say("bt6t: LE scan of 10 s: nothing heard (%u stray bytes) -- the radio, or its antenna path, is not working\n",
+			    junk);
+		}
+	}
+}
+
+static bool hci_hello(void);
+
+/* The controller's bring-up on a thread of its own: it waits for the small image and takes some 30 s. */
+static void
+bt_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	if (hci_hello() && bt_level >= 4) {
+		hci_firmware_and_scan();
+	}
+	thread_terminate(current_thread());
+}
+
+/* (from a thread call, so that the thread is made once the scheduler runs: not at EARLY_BOOT) */
+static void
+bt_later(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	thread_t thread;
+
+	if (kernel_thread_start(bt_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	} else {
+		say("bt6t: no thread for the controller's bring-up\n");
+	}
+}
+
+static bool
 hci_hello(void)
 {
 	static const uint8_t off = 0xc0, on = 0xfc, version[] = { 0x01, 0x00, 0xfc, 0x01, 0x19 };
@@ -386,7 +928,7 @@ hci_hello(void)
 	char hex[3 * sizeof(answer) + 1];
 
 	if (!uart_setup()) {
-		return;
+		return false;
 	}
 	uart_baud(2400);
 	say("bt6t: the power-off pulse (0xc0 at 2400 baud): %s\n", uart_write(&off, 1) ? "sent" : "NOT SENT");
@@ -398,6 +940,13 @@ hci_hello(void)
 	if (got != 0) {
 		say("bt6t: %u bytes came in after the pulses (dropped)\n", got);
 	}
+	/*
+	 * No hardware flow control (hci_qca.c turns it on here): with TX waiting for CTS the controller answered nothing more
+	 * -- not even HCI_Reset -- and the rampatch's 217 KB took 57 s (run 155555); at 115200 it keeps up without. The
+	 * lines' levels, for when it is to be turned on (SE_GENI_IOS: bit 0 RX, bit 1 CTS).
+	 */
+	say("bt6t: SE_GENI_IOS after the pulses: 0x%08x (RX %u, CTS %u); flow control stays off\n", rd(se6 + SE_GENI_IOS),
+	    rd(se6 + SE_GENI_IOS) & 1, (rd(se6 + SE_GENI_IOS) >> 1) & 1);
 	say("bt6t: HCI 01 00 fc 01 19 (QCA: read the version): %s\n", uart_write(version, sizeof(version)) ? "sent" : "NOT SENT");
 	got = uart_read(answer, sizeof(answer), 1000000);
 	hex[0] = 0;
@@ -405,13 +954,21 @@ hci_hello(void)
 		snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x ", answer[i]);
 	}
 	say("bt6t: THE CONTROLLER ANSWERS %u bytes: %s\n", got, got ? hex : "(nothing in 1 s)");
-	if (got >= 17 && answer[0] == 0x04 && answer[1] == 0xff && answer[3] == 0x00 && answer[4] == 0x02) {
-		const uint8_t *v = answer + 5;
+	/* (the vendor event wherever it begins: a byte left from the pulses may come first) */
+	for (uint32_t at = 0; at + 17 <= got; at++) {
+		const uint8_t *v = answer + at + 5;
+
+		if (!(answer[at] == 0x04 && answer[at + 1] == 0xff && answer[at + 3] == 0x00 && answer[at + 4] == 0x02)) {
+			continue;
+		}
 
 		say("bt6t: THE WCN3990 IS UP: product id 0x%08x, patch version 0x%04x, ROM version 0x%04x, SoC id 0x%08x\n",
 		    v[0] | v[1] << 8 | v[2] << 16 | (uint32_t)v[3] << 24, v[4] | v[5] << 8, v[6] | v[7] << 8,
 		    v[8] | v[9] << 8 | v[10] << 16 | (uint32_t)v[11] << 24);
+		/* (the Command Complete that follows the vendor event, if it is in what came: read off already) */
+		return true;
 	}
+	return false;
 }
 
 __startup_func
@@ -424,10 +981,11 @@ bt6t_init(void)
 	if (!PE_parse_boot_argn("bt6t", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (level > 3) {
-		say("bt6t: bt6t=%u: only levels 1 to 3 are written so far: level 3\n", level);
-		level = 3;
+	if (level > 4) {
+		say("bt6t: bt6t=%u: only levels 1 to 4 are written so far: level 4\n", level);
+		level = 4;
 	}
+	bt_level = level;
 	tlmm = ml_io_map(TLMM_EAST_PHYS, TLMM_EAST_SIZE);
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
 	if (tlmm == 0 || gcc == 0) {
@@ -493,7 +1051,9 @@ bt6t_init(void)
 		say("bt6t: SE6 +0x%03x %s = 0x%08x\n", engine[i].offset, engine[i].what, rd(se6 + engine[i].offset));
 	}
 	if (level >= 3) {
-		hci_hello();
+		/* (on a thread: the firmware is a file of the small image, which is there only later, and its 217 KB take ~20 s) */
+		later = thread_call_allocate(bt_later, NULL);
+		thread_call_enter(later);
 	}
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, bt6t_init);

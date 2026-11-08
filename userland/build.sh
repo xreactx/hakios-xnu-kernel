@@ -489,6 +489,14 @@ if [ -f ../fw-wifi/ath10k-wcn3990-firmware-5.bin ]; then
 	mkdir -p root/fw
 	cp ../fw-wifi/ath10k-wcn3990-firmware-5.bin root/fw/
 fi
+# ... and the WCN3990's Bluetooth rampatch and NVM for its ROM 2.1 (devices/fajita/soc/drivers/bt/hakios.bt6t.c, bt6t=4),
+# out of the phone's bluetooth_b partition (FAT; xl flash-read bluetooth_b 0 100000, 7z x) into ../fw-bt/bt/image
+for f in crbtfw21.tlv crnv21.bin; do
+	if [ -f ../fw-bt/bt/image/$f ]; then
+		mkdir -p root/fw
+		cp ../fw-bt/bt/image/$f root/fw/
+	fi
+done
 # ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
 # (drivers/wifi/hakios.wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
