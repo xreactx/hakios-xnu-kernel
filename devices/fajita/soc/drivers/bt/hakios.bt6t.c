@@ -220,7 +220,9 @@ uart_clock_and_pins(void)
 #define SE_GENI_M_IRQ_CLEAR     0x618
 #define SE_GENI_S_CMD0          0x630
 #define SE_GENI_S_CMD_CTRL_REG  0x634
+#define SE_GENI_S_IRQ_STATUS    0x640
 #define SE_GENI_S_IRQ_CLEAR     0x648
+#define SE_UART_MANUAL_RFR      0x2ac
 #define SE_GENI_TX_FIFOn        0x700
 #define SE_GENI_RX_FIFOn        0x780
 #define SE_GENI_TX_FIFO_STATUS  0x800
@@ -314,6 +316,8 @@ uart_write(const uint8_t *bytes, uint32_t length)
  */
 static uint8_t rx_kept[4 * 64];
 static uint32_t rx_kept_at, rx_kept_count;
+static uint32_t debug_packets, other_packets;  /* (ACL on the firmware's debug handle 0x2edc; other ACL/SCO) */
+static uint32_t rx_overflows;                  /* (the RX FIFO full: bytes lost, events out of step after) */
 
 static uint32_t
 uart_read(uint8_t *bytes, uint32_t size, uint32_t us)
@@ -331,6 +335,10 @@ uart_read(uint8_t *bytes, uint32_t size, uint32_t us)
 			break;
 		}
 		rx_kept_at = 0;
+		if (rd(se6 + SE_GENI_S_IRQ_STATUS) & (1u << 25)) {    /* S_RX_FIFO_WR_ERR: bytes came to a full FIFO, and were lost */
+			rx_overflows++;
+			wr(se6 + SE_GENI_S_IRQ_CLEAR, 1u << 25);
+		}
 		status = rd(se6 + SE_GENI_RX_FIFO_STATUS);
 		words = status & 0x01ffffffu;
 		if (words > sizeof(rx_kept) / 4) {
@@ -525,6 +533,46 @@ hci_event(uint8_t *event, uint32_t size, uint32_t us, uint32_t *junk)
 		if (n == 0) {
 			delay(50);
 			spent += 50;
+			continue;
+		}
+		if (got == 0 && (event[0] == 0x02 || event[0] == 0x03)) {
+			/*
+			 * An ACL (02: handle 2, length 2) or SCO (03: handle 2, length 1) packet, read whole and passed over: the
+			 * QCA firmware sends its debug log as ACL on handle 0x2edc (hci_qca.c QCA_DEBUG_HANDLE). Searching for the
+			 * next 04 used to land inside one and read its bytes as events 0x89, 0xfa..0xfd (runs 163957 to 173252).
+			 */
+			uint8_t header[4], skip[64];
+			uint32_t header_length = event[0] == 0x02 ? 4 : 3, length, have = 0;
+			uint64_t waited = 0;
+
+			while (have < header_length && waited <= us) {
+				uint32_t n = uart_read(header + have, header_length - have, 0);
+
+				have += n;
+				if (n == 0) {
+					delay(50);
+					waited += 50;
+				}
+			}
+			if (have < header_length) {
+				return 0;
+			}
+			length = event[0] == 0x02 ? (uint32_t)(header[2] | header[3] << 8) : header[2];
+			if ((header[0] | (header[1] & 0x0f) << 8) == 0x2edc) {
+				debug_packets++;
+			} else {
+				other_packets++;
+			}
+			for (have = 0; have < length && waited <= us;) {
+				uint32_t want = length - have < sizeof(skip) ? length - have : sizeof(skip), n = uart_read(skip, want, 0);
+
+				have += n;
+				if (n == 0) {
+					delay(50);
+					waited += 50;
+				}
+			}
+			spent += waited;
 			continue;
 		}
 		if (got == 0 && event[0] != 0x04) {
@@ -739,6 +787,37 @@ wait_file(const char *name, uint64_t *size)
  * HCI_Read_Local_Version_Information and HCI_Read_BD_ADDR, and a classic inquiry of 10 s (GIAC 9e8b33, 8 x 1.28 s):
  * how many devices answer, and how strongly. Addresses of other people's devices are not written down whole.
  */
+/* bt6t_bdaddr=aa:bb:cc:dd:ee:ff (xl adds it from fw-bt/bdaddr) into HCI order: least significant octet first */
+static bool
+parse_bdaddr(uint8_t out[6])
+{
+	char text[32] = { 0 };
+	int octet = 5;
+	uint32_t value = 0, digits = 0;
+
+	if (!PE_parse_boot_argn("bt6t_bdaddr", text, sizeof(text))) {
+		return false;
+	}
+	for (const char *c = text;; c++) {
+		int v = *c >= '0' && *c <= '9' ? *c - '0' : *c >= 'a' && *c <= 'f' ? *c - 'a' + 10 :
+		    *c >= 'A' && *c <= 'F' ? *c - 'A' + 10 : -1;
+
+		if (v >= 0 && digits < 2) {
+			value = value << 4 | (uint32_t)v;
+			digits++;
+			continue;
+		}
+		if (digits != 2 || octet < 0 || (*c != ':' && *c != 0)) {
+			return false;
+		}
+		out[octet--] = (uint8_t)value;
+		value = digits = 0;
+		if (*c == 0) {
+			return octet == -1;
+		}
+	}
+}
+
 static void
 hci_firmware_and_scan(void)
 {
@@ -746,6 +825,8 @@ hci_firmware_and_scan(void)
 	uint8_t *copy, event[260];
 	uint64_t size = 0;
 	int status;
+	uint8_t bdaddr[6];
+	bool have_bdaddr = parse_bdaddr(bdaddr);
 
 	/* (first: does a plain command get through (flow control off)? HCI_Reset on the ROM, answered by Command Complete) */
 	status = hci_command_complete(0x0c03, NULL, 0, event, sizeof(event), 3000000);
@@ -793,6 +874,26 @@ hci_firmware_and_scan(void)
 	if (status != 0) {
 		return;
 	}
+	if (have_bdaddr) {
+		/* btqca.c qca_set_bdaddr(): EDL_WRITE_BD_ADDR 0xfc14, the address most significant octet first (swapped), answered by a
+		 * vendor event (and a Command Complete); the controller keeps it until it is reset or powered off */
+		uint32_t got, junk = 0, codes = 0;
+
+		uint8_t swapped[6];
+
+		for (int i = 0; i < 6; i++) {
+			swapped[i] = bdaddr[5 - i];             /* (qca_set_bdaddr() baswap()s: this command wants it the other way) */
+		}
+		if (hci_command(0xfc14, swapped, sizeof(swapped))) {
+			for (int i = 0; i < 4 && (got = hci_event(event, sizeof(event), 1000000, &junk)) != 0; i++) {
+				codes = codes << 8 | event[1];
+				if (event[1] == 0x0e && (event[4] | event[5] << 8) == 0xfc14) {
+					break;
+				}
+			}
+			say("bt6t: EDL_WRITE_BD_ADDR (the phone's own, ending :%02x): answered by event(s) 0x%x\n", bdaddr[0], codes);
+		}
+	}
 	status = hci_command_complete(0x1001, NULL, 0, event, sizeof(event), 1000000);
 	if (status == 0 && event[2] >= 9) {
 		say("bt6t: HCI_Read_Local_Version: HCI %u rev 0x%04x, LMP %u subversion 0x%04x, manufacturer %u (29: Qualcomm)\n",
@@ -800,8 +901,10 @@ hci_firmware_and_scan(void)
 	}
 	status = hci_command_complete(0x1009, NULL, 0, event, sizeof(event), 1000000);
 	if (status == 0 && event[2] >= 10) {
-		say("bt6t: HCI_Read_BD_ADDR: THE CONTROLLER IS %02x:%02x:%02x:%02x:%02x:%02x\n", event[12], event[11], event[10],
-		    event[9], event[8], event[7]);
+		/* (the phone's own address is not written down whole: only whether it took, and its last two octets) */
+		say("bt6t: HCI_Read_BD_ADDR: THE CONTROLLER IS xx:xx:xx:xx:%02x:%02x%s\n", event[8], event[7],
+		    !have_bdaddr ? " (no bt6t_bdaddr: the NVM's own)" : memcmp(event + 7, bdaddr, 6) == 0 ?
+		    " -- THE PHONE'S OWN ADDRESS (bt6t_bdaddr)" : " -- NOT bt6t_bdaddr: the write did not take");
 	}
 	{
 		static const uint8_t inquiry[] = { 0x33, 0x8b, 0x9e, 0x08, 0x00 };    /* GIAC, 8 x 1.28 s, no limit */
@@ -869,7 +972,8 @@ le:
 			char line[3 * 12 + 1];
 
 			hex_line(line, sizeof(line), event, 12, 12);
-			say("bt6t: LE scan: not started: %s gave %d (the last event read: %s)\n", step, status, line);
+			say("bt6t: LE scan: not started: %s gave %d (the last event read: %s); RX FIFO overflows so far: %u\n", step,
+			    status, line, rx_overflows);
 			return;
 		}
 		start = mach_absolute_time();
@@ -901,6 +1005,8 @@ le:
 			}
 		}
 		(void)hci_command_complete(0x200c, disable, sizeof(disable), event, sizeof(event), 1000000);
+		say("bt6t: RX FIFO overflows so far: %u; ACL packets passed over: %u of the firmware's debug log (0x2edc), %u "
+		    "other\n", rx_overflows, debug_packets, other_packets);
 		if (reports != 0) {
 			say("bt6t: LE scan of 10 s: THE RADIO HEARS: %u advertisers, %u reports, %d to %d dBm\n", heard, reports, weakest,
 			    strongest);
@@ -962,8 +1068,21 @@ hci_hello(void)
 	 * -- not even HCI_Reset -- and the rampatch's 217 KB took 57 s (run 155555); at 115200 it keeps up without. The
 	 * lines' levels, for when it is to be turned on (SE_GENI_IOS: bit 0 RX, bit 1 CTS).
 	 */
-	say("bt6t: SE_GENI_IOS after the pulses: 0x%08x (RX %u, CTS %u); flow control stays off\n", rd(se6 + SE_GENI_IOS),
-	    rd(se6 + SE_GENI_IOS) & 1, (rd(se6 + SE_GENI_IOS) >> 1) & 1);
+	/*
+	 * (that run was before uart_read() kept a word's other bytes, so it proved little.) What is on now is the RX half
+	 * only: RFR left to the hardware (SE_UART_MANUAL_RFR 0, deasserted at the RFR watermark, depth - 2 words), so the
+	 * controller holds off while this side is busy (logging) instead of the FIFO overflowing -- run 165530 lost bytes
+	 * and read events out of step after the inquiry. Our TX still ignores CTS. bt6t_rfr=0: RFR held ready, as before.
+	 */
+	{
+		uint32_t rfr = 1;
+
+		(void)PE_parse_boot_argn("bt6t_rfr", &rfr, sizeof(rfr));
+		wr(se6 + SE_UART_MANUAL_RFR, rfr ? 0 : (1u << 31));     /* (UART_MANUAL_RFR_EN, UART_RFR_READY 0) */
+		say("bt6t: SE_GENI_IOS after the pulses: 0x%08x (RX %u, CTS %u); RFR %s, our TX ignores CTS\n",
+		    rd(se6 + SE_GENI_IOS), rd(se6 + SE_GENI_IOS) & 1, (rd(se6 + SE_GENI_IOS) >> 1) & 1,
+		    rfr ? "BY THE HARDWARE (the controller held off when the FIFO fills)" : "held ready (bt6t_rfr=0)");
+	}
 	say("bt6t: HCI 01 00 fc 01 19 (QCA: read the version): %s\n", uart_write(version, sizeof(version)) ? "sent" : "NOT SENT");
 	got = uart_read(answer, sizeof(answer), 1000000);
 	hex[0] = 0;

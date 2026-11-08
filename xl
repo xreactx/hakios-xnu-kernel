@@ -225,6 +225,9 @@ run() { # run <oem command> <label>
 		# (redwood's wifi= and wifi_step=; the 6T's ath10k, wifi6t=, asks for it the same way: without it, a new one each boot)
 		*" wifi="*|*" wifi_step="*|*" wifi6t="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
 		esac
+		# (the 6T's Bluetooth, bt6t=4: the phone's own address, saved from Android -- settings get secure bluetooth_address --
+		# into fw-bt/bdaddr, which stays out of the repository; without it the controller keeps its NVM's 39:90:21:74:07:00)
+		case " $args " in *" bt6t="*) [ -s fw-bt/bdaddr ] && args="$args bt6t_bdaddr=$(tr -d ' \n\r' < fw-bt/bdaddr)" ;; esac
 		# The phone's own boot-args: the .config's (make fajita_defconfig; tools/hakios-config.py args), else
 		# devices/$DEVICE/run.args (words, # to the line's end a comment); each one unless XL_CMDLINE already has it by name
 		local device_args=devices/${DEVICE:-redwood}/run.args a words=
