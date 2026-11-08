@@ -4317,6 +4317,8 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
  * Called while the system starts, before there is a root file system. With wifi_step=N the start
  * waits until the steps are over (see hakios_adreno_init()); with wifi=1 it does not.
  */
+extern void hakios_lx_radio_reserve(void);
+
 void
 hakios_wifi_init(void)
 {
@@ -4324,6 +4326,8 @@ hakios_wifi_init(void)
 	uint64_t size = 0;
 	thread_t thread;
 
+	/* (the 6T's radio: its memory, while there is still memory in one piece; see hakios.lx.c) */
+	hakios_lx_radio_reserve();
 	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {
 		return;

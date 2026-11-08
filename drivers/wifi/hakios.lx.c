@@ -66,6 +66,32 @@ lx_os_free(void *memory, unsigned long size)
  * in between (as hakios.adreno.c does with what it shares with the GPU); the first, cached
  * view is written out and never used again.
  */
+/*
+ * The 44 MB (wifi/lx/src/lx_base.c, POOL_SIZE), taken as the kernel starts when wifi6t=1: in one piece that is easy
+ * to find then and not 70 s later, when the 6T's radio comes up behind the modem (modem_after) with Darwin's
+ * services running -- one boot after another found none ("no 46137344 bytes of memory in one piece") and had no
+ * Wi-Fi. hakios_wifi_init() asks for it; lx_os_radio_memory() takes it if it is big enough.
+ */
+#define RADIO_EARLY_BYTES       (44ul << 20)
+static vm_offset_t radio_early;
+
+void
+hakios_lx_radio_reserve(void)
+{
+	if (!hakios_wifi6t() || radio_early != 0) {
+		return;
+	}
+	if (kmem_alloc_contig(kernel_map, &radio_early, RADIO_EARLY_BYTES, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		radio_early = 0;
+		say("lx: the radio's %lu MB could not be set aside at the start; it is asked for again when the radio comes up\n",
+		    RADIO_EARLY_BYTES >> 20);
+		return;
+	}
+	say("lx: the radio's %lu MB set aside in one piece at the start, at %#llx\n", RADIO_EARLY_BYTES >> 20,
+	    (unsigned long long)kvtophys(radio_early));
+}
+
 void *
 lx_os_radio_memory(unsigned long size, unsigned long long *address)
 {
@@ -73,7 +99,10 @@ lx_os_radio_memory(unsigned long size, unsigned long long *address)
 	uint64_t physical;
 
 	size = round_page(size);
-	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+	if (radio_early != 0 && size <= RADIO_EARLY_BYTES) {
+		cached = radio_early;
+		radio_early = 0;
+	} else if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
 	    KERN_SUCCESS) {
 		say("lx: no %lu bytes of memory in one piece\n", size);
 		return NULL;
