@@ -1083,10 +1083,14 @@ unpack_one(int make)
 	}
 	/*
 	 * var_fresh=systemgroup (one boot, by hand): the system group containers are read past, not made, so that
-	 * containermanagerd makes them again -- with their access control lists, which every restore before
+	 * containermanagerd makes them again (=datasystem: the system daemons' own data containers, Data/System,
+	 * where mobileactivationd keeps its data ark; =containers: both) -- with their access control lists, which every restore before
 	 * restore_acl() lost, and so every save after it. The save at the run's end keeps the new ones.
 	 */
-	if (make && strncmp(relative, "containers/Shared/SystemGroup/", 30) == 0 && boot_arg_is("var_fresh", "systemgroup")) {
+	if (make && ((strncmp(relative, "containers/Shared/SystemGroup/", 30) == 0 &&
+	    (boot_arg_is("var_fresh", "systemgroup") || boot_arg_is("var_fresh", "containers"))) ||
+	    (strncmp(relative, "containers/Data/System/", 23) == 0 &&
+	    (boot_arg_is("var_fresh", "datasystem") || boot_arg_is("var_fresh", "containers"))))) {
 		make = 0;
 		fresh_skipped++;
 	}
@@ -1324,8 +1328,8 @@ load(void)
 	printf("var_store: %llu access control lists back, %llu could not be\n", (unsigned long long)acls_set,
 	    (unsigned long long)acls_failed);
 	if (fresh_skipped != 0) {
-		printf("var_store: var_fresh=systemgroup: %llu entries of the system group containers left out, to be made "
-		    "again\n", (unsigned long long)fresh_skipped);
+		printf("var_store: var_fresh: %llu entries of the containers left out, to be made again\n",
+		    (unsigned long long)fresh_skipped);
 	}
 	if (short_files != 0) {
 		printf("var_store: %llu files did not fit: %llu bytes of them are not there\n",

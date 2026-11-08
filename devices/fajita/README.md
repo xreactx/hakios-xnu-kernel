@@ -171,6 +171,16 @@ cache, diagnostics, every `Library/Caches` -- and is left out now (`var_store.c`
 volume is 85 MB, 42 % of a slot (runs 125928 and the next). A save that would not fit fails and the older slot
 is kept.
 
+Access control lists (8 November 2026): XNU keeps a ramfs file's ACL in the attribute `com.apple.system.Security`,
+which the save reads but the restore was not allowed to set (it needs a private entitlement), so every ACL was lost
+at each boot. Darwin's containers depend on theirs (`containermanagerd` makes a container's `Library` mode 000,
+owned by nobody, and opens it with an ACL): `analyticsd` and `mobileactivationd` ("Failed to create data ark.")
+were refused their containers and stopped every ten seconds. The restore now sets ACLs through `chmod_extended()`
+(133 back at a boot, runs 091214, 092911). A volume saved before that has lost them for good: boot once with
+`XL_CMDLINE="var_fresh=containers"` (or `=systemgroup`, `=datasystem`) and Darwin makes those containers again,
+with their lists, losing what was in them (system services' state, not applications' data). Since then no
+service crash-loops.
+
 **6. Touch and buttons.**
 
 Done on 30 October 2026. The touch screen (`hakios.synaptics.c`, `synaptics=3`) is a Synaptics S3706B speaking RMI4:
