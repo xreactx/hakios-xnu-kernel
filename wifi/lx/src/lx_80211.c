@@ -127,6 +127,7 @@ struct lx_radio {
 	int8_t signal;				/* dBm, of the last beacon of the network joined */
 	int last_error;
 	unsigned sent, sent_lost, received, received_group, eapol, rekeys;
+	unsigned acked, unacked, eapol_acked, eapol_unacked;	/* what the driver says of the frames it sent (tx status) */
 	unsigned long long joined_at;		/* nanoseconds */
 };
 
@@ -482,9 +483,44 @@ linuxkpi_ieee80211_handle_wake_tx_queue(struct ieee80211_hw *hw, struct ieee8021
 {
 }
 
+/*
+ * What the driver says of a frame it sent: acknowledged by the access point or not (IEEE80211_TX_STAT_ACK).
+ * Counted, and told for the handshake's frames (EAPOL: LLC and SNAP with type 0x888e, after an 802.11 header
+ * of 24 bytes, or at 12 in an Ethernet frame): whether our message 2 reached the access point is what tells a
+ * wrong passphrase (it came, and the AP asks again) from a frame that never got there.
+ */
+static void
+sent_status(struct ieee80211_hw *hw, struct sk_buff *skb, const struct ieee80211_tx_info *info)
+{
+	struct lx_radio *radio = radio_of(hw);
+	bool ack = info != NULL && (info->flags & IEEE80211_TX_STAT_ACK) != 0, eapol = false;
+	const uint8_t *f = skb->data;
+
+	if (skb->len >= 32 && (f[0] & 0x0c) == 0x08 && f[24] == 0xaa && f[25] == 0xaa && f[30] == 0x88 && f[31] == 0x8e) {
+		eapol = true;
+	} else if (skb->len >= 14 && f[12] == 0x88 && f[13] == 0x8e) {
+		eapol = true;
+	}
+	if (ack) {
+		radio->acked++;
+	} else {
+		radio->unacked++;
+	}
+	if (eapol) {
+		if (ack) {
+			radio->eapol_acked++;
+		} else {
+			radio->eapol_unacked++;
+		}
+		lx_tell("lx: the handshake: our frame of %u bytes was %s by the access point (driver's status flags %#x)\n", skb->len,
+		    ack ? "ACKNOWLEDGED" : "NOT acknowledged", info != NULL ? info->flags : 0);
+	}
+}
+
 void
 linuxkpi_ieee80211_tx_status(struct ieee80211_hw *hw, struct sk_buff *skb)
 {
+	sent_status(hw, skb, IEEE80211_SKB_CB(skb));
 	dev_kfree_skb_any(skb);
 }
 
@@ -492,6 +528,7 @@ void
 linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_status *status)
 {
 	if (status->skb != NULL) {
+		sent_status(hw, status->skb, status->info != NULL ? status->info : IEEE80211_SKB_CB(status->skb));
 		dev_kfree_skb_any(status->skb);
 	}
 }
@@ -738,13 +775,35 @@ ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 {
 	struct sk_buff *skb;
 	uint8_t *bytes;
+	/*
+	 * Without the driver's frame mode (ath10k on the 6T's WCN3990: no SUPPORTS_TX_ENCAP_OFFLOAD) the frame goes
+	 * as 802.11, as mac80211 would make it: a data frame to the access point (to-DS; addresses: the access point,
+	 * ours, the destination), then LLC and SNAP with the Ethernet type, then the payload. ath10k sends it in its
+	 * "native Wi-Fi" mode (mac.c: ath10k_tx_h_get_txmode()), and the firmware ciphers it with the peer's key.
+	 */
+	bool native = radio->vif != NULL && !(radio->vif->offload_flags & IEEE80211_OFFLOAD_ENCAP_ENABLED);
 
-	if (radio->vif == NULL || radio->sta == NULL || (skb = frame_new(radio, length, &bytes)) == NULL) {
+	if (radio->vif == NULL || radio->sta == NULL || length < 14 ||
+	    (skb = frame_new(radio, native ? 24 + 8 + length - 14 : length, &bytes)) == NULL) {
 		radio->sent_lost++;
 		return (false);
 	}
-	memcpy(bytes, frame, length);
-	IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_CTL_HW_80211_ENCAP;
+	if (native) {
+		static const uint8_t llc_snap[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
+
+		bzero(bytes, 24);
+		bytes[0] = 0x08;			/* data */
+		bytes[1] = 0x01;			/* to the distribution system */
+		memcpy(bytes + 4, radio->target.address, ETH_ALEN);
+		memcpy(bytes + 10, radio->vif->addr, ETH_ALEN);
+		memcpy(bytes + 16, frame, ETH_ALEN);
+		memcpy(bytes + 24, llc_snap, sizeof(llc_snap));
+		memcpy(bytes + 30, frame + 12, 2);
+		memcpy(bytes + 32, frame + 14, length - 14);
+	} else {
+		memcpy(bytes, frame, length);
+		IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_CTL_HW_80211_ENCAP;
+	}
 	IEEE80211_SKB_CB(skb)->control.hw_key = radio->pairwise_key;
 	radio->sent++;
 	frame_send(radio, skb);
@@ -1839,6 +1898,8 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	}
 	lx_os_unlock();
 	if (radio->handshake != LX_WPA_KEYS) {
+		lx_tell("lx: our handshake frames: %u acknowledged by the access point, %u not; all frames sent: %u acknowledged, %u not\n",
+		    radio->eapol_acked, radio->eapol_unacked, radio->acked, radio->unacked);
 		lx_tell("lx: THE HANDSHAKE DID NOT COME THROUGH in %llu ms: %s%s (%u of its messages came)\n", (lx_os_nanoseconds() - began) /
 		    1000000ull, radio->answer == ANSWER_GONE ? "the access point has shown us the door (a wrong passphrase gives this)" :
 		    radio->handshake == LX_WPA_BAD ? "a message was not good: " : radio->handshake == LX_WPA_ANSWER ? "our message 2 was "
