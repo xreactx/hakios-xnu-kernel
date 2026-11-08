@@ -1226,6 +1226,395 @@ static const struct cdevsw bt_tty_cdevsw = {
 	.d_type       = D_TTY
 };
 
+
+/*
+ * Level 5's transport for bluetoothd: what iOS 16's H4 driver ("POSIX", bluetoothd 20F66 0x1000666xx) asks for is not a
+ * tty but a kernel control, com.apple.uart.sk.bluetooth (PF_SYSTEM, SOCK_STREAM), with the UART's termios by socket
+ * option (getsockopt TIOCGETA 0x40487413, setsockopt TIOCSETA 0x80487414), a 12-byte setting (setsockopt 0x800c5414),
+ * and by getsockopt 0x40105412 the UUID of a Skywalk nexus whose channel (os_channel_create(uuid, 0)) carries the H4
+ * bytes: what it writes into the TX ring's slots goes to the UART here (bt_sk_sync_tx), what the UART gives is put into
+ * the RX ring's (bt_sk_sync_rx, after the RX thread's kern_channel_notify). The nexus is a kernel pipe, as utun's
+ * (bsd/net/if_utun.c utun_register_kernel_pipe_nexus, utun_kpipe_sync_tx/rx), set up at the first ask for its UUID.
+ */
+#if SKYWALK && CONFIG_NEXUS_KERNEL_PIPE
+#include <sys/kern_control.h>
+#include <skywalk/os_skywalk_private.h>
+
+#define BT_SK_CONTROL           "com.apple.uart.sk.bluetooth"
+#define BT_SK_GET_TERMIOS       0x40487413u     /* TIOCGETA */
+#define BT_SK_SET_TERMIOS       0x80487414u     /* TIOCSETA */
+#define BT_SK_SET_12            0x800c5414u     /* _IOW('T', 20, 12 bytes): written down, not understood yet */
+#define BT_SK_GET_UUID          0x40105412u     /* _IOR('T', 18, uuid_t) */
+#define BT_SK_BUF_SIZE          2048
+
+LCK_GRP_DECLARE(bt_sk_grp, "bt6t_sk");
+LCK_MTX_DECLARE(bt_sk_lock, &bt_sk_grp);
+
+static kern_ctl_ref bt_sk_ctl;
+static nexus_controller_t bt_sk_ncd;
+static uuid_t bt_sk_prov_uuid, bt_sk_nx_uuid;
+static kern_channel_ring_t bt_sk_txring, bt_sk_rxring;
+static volatile bool bt_sk_open;               /* (a channel is connected: the RX thread gives the UART's bytes to it) */
+static uint8_t bt_sk_termios[72];
+static uint32_t bt_sk_tx_bytes, bt_sk_rx_bytes, bt_sk_rx_lost;
+static uint32_t bt_sk_tx_logged, bt_sk_rx_logged;   /* (the first 400 slots each way are written down, 12 bytes of each) */
+static uint8_t bt_sk_rx_buf[16384];
+static uint32_t bt_sk_rx_head, bt_sk_rx_count;  /* (head: the first byte not yet given; count: bytes waiting) */
+
+static errno_t
+bt_sk_pre_connect(__unused kern_nexus_provider_t nxprov, __unused proc_t p, __unused kern_nexus_t nexus,
+    __unused nexus_port_t port, __unused kern_channel_t channel, __unused void **ch_ctx)
+{
+	return 0;
+}
+
+static errno_t
+bt_sk_connected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
+{
+	lck_mtx_lock(&bt_sk_lock);
+	bt_sk_rx_head = bt_sk_rx_count = 0;
+	lck_mtx_unlock(&bt_sk_lock);
+	bt_sk_open = true;
+	say("bt6t: sk: THE CHANNEL IS CONNECTED (pid %d)\n", proc_selfpid());
+	return 0;
+}
+
+static void
+bt_sk_pre_disconnect(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
+{
+	bt_sk_open = false;
+}
+
+static void
+bt_sk_disconnected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
+{
+	say("bt6t: sk: channel disconnected: %u bytes to the controller, %u from it, %u lost\n", bt_sk_tx_bytes,
+	    bt_sk_rx_bytes, bt_sk_rx_lost);
+}
+
+static errno_t
+bt_sk_ring_init(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel,
+    kern_channel_ring_t ring, boolean_t is_tx_ring, __unused void **ring_ctx)
+{
+	if (is_tx_ring) {
+		bt_sk_txring = ring;
+	} else {
+		bt_sk_rxring = ring;
+	}
+	return 0;
+}
+
+static void
+bt_sk_ring_fini(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t ring)
+{
+	if (ring == bt_sk_txring) {
+		bt_sk_txring = NULL;
+	} else if (ring == bt_sk_rxring) {
+		bt_sk_rxring = NULL;
+	}
+}
+
+/* bluetoothd's H4 bytes, slot by slot, to the controller */
+static errno_t
+bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t ring,
+    __unused uint32_t flags)
+{
+	kern_channel_slot_t slot = kern_channel_get_next_slot(ring, NULL, NULL), last = NULL;
+
+	while (slot != NULL) {
+		kern_packet_t ph = kern_channel_slot_get_packet(ring, slot);
+		kern_buflet_t buf;
+
+		last = slot;
+		slot = kern_channel_get_next_slot(ring, slot, NULL);
+		if (ph == 0 || (buf = kern_packet_get_next_buflet(ph, NULL)) == NULL) {
+			continue;
+		}
+		uint8_t *data = (uint8_t *)kern_buflet_get_data_address(buf) + kern_buflet_get_data_offset(buf);
+		uint32_t length = kern_packet_get_data_length(ph);
+
+		if (length > BT_SK_BUF_SIZE) {
+			length = BT_SK_BUF_SIZE;
+		}
+		if (bt_sk_tx_logged < 400) {
+			char line[3 * 12 + 1];
+
+			bt_sk_tx_logged++;
+			hex_line(line, sizeof(line), data, length, 12);
+			say("bt6t: sk: > %u: %s\n", length, line);
+		}
+		bt_sk_tx_bytes += length;
+		uart_write(data, length);
+	}
+	if (last != NULL) {
+		kern_channel_advance_slot(ring, last);
+		(void)kern_channel_reclaim(ring);
+	}
+	return 0;
+}
+
+/* what the controller said, into the RX ring's slots */
+static errno_t
+bt_sk_sync_rx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t ring,
+    __unused uint32_t flags)
+{
+	struct kern_pbufpool *pp = ring->ckr_pp;
+	kern_channel_slot_t slot, last = NULL;
+
+	(void)kern_channel_reclaim(ring);
+	slot = kern_channel_get_next_slot(ring, NULL, NULL);
+	while (slot != NULL) {
+		kern_packet_t ph = 0;
+		kern_buflet_t buf;
+		uint8_t *data;
+		uint32_t n;
+
+		lck_mtx_lock(&bt_sk_lock);
+		n = bt_sk_rx_count < BT_SK_BUF_SIZE ? bt_sk_rx_count : BT_SK_BUF_SIZE;
+		lck_mtx_unlock(&bt_sk_lock);
+		if (n == 0 || kern_pbufpool_alloc_nosleep(pp, 1, &ph) != 0) {
+			break;
+		}
+		buf = kern_packet_get_next_buflet(ph, NULL);
+		data = buf != NULL ? kern_buflet_get_data_address(buf) : NULL;
+		if (data == NULL) {
+			kern_pbufpool_free(pp, ph);
+			break;
+		}
+		lck_mtx_lock(&bt_sk_lock);
+		for (uint32_t i = 0; i < n; i++) {
+			data[i] = bt_sk_rx_buf[(bt_sk_rx_head + i) % sizeof(bt_sk_rx_buf)];
+		}
+		bt_sk_rx_head = (bt_sk_rx_head + n) % sizeof(bt_sk_rx_buf);
+		bt_sk_rx_count -= n;
+		lck_mtx_unlock(&bt_sk_lock);
+		if (bt_sk_rx_logged < 400) {
+			char line[3 * 12 + 1];
+
+			bt_sk_rx_logged++;
+			hex_line(line, sizeof(line), data, n, 12);
+			say("bt6t: sk: < %u: %s\n", n, line);
+		}
+		bt_sk_rx_bytes += n;
+		kern_packet_clear_flow_uuid(ph);
+		if (kern_buflet_set_data_offset(buf, 0) != 0 || kern_buflet_set_data_length(buf, (uint16_t)n) != 0 ||
+		    kern_packet_finalize(ph) != 0 || kern_channel_slot_attach_packet(ring, slot, ph) != 0) {
+			say("bt6t: sk: an RX packet could not be put in its slot\n");
+			kern_pbufpool_free(pp, ph);
+			break;
+		}
+		last = slot;
+		slot = kern_channel_get_next_slot(ring, slot, NULL);
+	}
+	if (last != NULL) {
+		kern_channel_advance_slot(ring, last);
+	}
+	return 0;
+}
+
+/* The kernel pipe and its one instance, at the first ask for the UUID (a getsockopt: a thread that may block). */
+static errno_t
+bt_sk_nexus_up(void)
+{
+	nexus_attr_t nxa = NULL;
+	uuid_t domain;
+	errno_t error;
+	struct kern_nexus_provider_init init = {
+		.nxpi_version = KERN_NEXUS_DOMAIN_PROVIDER_CURRENT_VERSION,
+		.nxpi_flags = NXPIF_VIRTUAL_DEVICE,
+		.nxpi_pre_connect = bt_sk_pre_connect,
+		.nxpi_connected = bt_sk_connected,
+		.nxpi_pre_disconnect = bt_sk_pre_disconnect,
+		.nxpi_disconnected = bt_sk_disconnected,
+		.nxpi_ring_init = bt_sk_ring_init,
+		.nxpi_ring_fini = bt_sk_ring_fini,
+		.nxpi_sync_tx = bt_sk_sync_tx,
+		.nxpi_sync_rx = bt_sk_sync_rx,
+	};
+	struct kern_nexus_init nx_init = { .nxi_version = KERN_NEXUS_CURRENT_VERSION };
+
+	if (!uuid_is_null(bt_sk_prov_uuid)) {
+		goto instance;
+	}
+	if ((error = kern_nexus_controller_create(&bt_sk_ncd)) != 0 ||
+	    (error = kern_nexus_get_default_domain_provider(NEXUS_TYPE_KERNEL_PIPE, &domain)) != 0 ||
+	    (error = kern_nexus_attr_create(&nxa)) != 0) {
+		goto out;
+	}
+	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_SLOT_BUF_SIZE, BT_SK_BUF_SIZE);
+	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_TX_SLOTS, 64);
+	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_RX_SLOTS, 64);
+	if ((error = kern_nexus_controller_register_provider(bt_sk_ncd, domain, (const uint8_t *)"com.hakios.nexus.bt6t",
+	    &init, sizeof(init), nxa, &bt_sk_prov_uuid)) != 0) {
+		goto out;
+	}
+instance:
+	/*
+	 * An instance for the process that asks, bound to it on the kernel pipe's client port (as utun_enable_channel()
+	 * does): an unbound one is refused to os_channel_create() with EPERM (run 184818). bluetoothd starts again with a
+	 * new pid after a crash, so each ask has an instance of its own and the last one is let go.
+	 */
+	if (!uuid_is_null(bt_sk_nx_uuid)) {
+		if (bt_sk_open) {
+			say("bt6t: sk: a channel is still open on the last instance: it is kept\n");
+			return 0;
+		}
+		(void)kern_nexus_controller_free_provider_instance(bt_sk_ncd, bt_sk_nx_uuid);
+		uuid_clear(bt_sk_nx_uuid);
+	}
+	error = kern_nexus_controller_alloc_provider_instance(bt_sk_ncd, bt_sk_prov_uuid, NULL, NULL, &bt_sk_nx_uuid,
+	    &nx_init);
+	if (error == 0) {
+		nexus_port_t port = NEXUS_PORT_KERNEL_PIPE_CLIENT;
+
+		error = kern_nexus_controller_bind_provider_instance(bt_sk_ncd, bt_sk_nx_uuid, &port, proc_selfpid(), NULL,
+		    NULL, 0, NEXUS_BIND_PID);
+		if (error != 0) {
+			(void)kern_nexus_controller_free_provider_instance(bt_sk_ncd, bt_sk_nx_uuid);
+			uuid_clear(bt_sk_nx_uuid);
+		}
+	}
+out:
+	if (nxa != NULL) {
+		kern_nexus_attr_destroy(nxa);
+	}
+	{
+		uuid_string_t text;
+
+		uuid_unparse_upper(bt_sk_nx_uuid, text);
+		say("bt6t: sk: the kernel pipe: %s for pid %d (error %d)\n", error == 0 ? text : "NOT MADE", proc_selfpid(), error);
+	}
+	return error;
+}
+
+static errno_t
+bt_sk_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused void **unitinfo)
+{
+	say("bt6t: sk: %s connected (unit %u, pid %d)\n", BT_SK_CONTROL, sac->sc_unit, proc_selfpid());
+	return 0;
+}
+
+static errno_t
+bt_sk_ctl_disconnect(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo)
+{
+	say("bt6t: sk: %s disconnected\n", BT_SK_CONTROL);
+	return 0;
+}
+
+static errno_t
+bt_sk_ctl_send(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, mbuf_t m, __unused int flags)
+{
+	say("bt6t: sk: %lu bytes written to the control socket itself (not passed on)\n", (unsigned long)mbuf_pkthdr_len(m));
+	mbuf_freem(m);
+	return 0;
+}
+
+static errno_t
+bt_sk_ctl_getopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data,
+    size_t *len)
+{
+	errno_t error = 0;
+
+	switch ((uint32_t)opt) {
+	case BT_SK_GET_TERMIOS:
+		if (data != NULL) {
+			memcpy(data, bt_sk_termios, MIN(*len, sizeof(bt_sk_termios)));
+		}
+		*len = MIN(*len, sizeof(bt_sk_termios));
+		break;
+	case BT_SK_GET_UUID:
+		if ((error = bt_sk_nexus_up()) == 0) {
+			if (data != NULL) {
+				memcpy(data, bt_sk_nx_uuid, MIN(*len, sizeof(uuid_t)));
+			}
+			*len = MIN(*len, sizeof(uuid_t));
+		}
+		break;
+	default:
+		error = ENOPROTOOPT;
+		break;
+	}
+	say("bt6t: sk: getsockopt 0x%08x (%lu bytes): %d\n", (uint32_t)opt, (unsigned long)*len, error);
+	return error;
+}
+
+static errno_t
+bt_sk_ctl_setopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data,
+    size_t len)
+{
+	char line[3 * 16 + 1];
+
+	hex_line(line, sizeof(line), data, (uint32_t)len, 16);
+	say("bt6t: sk: setsockopt 0x%08x (%lu bytes): %s\n", (uint32_t)opt, (unsigned long)len, line);
+	if ((uint32_t)opt == BT_SK_SET_TERMIOS && len == sizeof(bt_sk_termios)) {
+		memcpy(bt_sk_termios, data, len);
+		say("bt6t: sk: termios set: %llu baud (the UART stays at 115200), cflag 0x%llx\n",
+		    *(uint64_t *)(bt_sk_termios + 64), *(uint64_t *)(bt_sk_termios + 16));
+	}
+	return 0;
+}
+
+/* The kernel control, from the RX thread before its loop. */
+static void
+bt_sk_register(void)
+{
+	struct kern_ctl_reg reg;
+	errno_t error;
+
+	/* the line as bluetoothd will find it: 8N1, local, 115200 (struct termios of a 64-bit process: 72 bytes) */
+	bzero(bt_sk_termios, sizeof(bt_sk_termios));
+	*(uint64_t *)(bt_sk_termios + 16) = CS8 | CREAD | CLOCAL;
+	*(uint64_t *)(bt_sk_termios + 56) = 115200;
+	*(uint64_t *)(bt_sk_termios + 64) = 115200;
+	bzero(&reg, sizeof(reg));
+	strlcpy(reg.ctl_name, BT_SK_CONTROL, sizeof(reg.ctl_name));
+	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
+	reg.ctl_sendsize = reg.ctl_recvsize = 16384;
+	reg.ctl_connect = bt_sk_ctl_connect;
+	reg.ctl_disconnect = bt_sk_ctl_disconnect;
+	reg.ctl_send = bt_sk_ctl_send;
+	reg.ctl_getopt = bt_sk_ctl_getopt;
+	reg.ctl_setopt = bt_sk_ctl_setopt;
+	error = ctl_register(&reg, &bt_sk_ctl);
+	say("bt6t: sk: the kernel control %s: %s (%d)\n", BT_SK_CONTROL, error == 0 ? "registered" : "NOT REGISTERED", error);
+}
+
+/* From the RX thread: the UART's bytes for the channel; false when no channel is there to take them. */
+static bool
+bt_sk_give(const uint8_t *bytes, uint32_t n)
+{
+	kern_channel_ring_t ring = bt_sk_rxring;
+
+	if (!bt_sk_open || ring == NULL) {
+		return false;
+	}
+	lck_mtx_lock(&bt_sk_lock);
+	for (uint32_t i = 0; i < n; i++) {
+		if (bt_sk_rx_count == sizeof(bt_sk_rx_buf)) {
+			bt_sk_rx_lost += n - i;
+			break;
+		}
+		bt_sk_rx_buf[(bt_sk_rx_head + bt_sk_rx_count) % sizeof(bt_sk_rx_buf)] = bytes[i];
+		bt_sk_rx_count++;
+	}
+	lck_mtx_unlock(&bt_sk_lock);
+	kern_channel_notify(ring, 0);
+	return true;
+}
+#else
+static void
+bt_sk_register(void)
+{
+	say("bt6t: sk: this kernel has no Skywalk kernel pipes: no transport for bluetoothd\n");
+}
+
+static bool
+bt_sk_give(__unused const uint8_t *bytes, __unused uint32_t n)
+{
+	return false;
+}
+#endif
+
 /* The tty and its two names, the IOService; then the RX FIFO into the tty for good (this thread does not return). */
 static void
 bt_tty_serve(void)
@@ -1247,6 +1636,7 @@ bt_tty_serve(void)
 	}
 	say("bt6t: level 5: /dev/uart.bluetooth and /dev/cu.bluetooth (major %d); the IOService \"bluetooth\": %d\n", major,
 	    HakiosBt6tPublish(bt_have_bdaddr ? msb_first : NULL, 115200));
+	bt_sk_register();
 	for (;;) {
 		uint8_t bytes[64];
 		uint32_t n = uart_read(bytes, sizeof(bytes), 0);
@@ -1254,6 +1644,9 @@ bt_tty_serve(void)
 		if (n == 0) {
 			IOSleep(1);
 			continue;
+		}
+		if (bt_sk_give(bytes, n)) {
+			continue;                       /* (bluetoothd's channel has them) */
 		}
 		if (!(bt_tty->t_state & TS_ISOPEN)) {
 			bt_rx_dropped += n;
