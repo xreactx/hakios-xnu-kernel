@@ -95,6 +95,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
+#include <vm/memory_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
 #include <sys/stat.h>
@@ -103,6 +104,8 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 
 static uint32_t last_step, skip_steps, pause_ms = 2200, fine, watch_seconds = 20;
@@ -3585,8 +3588,16 @@ step_zap_load(void)
 		zap_is_loaded = true;
 		return true;
 	}
-	/* (the memory is looked at only now: TrustZone has just said that it is not its own) */
-	memory = (volatile uint8_t *)ml_io_map_wcomb(ZAP_MEMORY, ZAP_MEMORY_SIZE);
+	/*
+	 * (the memory is looked at only now: TrustZone has just said that it is not its own.) Mapped for the copy only, and
+	 * unmapped before TrustZone takes it, as Linux's PIL does: a mapping left in place (write-combining is Normal
+	 * memory, which the cores may read speculatively) reaches memory that is TrustZone's from then on.
+	 */
+	memory = (volatile uint8_t *)ml_io_map_unmappable(ZAP_MEMORY, ZAP_MEMORY_SIZE, VM_WIMG_WCOMB);
+	if (memory == NULL) {
+		printf("adreno: %u: the zap shader's memory cannot be mapped\n", step);
+		return false;
+	}
 	printf("adreno: %u: the reserved memory begins %02x %02x %02x %02x, the zap shader %02x %02x %02x %02x\n", step,
 	    memory[0], memory[1], memory[2], memory[3], segment[0], segment[1], segment[2], segment[3]);
 	printf("adreno: %u: about to write %llu bytes at %#llx\n", step, size, ZAP_MEMORY);
@@ -3596,6 +3607,13 @@ step_zap_load(void)
 		memory[i] = i < size ? segment[i] : 0;
 	}
 	settle();
+	{
+		/* (io_map() maps whole pages and hands back a pointer into the first: the zap region begins 4 KB into a 16 KB page) */
+		vm_offset_t base = trunc_page((vm_offset_t)memory);
+
+		ml_io_unmap(base, round_page((vm_offset_t)memory + ZAP_MEMORY_SIZE) - base);
+	}
+	memory = NULL;
 	if (scm("to authenticate the zap shader and run it", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_GPU, 0,
 	    0, &answer) != 0 || answer != 0) {
 		printf("adreno: %u: TrustZone does not authenticate the zap shader (%#llx)\n", step, answer);
