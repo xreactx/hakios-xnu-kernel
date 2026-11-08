@@ -2028,7 +2028,20 @@ lx_station_join(void)
 	what.passphrase_length = (uint8_t)passphrase_length;
 	what.security = HAKIOS_STA_WPA2_PSK;
 	lx_os_net_attach(radio->wiphy->perm_addr);
-	error = station_join(radio, &what);
+	/*
+	 * Up to three times, 3 s apart, each with a scan of its own: one boot in nine the scans missed the strong access
+	 * point of the network (-35 dBm on channel 1) and heard only a far one (-79 dBm on 149), which did not answer the
+	 * authentication, and the run had no Wi-Fi at all. A handshake that failed (EAUTH: a wrong passphrase, most
+	 * likely) is not tried again, nor a network not heard in three scans (ENOENT).
+	 */
+	for (unsigned attempt = 1; attempt <= 3; attempt++) {
+		error = station_join(radio, &what);
+		if (error == 0 || error == EAUTH || error == ENOENT || attempt == 3) {
+			break;
+		}
+		lx_tell("lx: joining failed (%d), attempt %u of 3: again in 3 s, with a scan of its own\n", error, attempt);
+		lx_pause_ms(3000);
+	}
 	explicit_bzero(&what, sizeof(what));
 	return (error);
 }
