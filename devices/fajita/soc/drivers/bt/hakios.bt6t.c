@@ -29,6 +29,7 @@
  * Boot-args:
  *   bt6t=1        the look
  *   bt6t=2        the UART's clock and pins set, then the look at the engine
+ *   bt6t=3        and the engine as a UART, the WCN3990's power pulses, and its version asked for (HCI)
  */
 #include <kern/startup.h>
 #include <machine/machine_routines.h>
@@ -169,6 +170,250 @@ uart_clock_and_pins(void)
 	return on;
 }
 
+/*
+ * ---- Level 3: the engine as a UART, the WCN3990's power pulses, and its version ----------------------------
+ *
+ * The engine set up as Linux's qcom_geni_serial.c does (port_setup, set_termios), polled, in FIFO mode, without
+ * interrupts: GENI (geni-se.h, qcom-geni-se.c v6.12) clock gating and I/O defaults, interrupts cleared, FIFO mode,
+ * 8-bit words packed four to a FIFO word least significant first (geni_se_config_packing(8, 4, false):
+ * 0x4380e / 0xc3e0e, byte granularity 0), the RX watermarks (2; RFR at depth - 2), RX stale 10 * 16 bits; then 8N1, no
+ * flow control (UART_CTS_MASK), the divider from the engine's 7.3728 MHz: oversampling 32, halved from QUP 2.5
+ * (0x20050000; QUP_HW_VER at the wrapper, qcom,qupv3_0_geni_se@8c0000 + 4). A transfer: TX_TRANS_LEN, then M_CMD0 =
+ * UART_START_TX << 27, the bytes into TX_FIFOn, M_IRQ_STATUS bit 0 (command done) awaited; reading: S_CMD0 =
+ * UART_START_READ << 27, words out of RX_FIFOn as RX_FIFO_STATUS counts them.
+ *
+ * Then the WCN3990 (hci_qca.c qca_regulator_init(), qca_send_power_pulse(); btqca.h): its supplies on do not start
+ * Bluetooth; a circuit on TX decodes single bytes sent at given rates: 0xC0 at 2400 (off, into its boot mode), then
+ * 0xFC at 115200 (on), and 100 ms for it to boot, flow control off for both. Then btqca.c qca_read_soc_version():
+ * the vendor command EDL_PATCH_CMD_OPCODE 0xFC00 with EDL_PATCH_VER_REQ_CMD 0x19, as H4 01 00 fc 01 19; the WCN3990
+ * (below the WCN3991) answers with a vendor event: 04 ff 0e, cresp 0 (EDL_CMD_REQ_RES_EVT), rtype 2
+ * (EDL_APP_VER_RES_EVT), then product id (4), patch version (2), ROM version (2), SoC id (4), little endian.
+ */
+#define QUP0_PHYS               0x008c0000UL
+#define GENI_FORCE_DEFAULT_REG  0x20
+#define GENI_OUTPUT_CTRL        0x24
+#define GENI_CGC_CTRL           0x28
+#define SE_GENI_STATUS          0x40
+#define GENI_SER_M_CLK_CFG      0x48
+#define GENI_SER_S_CLK_CFG      0x4c
+#define SE_UART_LOOPBACK_CFG    0x22c
+#define SE_GENI_BYTE_GRAN       0x254
+#define SE_GENI_DMA_MODE_EN     0x258
+#define SE_UART_TX_TRANS_CFG    0x25c
+#define SE_GENI_TX_PACKING_CFG0 0x260
+#define SE_GENI_TX_PACKING_CFG1 0x264
+#define SE_UART_TX_WORD_LEN     0x268
+#define SE_UART_TX_STOP_BIT_LEN 0x26c
+#define SE_UART_TX_TRANS_LEN    0x270
+#define SE_UART_RX_TRANS_CFG    0x280
+#define SE_GENI_RX_PACKING_CFG0 0x284
+#define SE_GENI_RX_PACKING_CFG1 0x288
+#define SE_UART_RX_WORD_LEN     0x28c
+#define SE_UART_RX_STALE_CNT    0x294
+#define SE_UART_TX_PARITY_CFG   0x2a4
+#define SE_UART_RX_PARITY_CFG   0x2a8
+#define SE_GENI_M_CMD0          0x600
+#define SE_GENI_M_IRQ_STATUS    0x610
+#define SE_GENI_M_IRQ_CLEAR     0x618
+#define SE_GENI_S_CMD0          0x630
+#define SE_GENI_S_CMD_CTRL_REG  0x634
+#define SE_GENI_S_IRQ_CLEAR     0x648
+#define SE_GENI_TX_FIFOn        0x700
+#define SE_GENI_RX_FIFOn        0x780
+#define SE_GENI_TX_FIFO_STATUS  0x800
+#define SE_GENI_RX_FIFO_STATUS  0x804
+#define SE_GENI_RX_WATERMARK_REG 0x810
+#define SE_GENI_RX_RFR_WATERMARK_REG 0x814
+#define SE_DMA_TX_IRQ_CLR       0xc44
+#define SE_DMA_RX_IRQ_CLR       0xd44
+#define SE_GSI_EVENT_EN         0xe18
+#define SE_IRQ_EN               0xe1c
+#define SE_HW_PARAM_0           0xe24
+#define SE_HW_PARAM_1           0xe28
+#define SE_DMA_GENERAL_CFG      0xe30
+
+static uint32_t uart_tx_depth, uart_rx_depth, uart_sampling;
+
+static bool
+wait_bits(vm_offset_t address, uint32_t mask, uint32_t want, uint32_t us)
+{
+	for (uint32_t t = 0; t < us; t += 10) {
+		if ((rd(address) & mask) == want) {
+			return true;
+		}
+		delay(10);
+	}
+	return (rd(address) & mask) == want;
+}
+
+static void
+uart_stop_rx(void)
+{
+	if (rd(se6 + SE_GENI_STATUS) & (1u << 12)) {           /* S_GENI_CMD_ACTIVE */
+		wr(se6 + SE_GENI_S_CMD_CTRL_REG, 1u << 2);       /* S_GENI_CMD_CANCEL */
+		wait_bits(se6 + SE_GENI_STATUS, 1u << 12, 0, 20000);
+	}
+	wr(se6 + SE_GENI_S_IRQ_CLEAR, 0xffffffffu);
+}
+
+static void
+uart_start_rx(void)
+{
+	wr(se6 + SE_GENI_S_CMD0, 1u << 27);                     /* UART_START_READ */
+}
+
+static void
+uart_baud(uint32_t baud)
+{
+	uint32_t divider = 7372800u / (baud * uart_sampling), cfg = 1u | (divider << 4);
+
+	uart_stop_rx();
+	wr(se6 + GENI_SER_M_CLK_CFG, cfg);
+	wr(se6 + GENI_SER_S_CLK_CFG, cfg);
+	uart_start_rx();
+	say("bt6t: the UART at %u baud (divider %u, oversampling %u)\n", baud, divider, uart_sampling);
+}
+
+static bool
+uart_write(const uint8_t *bytes, uint32_t length)
+{
+	wr(se6 + SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
+	wr(se6 + SE_UART_TX_TRANS_LEN, length);
+	wr(se6 + SE_GENI_M_CMD0, 1u << 27);                     /* UART_START_TX */
+	for (uint32_t at = 0; at < length; at += 4) {
+		uint32_t word = 0;
+
+		for (uint32_t b = 0; b < 4 && at + b < length; b++) {
+			word |= (uint32_t)bytes[at + b] << (8 * b);
+		}
+		if (!wait_bits(se6 + SE_GENI_TX_FIFO_STATUS, 0x0fffffffu, 0, 0) &&
+		    (rd(se6 + SE_GENI_TX_FIFO_STATUS) & 0x0fffffffu) >= uart_tx_depth) {
+			for (uint32_t t = 0; t < 100000 && (rd(se6 + SE_GENI_TX_FIFO_STATUS) & 0x0fffffffu) >= uart_tx_depth; t += 10) {
+				delay(10);
+			}
+		}
+		wr(se6 + SE_GENI_TX_FIFOn, word);
+	}
+	if (!wait_bits(se6 + SE_GENI_M_IRQ_STATUS, 1u, 1u, 200000)) {   /* M_CMD_DONE */
+		say("bt6t: the UART did not finish sending %u bytes (M_IRQ_STATUS 0x%08x, TX FIFO 0x%08x)\n", length,
+		    rd(se6 + SE_GENI_M_IRQ_STATUS), rd(se6 + SE_GENI_TX_FIFO_STATUS));
+		return false;
+	}
+	wr(se6 + SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
+	return true;
+}
+
+/* What has come in, up to `size` bytes, within `us`; the count. */
+static uint32_t
+uart_read(uint8_t *bytes, uint32_t size, uint32_t us)
+{
+	uint32_t got = 0;
+
+	for (uint32_t t = 0; t <= us && got < size; t += 100) {
+		uint32_t status = rd(se6 + SE_GENI_RX_FIFO_STATUS), words = status & 0x01ffffffu;
+
+		for (uint32_t w = 0; w < words && got < size; w++) {
+			uint32_t word = rd(se6 + SE_GENI_RX_FIFOn), n = 4;
+
+			if (w == words - 1 && (status & (1u << 31)) && ((status >> 28) & 7) != 0) {
+				n = (status >> 28) & 7;                     /* RX_LAST: a last word only partly filled */
+			}
+			for (uint32_t b = 0; b < n && got < size; b++) {
+				bytes[got++] = (uint8_t)(word >> (8 * b));
+			}
+		}
+		if (words == 0) {
+			delay(100);
+		}
+	}
+	return got;
+}
+
+static bool
+uart_setup(void)
+{
+	vm_offset_t qup = ml_io_map(QUP0_PHYS, 0x4000);
+	uint32_t version = qup != 0 ? rd(qup + 4) : 0, proto = (rd(se6 + 0x68) >> 8) & 0xff;
+
+	if (proto != 2) {
+		say("bt6t: the engine's firmware is protocol %u, not the UART (2)\n", proto);
+		return false;
+	}
+	uart_tx_depth = (rd(se6 + SE_HW_PARAM_0) >> 16) & 0x3f;
+	uart_rx_depth = (rd(se6 + SE_HW_PARAM_1) >> 16) & 0x3f;
+	uart_sampling = version >= 0x20050000u ? 16 : 32;
+	say("bt6t: level 3: QUP version 0x%08x, FIFOs %u/%u words: the engine set up as a UART (polled FIFO mode, 8N1, no flow "
+	    "control)\n", version, uart_tx_depth, uart_rx_depth);
+	uart_stop_rx();
+	/* geni_se_init(): interrupts cleared, I/O defaults, mode, watermarks */
+	wr(se6 + SE_GSI_EVENT_EN, 0);
+	wr(se6 + SE_GENI_M_IRQ_CLEAR, 0xffffffffu);
+	wr(se6 + SE_GENI_S_IRQ_CLEAR, 0xffffffffu);
+	wr(se6 + SE_DMA_TX_IRQ_CLR, 0xffffffffu);
+	wr(se6 + SE_DMA_RX_IRQ_CLR, 0xffffffffu);
+	wr(se6 + GENI_CGC_CTRL, rd(se6 + GENI_CGC_CTRL) | 0x7fu);
+	wr(se6 + SE_DMA_GENERAL_CFG, rd(se6 + SE_DMA_GENERAL_CFG) | 0xfu);
+	wr(se6 + GENI_OUTPUT_CTRL, 0x7fu);
+	wr(se6 + GENI_FORCE_DEFAULT_REG, 1u);
+	wr(se6 + SE_GENI_DMA_MODE_EN, rd(se6 + SE_GENI_DMA_MODE_EN) & ~1u);
+	wr(se6 + SE_GENI_RX_WATERMARK_REG, 2);
+	wr(se6 + SE_GENI_RX_RFR_WATERMARK_REG, uart_rx_depth - 2);
+	/* geni_se_config_packing(8, 4, false, true, true) */
+	wr(se6 + SE_GENI_TX_PACKING_CFG0, 0x4380eu);
+	wr(se6 + SE_GENI_TX_PACKING_CFG1, 0xc3e0eu);
+	wr(se6 + SE_GENI_RX_PACKING_CFG0, 0x4380eu);
+	wr(se6 + SE_GENI_RX_PACKING_CFG1, 0xc3e0eu);
+	wr(se6 + SE_GENI_BYTE_GRAN, 0);
+	/* qcom_geni_serial port_setup and set_termios: stale count, 8N1, no flow control, no loopback */
+	wr(se6 + SE_UART_RX_STALE_CNT, 10 * 16);
+	wr(se6 + SE_UART_LOOPBACK_CFG, 0);
+	wr(se6 + SE_UART_TX_TRANS_CFG, (rd(se6 + SE_UART_TX_TRANS_CFG) & ~1u) | 2u);   /* no parity, UART_CTS_MASK */
+	wr(se6 + SE_UART_TX_PARITY_CFG, rd(se6 + SE_UART_TX_PARITY_CFG) & ~1u);
+	wr(se6 + SE_UART_RX_TRANS_CFG, rd(se6 + SE_UART_RX_TRANS_CFG) & ~(1u << 3));
+	wr(se6 + SE_UART_RX_PARITY_CFG, rd(se6 + SE_UART_RX_PARITY_CFG) & ~1u);
+	wr(se6 + SE_UART_TX_WORD_LEN, 8);
+	wr(se6 + SE_UART_RX_WORD_LEN, 8);
+	wr(se6 + SE_UART_TX_STOP_BIT_LEN, 0);
+	return true;
+}
+
+static void
+hci_hello(void)
+{
+	static const uint8_t off = 0xc0, on = 0xfc, version[] = { 0x01, 0x00, 0xfc, 0x01, 0x19 };
+	uint8_t answer[64];
+	uint32_t got;
+	char hex[3 * sizeof(answer) + 1];
+
+	if (!uart_setup()) {
+		return;
+	}
+	uart_baud(2400);
+	say("bt6t: the power-off pulse (0xc0 at 2400 baud): %s\n", uart_write(&off, 1) ? "sent" : "NOT SENT");
+	delay(10000);
+	uart_baud(115200);
+	say("bt6t: the power-on pulse (0xfc at 115200 baud): %s\n", uart_write(&on, 1) ? "sent" : "NOT SENT");
+	delay(100000);
+	got = uart_read(answer, sizeof(answer), 0);
+	if (got != 0) {
+		say("bt6t: %u bytes came in after the pulses (dropped)\n", got);
+	}
+	say("bt6t: HCI 01 00 fc 01 19 (QCA: read the version): %s\n", uart_write(version, sizeof(version)) ? "sent" : "NOT SENT");
+	got = uart_read(answer, sizeof(answer), 1000000);
+	hex[0] = 0;
+	for (uint32_t i = 0; i < got; i++) {
+		snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x ", answer[i]);
+	}
+	say("bt6t: THE CONTROLLER ANSWERS %u bytes: %s\n", got, got ? hex : "(nothing in 1 s)");
+	if (got >= 17 && answer[0] == 0x04 && answer[1] == 0xff && answer[3] == 0x00 && answer[4] == 0x02) {
+		const uint8_t *v = answer + 5;
+
+		say("bt6t: THE WCN3990 IS UP: product id 0x%08x, patch version 0x%04x, ROM version 0x%04x, SoC id 0x%08x\n",
+		    v[0] | v[1] << 8 | v[2] << 16 | (uint32_t)v[3] << 24, v[4] | v[5] << 8, v[6] | v[7] << 8,
+		    v[8] | v[9] << 8 | v[10] << 16 | (uint32_t)v[11] << 24);
+	}
+}
+
 __startup_func
 static void
 bt6t_init(void)
@@ -179,9 +424,9 @@ bt6t_init(void)
 	if (!PE_parse_boot_argn("bt6t", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (level > 2) {
-		say("bt6t: bt6t=%u: only levels 1 (a look) and 2 (the UART's clock and pins) are written so far: level 2\n", level);
-		level = 2;
+	if (level > 3) {
+		say("bt6t: bt6t=%u: only levels 1 to 3 are written so far: level 3\n", level);
+		level = 3;
 	}
 	tlmm = ml_io_map(TLMM_EAST_PHYS, TLMM_EAST_SIZE);
 	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
@@ -246,6 +491,9 @@ bt6t_init(void)
 	}
 	for (unsigned i = 0; i < sizeof(engine) / sizeof(engine[0]); i++) {
 		say("bt6t: SE6 +0x%03x %s = 0x%08x\n", engine[i].offset, engine[i].what, rd(se6 + engine[i].offset));
+	}
+	if (level >= 3) {
+		hci_hello();
 	}
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, bt6t_init);
