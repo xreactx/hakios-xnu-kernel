@@ -491,15 +491,12 @@ static bool
 hci_command(uint16_t opcode, const uint8_t *parameters, uint8_t length)
 {
 	static uint8_t packet[4 + 255];
-	uint8_t pending[16];
-	uint32_t n;
 
-	/* (what has come since, first: a 0xfe still in the FIFO says the controller sleeps) */
-	while ((n = uart_read(pending, sizeof(pending), 0)) != 0) {
-		for (uint32_t b = 0; b < n; b++) {
-			ibs_byte(pending[b]);
-		}
-	}
+	/*
+	 * (nothing is drained first: the controller sends events of its own -- vendor 04 ff ... -- and a drain took half of
+	 * one, which left the next read out of step (runs 162304 to 163957); hci_event() reads them whole and the callers
+	 * pass over what is not theirs; in-band sleep is off in the NVM, and a stray 0xfe/0xfd/0xfc is taken by hci_event())
+	 */
 	if (!ibs_wake()) {
 		return false;
 	}
@@ -554,7 +551,7 @@ hci_command_complete(uint16_t opcode, const uint8_t *parameters, uint8_t length,
 	if (!hci_command(opcode, parameters, length)) {
 		return -1;
 	}
-	for (int tries = 0; tries < 8; tries++) {
+	for (int tries = 0; tries < 32; tries++) {
 		uint32_t got = hci_event(event, size, us, NULL);
 
 		if (got == 0) {
@@ -562,6 +559,18 @@ hci_command_complete(uint16_t opcode, const uint8_t *parameters, uint8_t length,
 		}
 		if (got >= 7 && event[1] == 0x0e && (event[4] | event[5] << 8) == opcode) {
 			return event[6];
+		}
+		if (got >= 7 && event[1] == 0x0f && (event[5] | event[6] << 8) == opcode && event[3] != 0) {
+			return event[3];                                /* (Command Status with an error: no Complete follows) */
+		}
+		{
+			static uint32_t told;
+			char line[3 * 16 + 1];
+
+			if (told++ < 12) {
+				hex_line(line, sizeof(line), event, got, 16);
+				say("bt6t: waiting for 0x%04x's Command Complete, another event: %u bytes: %s\n", opcode, got, line);
+			}
 		}
 	}
 	return -1;
@@ -627,7 +636,7 @@ tlv_download(const char *what, const uint8_t *data, uint32_t size, uint8_t mode)
 				uint8_t cc[16];
 				uint32_t n = hci_event(cc, sizeof(cc), 100000, &junk);
 
-				if (n >= 6 && cc[1] == 0x0e && cc[4] == 0x00 && cc[5] == 0xfc) {
+				if (n >= 6 && cc[1] == 0x0e) {   /* (04 0e 04 01 00 00 00: its opcode comes back as 0x0000) */
 					ccs++;
 				} else if (n != 0) {
 					static bool told;
@@ -844,15 +853,23 @@ le:
 		int strongest = -128, weakest = 127;
 		uint64_t start, ns = 0;
 
+		const char *step = "Set_Event_Mask";
+
+		event[0] = event[1] = 0;
 		status = hci_command_complete(0x0c01, mask, sizeof(mask), event, sizeof(event), 1000000);
 		if (status == 0) {
+			step = "LE_Set_Scan_Parameters";
 			status = hci_command_complete(0x200b, parameters, sizeof(parameters), event, sizeof(event), 1000000);
 		}
 		if (status == 0) {
+			step = "LE_Set_Scan_Enable";
 			status = hci_command_complete(0x200c, enable, sizeof(enable), event, sizeof(event), 1000000);
 		}
 		if (status != 0) {
-			say("bt6t: LE scan: not started (status %d)\n", status);
+			char line[3 * 12 + 1];
+
+			hex_line(line, sizeof(line), event, 12, 12);
+			say("bt6t: LE scan: not started: %s gave %d (the last event read: %s)\n", step, status, line);
 			return;
 		}
 		start = mach_absolute_time();
