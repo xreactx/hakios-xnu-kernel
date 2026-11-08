@@ -536,6 +536,77 @@ static uint64_t last_saved_at, changed_entries, changed_bytes;
 static char path[MAX_PATH];               /* the whole path, under ROOT */
 static struct { uint64_t ino; char path[LINK_PATH]; } *links;
 static uint64_t skipped_kinds, skipped_big;
+static uint64_t acls_set, acls_failed;
+static uint64_t fresh_skipped;
+
+/*
+ * An access control list back on what it was saved from. XNU keeps a file's ACL in the extended attribute
+ * com.apple.system.Security (a struct kauth_filesec, big-endian on disk: bsd/sys/kauth.h) where the file system
+ * has none of its own, as ramfs here; root may read that attribute, so the save has it, but only a task with
+ * com.apple.private.vfs.filesec-access may set it, and setxattr() of it failed: every ACL was lost at each boot.
+ * Darwin's containers depend on theirs (containermanagerd makes a system group container's Library mode 000,
+ * owned by nobody, and opens it with an ACL), so analyticsd and mobileactivationd ("Failed to create data ark.")
+ * were refused theirs and stopped every ten seconds. chmod_extended() (syscall 282, chmodx_np()'s), which root
+ * may call, sets the list through the file system's attributes as XNU itself would; owner and mode stay as
+ * restored. Returns 1 if it was this attribute (set or not), 0 for any other.
+ */
+static int
+restore_acl(const char *path, const char *name, const uint8_t *value, uint32_t vlen, int kind)
+{
+	enum { HEAD = 4 + 16 + 16 + 4 + 4, ACE = 16 + 4 + 4, MAGIC = 0x012cc16d, NOACL = 0xffffffffu, MOST = 128 };
+	static uint8_t fsec[HEAD + MOST * ACE];
+	uint32_t magic, count, flags;
+	int big;
+
+	if (strcmp(name, "com.apple.system.Security") != 0) {
+		return 0;
+	}
+	if (vlen < HEAD || kind == ENT_SYMLINK) {	/* (chmod_extended follows a link: its target has its own) */
+		return 1;
+	}
+	magic = (uint32_t)value[0] << 24 | (uint32_t)value[1] << 16 | (uint32_t)value[2] << 8 | value[3];
+	big = magic == MAGIC;
+	if (!big && (value[0] | (uint32_t)value[1] << 8 | (uint32_t)value[2] << 16 | (uint32_t)value[3] << 24) != MAGIC) {
+		acls_failed++;
+		return 1;
+	}
+#define GET32(at) (big ? (uint32_t)value[at] << 24 | (uint32_t)value[(at) + 1] << 16 | (uint32_t)value[(at) + 2] << 8 | \
+	    value[(at) + 3] : value[at] | (uint32_t)value[(at) + 1] << 8 | (uint32_t)value[(at) + 2] << 16 | \
+	    (uint32_t)value[(at) + 3] << 24)
+	count = GET32(36);
+	flags = GET32(40);
+	if (count == NOACL) {
+		return 1;			/* (owner and group only: nothing to give back) */
+	}
+	if (count > MOST || vlen < HEAD + count * ACE) {
+		acls_failed++;
+		return 1;
+	}
+	{
+		uint32_t host;
+
+		host = MAGIC;
+		memcpy(fsec, &host, 4);
+		memcpy(fsec + 4, value + 4, 32);	/* the owner's and the group's GUIDs, as they are */
+		memcpy(fsec + 36, &count, 4);
+		memcpy(fsec + 40, &flags, 4);
+		for (uint32_t i = 0; i < count; i++) {
+			uint32_t at = HEAD + i * ACE, ace_flags = GET32(at + 16), rights = GET32(at + 20);
+
+			memcpy(fsec + at, value + at, 16);	/* the GUID the entry applies to */
+			memcpy(fsec + at + 16, &ace_flags, 4);
+			memcpy(fsec + at + 20, &rights, 4);
+		}
+	}
+#undef GET32
+	/* (uid and gid KAUTH_UID_NONE and KAUTH_GID_NONE, mode -1: only the list changes) */
+	if (mini_syscall(282, (long)path, (long)(~0u - 100), (long)(~0u - 100), -1, (long)fsec, 0) == 0) {
+		acls_set++;
+	} else {
+		acls_failed++;
+	}
+	return 1;
+}
 
 static int
 is_skipped(const char *relative)
@@ -1010,6 +1081,15 @@ unpack_one(int make)
 	if (make && !whole_path(relative, e.pathlen)) {
 		make = 0;               /* read past it: an archive is not to make names of its own choosing */
 	}
+	/*
+	 * var_fresh=systemgroup (one boot, by hand): the system group containers are read past, not made, so that
+	 * containermanagerd makes them again -- with their access control lists, which every restore before
+	 * restore_acl() lost, and so every save after it. The save at the run's end keeps the new ones.
+	 */
+	if (make && strncmp(relative, "containers/Shared/SystemGroup/", 30) == 0 && boot_arg_is("var_fresh", "systemgroup")) {
+		make = 0;
+		fresh_skipped++;
+	}
 	if (make) {
 		switch (e.kind) {
 		case ENT_DIR:
@@ -1047,7 +1127,7 @@ unpack_one(int make)
 			break;
 		}
 		name[namelen] = 0;
-		if (make && e.kind != ENT_HARDLINK) {
+		if (make && e.kind != ENT_HARDLINK && !restore_acl(path, name, value, vlen, e.kind)) {
 			setxattr(path, name, value, vlen, 0, XATTR_NOFOLLOW);
 		}
 	}
@@ -1241,6 +1321,12 @@ load(void)
 	printf("var_store: %llu directories, %llu files (%llu bytes), %llu links back in /private/var\n",
 	    (unsigned long long)made_dirs, (unsigned long long)made_files, (unsigned long long)made_bytes,
 	    (unsigned long long)made_links);
+	printf("var_store: %llu access control lists back, %llu could not be\n", (unsigned long long)acls_set,
+	    (unsigned long long)acls_failed);
+	if (fresh_skipped != 0) {
+		printf("var_store: var_fresh=systemgroup: %llu entries of the system group containers left out, to be made "
+		    "again\n", (unsigned long long)fresh_skipped);
+	}
 	if (short_files != 0) {
 		printf("var_store: %llu files did not fit: %llu bytes of them are not there\n",
 		    (unsigned long long)short_files, (unsigned long long)lost_bytes);
