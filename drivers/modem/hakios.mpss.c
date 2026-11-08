@@ -1670,17 +1670,21 @@ static bool rails_asked;                /* our request for its rails stands (unt
 static bool stopped_by_its_word;
 static uint32_t our_item;
 static bool smp2p_agreed, smp2p_restart_acks, smp2p_restart_acked;
+extern bool hakios_tz_enter(void);
+extern void hakios_tz_leave(bool held);
 
 static int32_t
 scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third, uint64_t fourth,
     uint64_t *answer)
 {
 	uint64_t session = 0;
+	bool held;
 
 	function |= SCM_64 | SCM_SIP;
 	printf("mpss: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n", step, what, function, first,
 	    second, third);
 	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
+	held = hakios_tz_enter();
 	for (int i = 0; i < 100; i++) {
 		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
 		register uint64_t x1 __asm__("x1") = arguments;
@@ -1697,10 +1701,12 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 		if (x0 != SCM_INTERRUPTED) {
 			printf("mpss: %u: TrustZone returns %d, answer %#llx\n", step, (int32_t)x0, x1);
 			*answer = x1;
+			hakios_tz_leave(held);
 			return (int32_t)x0;
 		}
 	}
 	printf("mpss: %u: TrustZone keeps saying the call was interrupted\n", step);
+	hakios_tz_leave(held);
 	return -1;
 }
 
@@ -7413,12 +7419,31 @@ hakios_mpss_quiesce(void)
 	dsp_shutdown("the kernel is on its way back to the loader");
 }
 
+/*
+ * The loader's core (UEFI, core 0) uses the always-on processor's mailbox and RPMh for the first 24 s or so
+ * of a run (its PMIC timer events, NOTE_SECONDS in xnuloader). The audio DSP, the touch screen and the buttons
+ * wait for that (adsp_after, synaptics_after, buttons_after); the modem did not, once modem=1 ran its steps
+ * with no pauses: it opened the mailbox 1.6 s into the kernel, and about one boot in twelve core 0 stopped
+ * answering (TrustZone's secure watchdog barked on it 7-8 times, NOC errors on cores 0, 4 and 5) and the modem
+ * went down with it ("XPU violation", "wdog or kernel error suspected"): a crash dump. So from step 3 -- the
+ * mailbox, then RPMh, then TrustZone -- not before modem_after seconds (25) since the driver began.
+ */
+static uint64_t mpss_init_us;
+static uint32_t modem_after = 25;
+
 static void
 run_steps(void)
 {
 	uint32_t done = 0;
 
 	for (step = 1; step <= last_step; step++) {
+		if (step == 3 && apcs_ipc != 0 && now_us() - mpss_init_us < modem_after * 1000000ull) {
+			uint64_t left = modem_after * 1000000ull - (now_us() - mpss_init_us);
+
+			printf("mpss: nothing more for %llu.%03llu s, while the loader's core may use the mailbox and RPMh "
+			    "(modem_after)\n", left / 1000000, left / 1000 % 1000);
+			sleep_ms((uint32_t)(left / 1000));
+		}
 		if (!steps[step - 1]()) {
 			printf("mpss: step %u: FAILED; the steps after it are not attempted\n", step);
 			break;
@@ -7537,6 +7562,8 @@ hakios_mpss_init(void)
 	uint32_t on = 0;
 	thread_t thread;
 
+	mpss_init_us = now_us();
+	PE_parse_boot_argn("modem_after", &modem_after, sizeof(modem_after));
 	PE_parse_boot_argn("modem_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("modem", &on, sizeof(on)) || on != 1)) {
 		return;

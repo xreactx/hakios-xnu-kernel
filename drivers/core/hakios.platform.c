@@ -13,6 +13,7 @@
  */
 #include <kern/locks.h>
 #include <kern/startup.h>
+#include <machine/machine_routines.h>
 #include <libkern/libkern.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
@@ -53,6 +54,32 @@ LCK_MTX_DECLARE(hakios_aop_mailbox_lock, &hakios_platform_lock_group);
 LCK_MTX_DECLARE(hakios_smem_alloc_lock, &hakios_platform_lock_group);
 LCK_MTX_DECLARE(hakios_rsc_lock, &hakios_platform_lock_group);
 LCK_MTX_DECLARE(hakios_smmu_lock, &hakios_platform_lock_group);
+/*
+ * TrustZone, one call at a time. The audio DSP, the GPU, the Wi-Fi and the modem each call it (scm() in each), on
+ * threads of their own; Linux serialises every SCM call (qcom_scm.c), and two at once on the 6T -- the modem
+ * handing its regions over through the hypervisor while the audio DSP's image was being authenticated and
+ * placed, both just after their 25 s waits -- brought the whole phone down to a crash dump. Held for a call and
+ * its "interrupted, go on" resumptions. Not taken with interrupts off (a driver's quiesce: one thread is left).
+ */
+LCK_MTX_DECLARE(hakios_tz_lock, &hakios_platform_lock_group);
+
+bool
+hakios_tz_enter(void)
+{
+	if (!ml_get_interrupts_enabled()) {
+		return false;
+	}
+	lck_mtx_lock(&hakios_tz_lock);
+	return true;
+}
+
+void
+hakios_tz_leave(bool held)
+{
+	if (held) {
+		lck_mtx_unlock(&hakios_tz_lock);
+	}
+}
 
 static char hakios_drivers_string[] = HAKIOS_DRIVERS_LIST;
 

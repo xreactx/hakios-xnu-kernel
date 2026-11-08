@@ -1842,17 +1842,22 @@ space_off(struct gpu_space *space, uint32_t match)
 #define SCM_INTERRUPTED         1                       /* a call that was preempted says so, and is made again so */
 #define PAS_GPU                 13
 
+extern bool hakios_tz_enter(void);
+extern void hakios_tz_leave(bool held);
+
 /* One call. What TrustZone returns: 0 or an error of its own, and a word of answer. */
 static int32_t
 scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
     uint64_t *answer)
 {
 	uint64_t session = 0;
+	bool held;
 
 	printf("adreno: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n", step, what, function, first,
 	    second, third);
 	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
 	hold(true);
+	held = hakios_tz_enter();
 	for (int i = 0; i < 100; i++) {
 		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
 		register uint64_t x1 __asm__("x1") = arguments;
@@ -1869,10 +1874,12 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 		if (x0 != SCM_INTERRUPTED) {
 			printf("adreno: %u: TrustZone returns %d, answer %#llx\n", step, (int32_t)x0, x1);
 			*answer = x1;
+			hakios_tz_leave(held);
 			return (int32_t)x0;
 		}
 	}
 	printf("adreno: %u: TrustZone keeps saying the call was interrupted\n", step);
+	hakios_tz_leave(held);
 	return -1;
 }
 

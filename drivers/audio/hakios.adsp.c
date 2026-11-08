@@ -1467,16 +1467,20 @@ static bool dsp_started;
 static bool stopped_by_its_word;
 static uint32_t our_item;
 static bool smp2p_agreed, smp2p_restart_acks, smp2p_restart_acked;
+extern bool hakios_tz_enter(void);
+extern void hakios_tz_leave(bool held);
 
 static int32_t
 scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third, uint64_t *answer)
 {
 	uint64_t session = 0;
+	bool held;
 
 	function |= SCM_64 | SCM_SIP;
 	printf("adsp: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n", step, what, function, first,
 	    second, third);
 	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
+	held = hakios_tz_enter();
 	for (int i = 0; i < 100; i++) {
 		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
 		register uint64_t x1 __asm__("x1") = arguments;
@@ -1493,10 +1497,12 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 		if (x0 != SCM_INTERRUPTED) {
 			printf("adsp: %u: TrustZone returns %d, answer %#llx\n", step, (int32_t)x0, x1);
 			*answer = x1;
+			hakios_tz_leave(held);
 			return (int32_t)x0;
 		}
 	}
 	printf("adsp: %u: TrustZone keeps saying the call was interrupted\n", step);
+	hakios_tz_leave(held);
 	return -1;
 }
 
