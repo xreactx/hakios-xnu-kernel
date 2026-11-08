@@ -560,6 +560,14 @@ lx_start(void)
 	}
 	lx_tell("lx: %llu ms later its register work is done: the radio is mac80211's\n",
 	    (lx_os_nanoseconds() - began) / 1000000ull);
+	/*
+	 * From here on the bus's and HTC's debugging is a line or more for every frame (snoc tx item, rx ce pipe, htc rx
+	 * completion): some 20000 lines in a five-minute run, which push everything else out of the kernel's log.
+	 * The start-up's (boot, QMI) stay; wifi_debug keeps them all.
+	 */
+	if (!lx_os_option("wifi_debug")) {
+		ath10k_debug_mask &= ~(ATH10K_DBG_SNOC | ATH10K_DBG_HTC);
+	}
 	driver = ar;
 	if (lx_os_option("wifi_scan")) {
 		lx_station_scan();
