@@ -127,6 +127,15 @@ DARWIN_JOBS=${JOBS-"
 # (Count a QEMU run log with its duplicate lines removed: run-darwin.sh prints launchd's log twice.)
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && DARWIN_JOBS="$DARWIN_JOBS com.apple.wifid"
+# Darwin's own Bluetooth daemon, for the 6T's WCN3990 (devices/fajita/soc/drivers/bt/hakios.bt6t.c, bt6t=5): the kernel
+# brings the controller up and hands it over as /dev/cu.bluetooth with the IOService "bluetooth" (transport-encoding
+# 1, H4), which is how bluetoothd takes a UART controller. BLUETOOTHD=1 puts it in, its os_log on the console. Off
+# by default until it is known what it does on a phone without the kernel's side (bt6t=5).
+BT_PLATFORM=fd079b298144a7deb4d7c87fef3eb474d8f0e7eb      # (MobileGestalt's ProductHash on this port, BlueTool's log)
+if [ "${BLUETOOTHD-0}" != 0 ]; then
+	DARWIN_JOBS="$DARWIN_JOBS com.apple.bluetoothd"
+	OSLOG="${OSLOG-com.apple.backboardd} com.apple.bluetoothd com.apple.BlueTool"
+fi
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libhakios.dylib, src/inject_sb.c is libhakios.sb.dylib, src/inject_media.c is
 # libhakios.media.dylib).
@@ -140,7 +149,8 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
-/redwood/lib/libhakios.tweaks.dylib Preferences"}
+/redwood/lib/libhakios.tweaks.dylib Preferences
+/redwood/lib/libhakios.bluetool.dylib BlueTool"}
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -249,6 +259,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		# program either as the one library the kernel inserts or opened by a library of ours
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.tweaks.dylib -framework CoreFoundation -lobjc \
 			-o obj/libhakios.tweaks.dylib src/inject_tweaks.c
+		# ... and inside BlueTool, MobileGestalt's ReleaseType "Vendor", for its boot script of this phone (src/inject_bluetool.c)
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.bluetool.dylib -framework CoreFoundation \
+			-lMobileGestalt -o obj/libhakios.bluetool.dylib src/inject_bluetool.c
 		# ... and inside an application, to say what killed it (src/inject_app.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -lobjc \
 			-o obj/libhakios.app.dylib src/inject_app.c
@@ -377,6 +390,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
+	[ -f obj/libhakios.bluetool.dylib ] && cp obj/libhakios.bluetool.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver
 		cp obj/HakiosAudio root/lib/HakiosAudio.driver/
@@ -454,6 +468,10 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		done
 	fi
 	cp ${RC:-rc.launchd} root/etc/rc
+	if [ "${BLUETOOTHD-0}" != 0 ]; then
+		mkdir -p root/etc/bluetool
+		for t in boot init deepsleep; do cp bluetool.boot.script root/etc/bluetool/$BT_PLATFORM.$t.script; done
+	fi
 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
 	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
 	# lines about its own business in the first minutes and pushes everything else out of the
@@ -703,6 +721,15 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# bundle says CADisableMinimumFrameDurationOnPhone, which no application of an iPhone X's system does; the panel
 	# here runs at 120 (IOMFBDisplayRefresh, MiniIOMobileFramebuffer.cpp). New files, not edits: sysroot's are links
 	python3 mkhighrate.py sysroot
+	# BlueTool's boot script for the 6T (BLUETOOTHD=1): BlueTool names the platform by MobileGestalt's ProductHash and
+	# looks for /etc/bluetool/<it>.boot.script before its built-in Broadcom scripts, of which none is this phone's (run
+	# 180453: "fwPos = -1", then a wait for a Wi-Fi vendor until bluetoothd gave up). The kernel has done the boot
+	# (bt6t=5: rampatch, NVM, address), and bluetoothd opens the tty itself: the script, for each of the three BlueTool is
+	# asked for (boot, init, deepsleep), does nothing but wait 10 ms (run 182705: boot taken, init then looked for).
+	if [ "${BLUETOOTHD-0}" != 0 ]; then
+		mkdir -p sysroot/private/etc/bluetool
+		for t in boot init deepsleep; do cp bluetool.boot.script sysroot/private/etc/bluetool/$BT_PLATFORM.$t.script; done
+	fi
 	# the audio DSP's firmware, the phone's own from ../fw-audio (never in the repository), where the kernel reads
 	# it once the root is mounted (drivers/audio/hakios.adsp.c, adsp=1): 20 MB that do not fit beside GL=1 in the small image
 	if [ -f ../fw-audio/adsp.mdt ]; then

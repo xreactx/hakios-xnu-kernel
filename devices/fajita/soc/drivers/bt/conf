@@ -2,4 +2,6 @@
 
 driver BT6T
 	file    bsd/dev/hakios.bt6t.c
-	help    the WCN3990's Bluetooth: step one, a read-only look at its UART's pins, clocks and serial engine (bt6t=1)
+	file    iokit/Kernel/hakios.bt6t_ioreg.cpp iokitcpp
+	help    the WCN3990's Bluetooth over its UART: bt6t=1..4 bring-up steps (firmware, address, scans); bt6t=5 hands the
+	help    controller to Darwin as /dev/cu.bluetooth (H4) and the IOService "bluetooth" bluetoothd looks for

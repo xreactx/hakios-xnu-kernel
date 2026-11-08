@@ -31,6 +31,11 @@
  *   bt6t=2        the UART's clock and pins set, then the look at the engine
  *   bt6t=3        and the engine as a UART, the WCN3990's power pulses, and its version asked for (HCI)
  *   bt6t=4        and its firmware (fw/crbtfw21.tlv, fw/crnv21.bin of the small image), HCI_Reset, its address, an inquiry
+ *   bt6t=5        level 4 without the inquiry and the LE scan, then the controller handed to Darwin: /dev/uart.bluetooth and
+ *                 /dev/cu.bluetooth, a tty of H4 bytes in both directions, and the IOService "bluetooth" (transport-encoding
+ *                 1 = H4, transport-speed, local-mac-address) by which bluetoothd finds it (hakios.bt6t_ioreg.cpp)
+ *   bt6t_bdaddr=  the phone's own address (xl adds it from fw-bt/bdaddr)
+ *   bt6t_rfr=0    RFR held ready instead of by the hardware
  */
 #include <kern/startup.h>
 #include <kern/thread_call.h>
@@ -38,6 +43,10 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include <sys/conf.h>
+#include <sys/tty.h>
+#include <sys/proc.h>
+#include <miscfs/devfs/devfs.h>
 #include <stdarg.h>
 
 extern void loader_log_putc(char c);
@@ -414,6 +423,8 @@ extern void *rootvnode;
 
 static uint32_t bt_level;
 static thread_call_t later;
+static bool bt_ready, bt_have_bdaddr;           /* (level 5: the controller up, its firmware in, its address set) */
+static uint8_t bt_bdaddr[6];                    /* (HCI order: least significant octet first) */
 
 /* Bytes as hex into a line, at most `max` of them. */
 static void
@@ -825,8 +836,8 @@ hci_firmware_and_scan(void)
 	uint8_t *copy, event[260];
 	uint64_t size = 0;
 	int status;
-	uint8_t bdaddr[6];
-	bool have_bdaddr = parse_bdaddr(bdaddr);
+	uint8_t *bdaddr = bt_bdaddr;
+	bool have_bdaddr = bt_have_bdaddr = parse_bdaddr(bdaddr);
 
 	/* (first: does a plain command get through (flow control off)? HCI_Reset on the ROM, answered by Command Complete) */
 	status = hci_command_complete(0x0c03, NULL, 0, event, sizeof(event), 3000000);
@@ -905,6 +916,10 @@ hci_firmware_and_scan(void)
 		say("bt6t: HCI_Read_BD_ADDR: THE CONTROLLER IS xx:xx:xx:xx:%02x:%02x%s\n", event[8], event[7],
 		    !have_bdaddr ? " (no bt6t_bdaddr: the NVM's own)" : memcmp(event + 7, bdaddr, 6) == 0 ?
 		    " -- THE PHONE'S OWN ADDRESS (bt6t_bdaddr)" : " -- NOT bt6t_bdaddr: the write did not take");
+	}
+	if (bt_level >= 5) {
+		bt_ready = true;                                /* (the scans are level 4's; at 5 the controller is Darwin's now) */
+		return;
 	}
 	{
 		static const uint8_t inquiry[] = { 0x33, 0x8b, 0x9e, 0x08, 0x00 };    /* GIAC, 8 x 1.28 s, no limit */
@@ -1017,6 +1032,242 @@ le:
 	}
 }
 
+
+/*
+ * Level 5: the controller as a tty, the way iOS's bluetoothd takes a UART controller (its transport-encoding 1, "H4":
+ * /dev/cu.bluetooth, else /dev/uart.bluetooth; H4 packets both ways, the transport set with termios). This is XNU's
+ * own tty layer, as the console's (bsd/dev/arm/km.c): what is written goes out through bt_tty_start() to the UART; a
+ * thread of ours polls the RX FIFO (RFR holds the controller off while it is full) and hands each byte to the line
+ * discipline. The line starts raw. The UART stays at 115200 whatever termios is set to (the controller's NVM says
+ * 115200; a rate asked for is written down, not taken). Both names are one tty.
+ */
+extern void IOSleep(unsigned int milliseconds);
+extern int HakiosBt6tPublish(const uint8_t *address_msb_first, uint32_t speed);     /* hakios.bt6t_ioreg.cpp */
+
+static struct tty *bt_tty;
+static uint32_t bt_tx_bytes, bt_rx_bytes, bt_rx_dropped, bt_opens;
+
+static void
+bt_tty_start(struct tty *tp)                    /* t_oproc; tty locked */
+{
+	uint8_t buffer[256];
+
+	if (tp->t_state & (TS_TIMEOUT | TS_BUSY | TS_TTSTOP)) {
+		goto out;
+	}
+	tp->t_state |= TS_BUSY;
+	while (tp->t_outq.c_cc > 0) {
+		int count = ndqb(&tp->t_outq, 0);
+
+		if (count <= 0) {
+			break;
+		}
+		if (count > (int)sizeof(buffer)) {
+			count = (int)sizeof(buffer);
+		}
+		count = q_to_b(&tp->t_outq, buffer, count);
+		if (bt_tx_bytes < 64) {
+			char line[3 * 16 + 1];
+
+			hex_line(line, sizeof(line), buffer, (uint32_t)count, 16);
+			say("bt6t: tty out %d bytes: %s\n", count, line);
+		}
+		bt_tx_bytes += (uint32_t)count;
+		uart_write(buffer, (uint32_t)count);
+	}
+	tp->t_state &= ~TS_BUSY;
+out:
+	(*linesw[tp->t_line].l_start)(tp);      /* (ttwwakeup: writers waiting for room) */
+}
+
+static int
+bt_tty_param(__unused struct tty *tp, struct termios *t)
+{
+	static speed_t told;
+
+	if (t->c_ospeed != told) {
+		told = t->c_ospeed;
+		say("bt6t: tty: %lu baud asked for (the UART stays at 115200), cflag 0x%lx%s\n", (unsigned long)t->c_ospeed,
+		    (unsigned long)t->c_cflag, (t->c_cflag & CRTSCTS) ? " (RTS/CTS)" : "");
+	}
+	return 0;
+}
+
+static int
+bt_tty_open(__unused dev_t dev, __unused int flag, __unused int devtype, __unused proc_t p)
+{
+	struct tty *tp = bt_tty;
+	int error;
+
+	if (tp == NULL || !bt_ready) {
+		return ENXIO;
+	}
+	tty_lock(tp);
+	tp->t_oproc = bt_tty_start;
+	tp->t_param = bt_tty_param;
+	tp->t_dev = dev;
+	if (!(tp->t_state & TS_ISOPEN)) {
+		/* raw from the start: an echo of what came in would go back to the controller as a command */
+		tp->t_iflag = 0;
+		tp->t_oflag = 0;
+		tp->t_lflag = 0;
+		tp->t_cflag = CREAD | CS8 | CLOCAL | CRTSCTS;
+		tp->t_ispeed = tp->t_ospeed = 115200;
+		termioschars(&tp->t_termios);
+		ttsetwater(tp);
+	}
+	tp->t_state |= TS_CARR_ON;
+	error = (*linesw[tp->t_line].l_open)(dev, tp);
+	tty_unlock(tp);
+	bt_opens++;
+	say("bt6t: tty opened (%s, by pid %d, open %u): %d\n", minor(dev) ? "cu.bluetooth" : "uart.bluetooth", proc_selfpid(),
+	    bt_opens, error);
+	return error;
+}
+
+static int
+bt_tty_close(__unused dev_t dev, int flag, __unused int mode, __unused proc_t p)
+{
+	struct tty *tp = bt_tty;
+	int error;
+
+	tty_lock(tp);
+	error = (*linesw[tp->t_line].l_close)(tp, flag);
+	ttyclose(tp);
+	tty_unlock(tp);
+	say("bt6t: tty closed: %u bytes out, %u in, %u dropped while it was closed\n", bt_tx_bytes, bt_rx_bytes, bt_rx_dropped);
+	return error;
+}
+
+static int
+bt_tty_read(__unused dev_t dev, struct uio *uio, int ioflag)
+{
+	struct tty *tp = bt_tty;
+	int error;
+
+	tty_lock(tp);
+	error = (*linesw[tp->t_line].l_read)(tp, uio, ioflag);
+	tty_unlock(tp);
+	return error;
+}
+
+static int
+bt_tty_write(__unused dev_t dev, struct uio *uio, int ioflag)
+{
+	struct tty *tp = bt_tty;
+	int error;
+
+	tty_lock(tp);
+	error = (*linesw[tp->t_line].l_write)(tp, uio, ioflag);
+	tty_unlock(tp);
+	return error;
+}
+
+static int
+bt_tty_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, int flag, proc_t p)
+{
+	struct tty *tp = bt_tty;
+	int error = 0;
+
+	tty_lock(tp);
+	switch (cmd) {
+	case TIOCMGET:                  /* (the lines as a UART's: all up; RTS/CTS are the hardware's) */
+		*(int *)data = TIOCM_LE | TIOCM_DTR | TIOCM_RTS | TIOCM_CTS | TIOCM_CAR | TIOCM_DSR;
+		break;
+	case TIOCMSET:
+	case TIOCMBIS:
+	case TIOCMBIC:
+	case TIOCSDTR:
+	case TIOCCDTR:
+	case TIOCSBRK:
+	case TIOCCBRK:
+		break;
+	case TIOCSCTTY:
+		error = ENOTTY;
+		break;
+	default:
+		error = (*linesw[tp->t_line].l_ioctl)(tp, cmd, data, flag, p);
+		if (error == ENOTTY) {
+			error = ttioctl_locked(tp, cmd, data, flag, p);
+		}
+		if (error == ENOTTY) {
+			static uint32_t told;
+
+			if (told++ < 8) {
+				say("bt6t: tty: ioctl 0x%lx not known (ENOTTY)\n", cmd);
+			}
+		}
+		break;
+	}
+	tty_unlock(tp);
+	return error;
+}
+
+static int
+bt_tty_select(__unused dev_t dev, int which, void *wql, proc_t p)
+{
+	return ttyselect(bt_tty, which, wql, p);
+}
+
+static const struct cdevsw bt_tty_cdevsw = {
+	.d_open       = bt_tty_open,
+	.d_close      = bt_tty_close,
+	.d_read       = bt_tty_read,
+	.d_write      = bt_tty_write,
+	.d_ioctl      = bt_tty_ioctl,
+	.d_stop       = (stop_fcn_t *)nulldev,
+	.d_reset      = (reset_fcn_t *)nulldev,
+	.d_ttys       = NULL,
+	.d_select     = bt_tty_select,
+	.d_mmap       = eno_mmap,
+	.d_strategy   = eno_strat,
+	.d_reserved_1 = eno_getc,
+	.d_reserved_2 = eno_putc,
+	.d_type       = D_TTY
+};
+
+/* The tty and its two names, the IOService; then the RX FIFO into the tty for good (this thread does not return). */
+static void
+bt_tty_serve(void)
+{
+	int major;
+	uint8_t msb_first[6];
+
+	bt_tty = ttymalloc();
+	major = cdevsw_add(-1, &bt_tty_cdevsw);
+	if (bt_tty == NULL || major < 0 || cdevsw_setkqueueok(major, &bt_tty_cdevsw, 0) == -1) {
+		say("bt6t: level 5: no tty (major %d)\n", major);
+		return;
+	}
+	bt_tty->t_dev = makedev(major, 0);
+	(void)devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "uart.bluetooth");
+	(void)devfs_make_node(makedev(major, 1), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "cu.bluetooth");
+	for (int i = 0; i < 6; i++) {
+		msb_first[i] = bt_bdaddr[5 - i];
+	}
+	say("bt6t: level 5: /dev/uart.bluetooth and /dev/cu.bluetooth (major %d); the IOService \"bluetooth\": %d\n", major,
+	    HakiosBt6tPublish(bt_have_bdaddr ? msb_first : NULL, 115200));
+	for (;;) {
+		uint8_t bytes[64];
+		uint32_t n = uart_read(bytes, sizeof(bytes), 0);
+
+		if (n == 0) {
+			IOSleep(1);
+			continue;
+		}
+		if (!(bt_tty->t_state & TS_ISOPEN)) {
+			bt_rx_dropped += n;
+			continue;
+		}
+		tty_lock(bt_tty);
+		for (uint32_t i = 0; i < n; i++) {
+			(*linesw[bt_tty->t_line].l_rint)(bytes[i], bt_tty);
+		}
+		tty_unlock(bt_tty);
+		bt_rx_bytes += n;
+	}
+}
+
 static bool hci_hello(void);
 
 /* The controller's bring-up on a thread of its own: it waits for the small image and takes some 30 s. */
@@ -1025,6 +1276,9 @@ bt_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	if (hci_hello() && bt_level >= 4) {
 		hci_firmware_and_scan();
+		if (bt_level >= 5 && bt_ready) {
+			bt_tty_serve();
+		}
 	}
 	thread_terminate(current_thread());
 }
@@ -1117,9 +1371,9 @@ bt6t_init(void)
 	if (!PE_parse_boot_argn("bt6t", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (level > 4) {
-		say("bt6t: bt6t=%u: only levels 1 to 4 are written so far: level 4\n", level);
-		level = 4;
+	if (level > 5) {
+		say("bt6t: bt6t=%u: only levels 1 to 5 are written so far: level 5\n", level);
+		level = 5;
 	}
 	bt_level = level;
 	tlmm = ml_io_map(TLMM_EAST_PHYS, TLMM_EAST_SIZE);
