@@ -142,15 +142,15 @@ wr(vm_offset_t address, uint32_t value)
  * on at 0x5200c (bits 16, 6, 7; the others left as they are), and the four pins to function 1 (qup6) with the device
  * tree's pulls, 2 mA. The chip is not spoken to. Returns whether all three clocks run.
  */
-static bool
-uart_clock_and_pins(void)
-{
-	const uint32_t rcg = 0x17754, m = 384, n = 15625, mask = 0xffff;
-	static const uint32_t pull[] = { 0, 1, 3, 0 };          /* 45 none, 46 down, 47 up, 48 none */
-	uint32_t cfg, tries;
-	bool on = true;
+static uint32_t uart_clock_hz = 7372800;        /* (the engine's clock: 7.3728 MHz, then 96 or 102.4 MHz for 3 Mbit/s) */
 
-	say("bt6t: level 2: the UART's clock (7.3728 MHz) and its pins; the chip is not spoken to\n");
+/* The engine's RCG (0x17754) from GPLL0 even (300 MHz) through M/N: the rate 300 MHz * m / n. */
+static void
+uart_rcg(uint32_t m, uint32_t n)
+{
+	const uint32_t rcg = 0x17754, mask = 0xffff;
+	uint32_t cfg, tries;
+
 	wr(gcc + rcg + 0x8, (rd(gcc + rcg + 0x8) & ~mask) | m);
 	wr(gcc + rcg + 0xc, (rd(gcc + rcg + 0xc) & ~mask) | (~(n - m) & mask));
 	wr(gcc + rcg + 0x10, (rd(gcc + rcg + 0x10) & ~mask) | (~n & mask));
@@ -162,9 +162,21 @@ uart_clock_and_pins(void)
 	for (tries = 0; tries < 1000 && (rd(gcc + rcg) & 1u); tries++) {
 		delay(1);
 	}
-	say("bt6t: RCG 0x%x: CFG 0x%08x, M 0x%04x, N 0x%04x, D 0x%04x; CMD 0x%08x (update %s)\n", rcg, rd(gcc + rcg + 0x4),
-	    rd(gcc + rcg + 0x8) & mask, rd(gcc + rcg + 0xc) & mask, rd(gcc + rcg + 0x10) & mask, rd(gcc + rcg),
-	    (rd(gcc + rcg) & 1u) ? "NOT TAKEN" : "taken");
+	uart_clock_hz = (uint32_t)(300000000ull * m / n);
+	say("bt6t: RCG 0x%x: CFG 0x%08x, M 0x%04x, N 0x%04x, D 0x%04x; CMD 0x%08x (update %s): %u Hz\n", rcg,
+	    rd(gcc + rcg + 0x4), rd(gcc + rcg + 0x8) & mask, rd(gcc + rcg + 0xc) & mask, rd(gcc + rcg + 0x10) & mask,
+	    rd(gcc + rcg), (rd(gcc + rcg) & 1u) ? "NOT TAKEN" : "taken", uart_clock_hz);
+}
+
+static bool
+uart_clock_and_pins(void)
+{
+	static const uint32_t pull[] = { 0, 1, 3, 0 };          /* 45 none, 46 down, 47 up, 48 none */
+	uint32_t tries;
+	bool on = true;
+
+	say("bt6t: level 2: the UART's clock (7.3728 MHz) and its pins; the chip is not spoken to\n");
+	uart_rcg(384, 15625);
 	wr(gcc + GCC_VOTE, rd(gcc + GCC_VOTE) | (1u << 16) | (1u << 6) | (1u << 7));
 	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
 		for (tries = 0; tries < 1000 && (rd(gcc + clocks[i].cbcr) & CBCR_OFF); tries++) {
@@ -281,7 +293,7 @@ uart_start_rx(void)
 static void
 uart_baud(uint32_t baud)
 {
-	uint32_t divider = 7372800u / (baud * uart_sampling), cfg = 1u | (divider << 4);
+	uint32_t divider = uart_clock_hz / (baud * uart_sampling), cfg = 1u | (divider << 4);
 
 	uart_stop_rx();
 	wr(se6 + GENI_SER_M_CLK_CFG, cfg);
@@ -424,6 +436,8 @@ extern void *rootvnode;
 
 static uint32_t bt_level;
 static thread_call_t later;
+static uint32_t bt_baud = 115200;               /* (the UART's rate now; bt6t_baud= is the one asked for, 3000000) */
+static uint8_t bt_baud_code;                    /* (its QCA_BAUDRATE_ code: 0 115200, 0x0e 3000000, 0x11 3200000) */
 static bool bt_ready, bt_have_bdaddr;           /* (level 5: the controller up, its firmware in, its address set) */
 static uint8_t bt_bdaddr[6];                    /* (HCI order: least significant octet first) */
 
@@ -763,10 +777,10 @@ nvm_edit(uint8_t *nvm, uint32_t size)
 			break;
 		}
 		if (id == 17 && tag_length >= 3) {
-			say("bt6t: NVM tag 17 (HCI): %02x %02x %02x -> %02x %02x 00 (no in-band sleep, 115200)\n", tag[12], tag[13],
-			    tag[14], tag[12] & 0x7f, tag[13]);
+			say("bt6t: NVM tag 17 (HCI): %02x %02x %02x -> %02x %02x %02x (no in-band sleep, the UART's rate kept: %u)\n",
+			    tag[12], tag[13], tag[14], tag[12] & 0x7f, tag[13], bt_baud_code, bt_baud);
 			tag[12] &= 0x7f;
-			tag[14] = 0;
+			tag[14] = bt_baud_code;
 		} else if (id == 27 && tag_length >= 1) {
 			say("bt6t: NVM tag 27 (deep sleep): %02x -> 00\n", tag[12]);
 			tag[12] = 0;
@@ -799,6 +813,64 @@ wait_file(const char *name, uint64_t *size)
  * HCI_Read_Local_Version_Information and HCI_Read_BD_ADDR, and a classic inquiry of 10 s (GIAC 9e8b33, 8 x 1.28 s):
  * how many devices answer, and how strongly. Addresses of other people's devices are not written down whole.
  */
+/*
+ * The UART from 115200 to the operating rate, before the firmware, as Linux's hci_qca.c qca_set_speed(QCA_OPER_SPEED)
+ * does for the WCN3990 (115200 carries some 90 kbit/s, A2DP wants 200-350; the rampatch takes 20 s at 115200): RFR held
+ * not ready so the controller sends nothing meanwhile, its vendor command 0xfc48 with the rate's code, 10 ms, the
+ * engine's clock and divider moved (96 MHz for 3 Mbit/s: GPLL0 even * 8/25; 102.4 MHz for 3.2: * 128/375; oversampling
+ * 32, divider 1), RFR back, and the vendor event it sends for the change read off. Then CTS heeded on our side (the
+ * controller's RTS), unless bt6t_cts=0. bt6t_baud=115200 leaves it all as it was.
+ */
+static uint32_t
+uart_fast(void)
+{
+	uint32_t want = 3000000, cts = 1, rfr = 1, got, junk = 0;
+	uint8_t cmd[] = { 0x01, 0x48, 0xfc, 0x01, 0x00 }, event[64];
+	char line[3 * 16 + 1];
+
+	(void)PE_parse_boot_argn("bt6t_baud", &want, sizeof(want));
+	(void)PE_parse_boot_argn("bt6t_cts", &cts, sizeof(cts));
+	(void)PE_parse_boot_argn("bt6t_rfr", &rfr, sizeof(rfr));
+	if (want != 3000000 && want != 3200000) {
+		say("bt6t: the UART stays at 115200 (bt6t_baud=%u)\n", want);
+		return 115200;
+	}
+	cmd[4] = want == 3000000 ? 0x0e : 0x11;
+	wr(se6 + SE_UART_MANUAL_RFR, (1u << 31) | (1u << 1));   /* (UART_MANUAL_RFR_EN, UART_RFR_NOT_READY) */
+	if (!uart_write(cmd, sizeof(cmd))) {
+		wr(se6 + SE_UART_MANUAL_RFR, rfr ? 0 : (1u << 31));
+		return 115200;
+	}
+	delay(10000);
+	if (want == 3000000) {
+		uart_rcg(8, 25);
+	} else {
+		uart_rcg(128, 375);
+	}
+	uart_baud(want);
+	wr(se6 + SE_UART_MANUAL_RFR, rfr ? 0 : (1u << 31));
+	bt_baud = want;
+	bt_baud_code = cmd[4];
+	got = hci_event(event, sizeof(event), 200000, &junk);
+	hex_line(line, sizeof(line), event, got, 16);
+	say("bt6t: the controller at %u baud (code 0x%02x): its answer %s (%u stray bytes)\n", want, cmd[4],
+	    got ? line : "(none in 200 ms)", junk);
+	if (cts) {
+		wr(se6 + SE_UART_TX_TRANS_CFG, rd(se6 + SE_UART_TX_TRANS_CFG) & ~2u);   /* (UART_CTS_MASK off: CTS heeded) */
+	}
+	/* (still in step? the version request, which the ROM answers) */
+	{
+		static const uint8_t version[] = { 0x19 };
+
+		hci_command(0xfc00, version, sizeof(version));
+		got = hci_event(event, sizeof(event), 1000000, &junk);
+		hex_line(line, sizeof(line), event, got, 16);
+		say("bt6t: at %u baud, CTS %s: the version asked again: %s\n", want, cts ? "heeded" : "not heeded",
+		    got ? line : "NO ANSWER (bt6t_baud=115200 for the old way)");
+	}
+	return want;
+}
+
 /* bt6t_bdaddr=aa:bb:cc:dd:ee:ff (xl adds it from fw-bt/bdaddr) into HCI order: least significant octet first */
 static bool
 parse_bdaddr(uint8_t out[6])
@@ -840,6 +912,7 @@ hci_firmware_and_scan(void)
 	uint8_t *bdaddr = bt_bdaddr;
 	bool have_bdaddr = bt_have_bdaddr = parse_bdaddr(bdaddr);
 
+	(void)uart_fast();
 	/* (first: does a plain command get through (flow control off)? HCI_Reset on the ROM, answered by Command Complete) */
 	status = hci_command_complete(0x0c03, NULL, 0, event, sizeof(event), 3000000);
 	say("bt6t: HCI_Reset before the rampatch (ROM firmware): %s (status %d); in-band sleep so far: %u sleeps, %u wakes by us, "
@@ -913,6 +986,11 @@ hci_firmware_and_scan(void)
 	}
 	status = hci_command_complete(0x1009, NULL, 0, event, sizeof(event), 1000000);
 	if (status == 0 && event[2] >= 10) {
+		if (!have_bdaddr) {
+			/* (no bt6t_bdaddr: the controller's own is what Darwin is given -- bluetoothd will not start without one) */
+			memcpy(bt_bdaddr, event + 7, 6);
+			bt_have_bdaddr = true;
+		}
 		/* (the phone's own address is not written down whole: only whether it took, and its last two octets) */
 		say("bt6t: HCI_Read_BD_ADDR: THE CONTROLLER IS xx:xx:xx:xx:%02x:%02x%s\n", event[8], event[7],
 		    !have_bdaddr ? " (no bt6t_bdaddr: the NVM's own)" : memcmp(event + 7, bdaddr, 6) == 0 ?
@@ -1113,7 +1191,7 @@ bt_tty_open(__unused dev_t dev, __unused int flag, __unused int devtype, __unuse
 		tp->t_oflag = 0;
 		tp->t_lflag = 0;
 		tp->t_cflag = CREAD | CS8 | CLOCAL | CRTSCTS;
-		tp->t_ispeed = tp->t_ospeed = 115200;
+		tp->t_ispeed = tp->t_ospeed = bt_baud;
 		termioschars(&tp->t_termios);
 		ttsetwater(tp);
 	}
@@ -1257,7 +1335,7 @@ static uuid_t bt_sk_prov_uuid, bt_sk_nx_uuid;
 static kern_channel_ring_t bt_sk_txring, bt_sk_rxring;
 static volatile bool bt_sk_open;               /* (a channel is connected: the RX thread gives the UART's bytes to it) */
 static uint8_t bt_sk_termios[72];
-static uint32_t bt_sk_tx_bytes, bt_sk_rx_bytes, bt_sk_rx_lost;
+static uint32_t bt_sk_tx_bytes, bt_sk_rx_bytes, bt_sk_rx_lost, bt_sk_renotify, bt_sk_rx_short, bt_sk_tx_failed;
 static uint32_t bt_sk_tx_logged;                   /* (the first 300 commands are written down by opcode) */
 static struct {
 	uint8_t type, header[4];
@@ -1268,8 +1346,35 @@ static struct {
 static uint32_t bt_sk_events_logged, bt_sk_acl_in, bt_sk_bad_bytes;
 /* (a packet is handed on whole once it is all there -- or not at all: the Command Complete of a command of ours) */
 static uint8_t bt_sk_pkt[4 + 1100];
-static uint32_t bt_sk_pkt_len, bt_sk_swallow_2005;
+static uint32_t bt_sk_pkt_len, bt_sk_swallow_2005, bt_sk_vendor_dropped;
 static bool bt_sk_random_set;                   /* (LE Set Random Address done since the last HCI_Reset) */
+/*
+ * The last 64 packets each way, for the end of a channel: which way, H4 type, length, an event's code or a command's
+ * opcode or an ACL packet's handle and flags, and when (ms since the channel connected) -- never their contents.
+ */
+static uint32_t bt_sk_rx_count;                 /* (declared again below, with the RX buffer: a tentative definition) */
+static struct bt_sk_mark {
+	uint32_t ms;
+	uint16_t length, what;
+	uint8_t way, type, rx_ring_slots;
+} bt_sk_marks[128];
+static uint32_t bt_sk_marks_n;
+static uint64_t bt_sk_since;
+
+static void
+bt_sk_mark(uint8_t way, uint8_t type, uint16_t length, uint16_t what)
+{
+	uint64_t ns;
+	struct bt_sk_mark *m = &bt_sk_marks[bt_sk_marks_n++ % (sizeof(bt_sk_marks) / sizeof(bt_sk_marks[0]))];
+
+	absolutetime_to_nanoseconds(mach_absolute_time() - bt_sk_since, &ns);
+	m->ms = (uint32_t)(ns / 1000000);
+	m->way = way;
+	m->type = type;
+	m->length = length;
+	m->what = what;
+	m->rx_ring_slots = (uint8_t)MIN(bt_sk_rx_count / 64, 255);
+}
 
 static uint8_t bt_sk_rx_buf[16384];
 static uint32_t bt_sk_rx_head, bt_sk_rx_count;  /* (head: the first byte not yet given; count: bytes waiting) */
@@ -1290,6 +1395,8 @@ bt_sk_connected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nex
 	bt_sk_pkt_len = 0;
 	bt_sk_swallow_2005 = 0;
 	bt_sk_random_set = false;
+	bt_sk_marks_n = 0;
+	bt_sk_since = mach_absolute_time();
 	lck_mtx_unlock(&bt_sk_lock);
 	bt_sk_open = true;
 	say("bt6t: sk: THE CHANNEL IS CONNECTED (pid %d)\n", proc_selfpid());
@@ -1305,8 +1412,20 @@ bt_sk_pre_disconnect(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_
 static void
 bt_sk_disconnected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
 {
-	say("bt6t: sk: channel disconnected: %u bytes to the controller, %u from it, %u lost, %u ACL in, %u bytes out of step\n",
-	    bt_sk_tx_bytes, bt_sk_rx_bytes, bt_sk_rx_lost, bt_sk_acl_in, bt_sk_bad_bytes);
+	say("bt6t: sk: channel disconnected: %u bytes to the controller, %u from it, %u lost, %u ACL in, %u bytes out of step; "
+	    "%u syncs left bytes behind, %u notifies again\n", bt_sk_tx_bytes, bt_sk_rx_bytes, bt_sk_rx_lost, bt_sk_acl_in,
+	    bt_sk_bad_bytes, bt_sk_rx_short, bt_sk_renotify);
+	say("bt6t: sk: %u QCA vendor events kept back; %u UART writes failed; the last packets (way, type, length, opcode/event/handle, ms, bytes waiting/64):\n",
+	    bt_sk_vendor_dropped, bt_sk_tx_failed);
+	{
+		uint32_t total = sizeof(bt_sk_marks) / sizeof(bt_sk_marks[0]), first = bt_sk_marks_n > total ? bt_sk_marks_n - total : 0;
+
+		for (uint32_t i = first; i < bt_sk_marks_n; i++) {
+			struct bt_sk_mark *m = &bt_sk_marks[i % total];
+
+			say("bt6t: sk: | %c %02x %4u 0x%04x %7u ms %u\n", m->way, m->type, m->length, m->what, m->ms, m->rx_ring_slots);
+		}
+	}
 }
 
 static errno_t
@@ -1394,11 +1513,22 @@ bt_sk_parse_byte(uint8_t *byte)
 		bt_sk_pkt[bt_sk_pkt_len++] = *byte;
 	}
 	if (bt_sk_parse.type == 0) {                    /* (the packet is whole) */
+		bt_sk_mark('<', bt_sk_pkt[0], (uint16_t)bt_sk_pkt_len, bt_sk_pkt[0] == 0x04 ? (bt_sk_pkt[1] == 0x0e && bt_sk_pkt_len >= 6 ?
+		    (uint16_t)(bt_sk_pkt[4] | bt_sk_pkt[5] << 8) : bt_sk_pkt[1]) : (uint16_t)(bt_sk_pkt[1] | bt_sk_pkt[2] << 8));
 		bool drop = bt_sk_pkt_len >= 6 && bt_sk_pkt[0] == 0x04 && bt_sk_pkt[1] == 0x0e &&
 		    (bt_sk_pkt[4] | bt_sk_pkt[5] << 8) == 0x2005 && bt_sk_swallow_2005 > 0;
+		/*
+		 * The QCA firmware's own vendor events (04 ff ...: it sends one before its "unknown command" for each of
+		 * Apple's vendor commands) are not given to bluetoothd: it reads an 0xff event as a Broadcom one of its own,
+		 * and one of these, so read, had it wait for bytes that never came -- "Timed out while receiving a packet",
+		 * the link given up (reasons 129, 3602; runs 203400, 204010, 204722).
+		 */
+		bool vendor = bt_sk_pkt_len >= 2 && bt_sk_pkt[0] == 0x04 && bt_sk_pkt[1] == 0xff;
 
 		if (drop) {
 			bt_sk_swallow_2005--;
+		} else if (vendor) {
+			bt_sk_vendor_dropped++;
 		} else {
 			bt_sk_put(bt_sk_pkt, bt_sk_pkt_len);
 		}
@@ -1569,8 +1699,11 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 		} else if (bt_sk_tx_logged++ < 300) {
 			say("bt6t: sk: > %s packet, %u bytes\n", length && data[0] == 0x02 ? "ACL" : "other", length);
 		}
+		bt_sk_mark('>', length ? data[0] : 0, (uint16_t)length, length >= 3 ? (uint16_t)(data[1] | data[2] << 8) : 0);
 		bt_sk_tx_bytes += length;
-		uart_write(data, length);
+		if (!uart_write(data, length)) {
+			bt_sk_tx_failed++;
+		}
 	}
 	if (last != NULL) {
 		kern_channel_advance_slot(ring, last);
@@ -1627,6 +1760,9 @@ bt_sk_sync_rx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 	}
 	if (last != NULL) {
 		kern_channel_advance_slot(ring, last);
+	}
+	if (bt_sk_rx_count != 0) {
+		bt_sk_rx_short++;                       /* (bytes left for a later sync: no slot or no packet for them now) */
 	}
 	return 0;
 }
@@ -1767,7 +1903,7 @@ bt_sk_ctl_setopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused vo
 	say("bt6t: sk: setsockopt 0x%08x (%lu bytes): %s\n", (uint32_t)opt, (unsigned long)len, line);
 	if ((uint32_t)opt == BT_SK_SET_TERMIOS && len == sizeof(bt_sk_termios)) {
 		memcpy(bt_sk_termios, data, len);
-		say("bt6t: sk: termios set: %llu baud (the UART stays at 115200), cflag 0x%llx\n",
+		say("bt6t: sk: termios set: %llu baud (the UART stays where the kernel put it), cflag 0x%llx\n",
 		    *(uint64_t *)(bt_sk_termios + 64), *(uint64_t *)(bt_sk_termios + 16));
 	}
 	return 0;
@@ -1783,8 +1919,8 @@ bt_sk_register(void)
 	/* the line as bluetoothd will find it: 8N1, local, 115200 (struct termios of a 64-bit process: 72 bytes) */
 	bzero(bt_sk_termios, sizeof(bt_sk_termios));
 	*(uint64_t *)(bt_sk_termios + 16) = CS8 | CREAD | CLOCAL;
-	*(uint64_t *)(bt_sk_termios + 56) = 115200;
-	*(uint64_t *)(bt_sk_termios + 64) = 115200;
+	*(uint64_t *)(bt_sk_termios + 56) = bt_baud;
+	*(uint64_t *)(bt_sk_termios + 64) = bt_baud;
 	bzero(&reg, sizeof(reg));
 	strlcpy(reg.ctl_name, BT_SK_CONTROL, sizeof(reg.ctl_name));
 	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
@@ -1822,6 +1958,23 @@ bt_sk_give(const uint8_t *bytes, uint32_t n)
 	return true;
 }
 
+/*
+ * From the RX thread when the UART is quiet: bytes the RX ring had no room for at its last sync (its slots, or the
+ * pool's packets, all out in a burst) wait for a notify, and the next would only come with the controller's next
+ * bytes -- which, when it waits for the host, never come: bluetoothd sat on half an ACL packet, "Timed out while
+ * receiving a packet", and restarted (reason 129, run 203400). So the ring is told again while any wait.
+ */
+static void
+bt_sk_idle(void)
+{
+	kern_channel_ring_t ring = bt_sk_rxring;
+
+	if (bt_sk_open && ring != NULL && bt_sk_rx_count != 0) {
+		bt_sk_renotify++;
+		kern_channel_notify(ring, 0);
+	}
+}
+
 /* Bytes for bluetoothd's RX ring (the controller's, or a Command Complete of ours), and the ring told. */
 static void
 bt_sk_put(const uint8_t *bytes, uint32_t n)
@@ -1854,6 +2007,11 @@ bt_sk_give(__unused const uint8_t *bytes, __unused uint32_t n)
 {
 	return false;
 }
+
+static void
+bt_sk_idle(void)
+{
+}
 #endif
 
 /* The tty and its two names, the IOService; then the RX FIFO into the tty for good (this thread does not return). */
@@ -1876,13 +2034,14 @@ bt_tty_serve(void)
 		msb_first[i] = bt_bdaddr[5 - i];
 	}
 	say("bt6t: level 5: /dev/uart.bluetooth and /dev/cu.bluetooth (major %d); the IOService \"bluetooth\": %d\n", major,
-	    HakiosBt6tPublish(bt_have_bdaddr ? msb_first : NULL, 115200));
+	    HakiosBt6tPublish(bt_have_bdaddr ? msb_first : NULL, bt_baud));
 	bt_sk_register();
 	for (;;) {
 		uint8_t bytes[64];
 		uint32_t n = uart_read(bytes, sizeof(bytes), 0);
 
 		if (n == 0) {
+			bt_sk_idle();
 			IOSleep(1);
 			continue;
 		}
