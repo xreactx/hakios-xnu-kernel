@@ -1257,7 +1257,15 @@ static kern_channel_ring_t bt_sk_txring, bt_sk_rxring;
 static volatile bool bt_sk_open;               /* (a channel is connected: the RX thread gives the UART's bytes to it) */
 static uint8_t bt_sk_termios[72];
 static uint32_t bt_sk_tx_bytes, bt_sk_rx_bytes, bt_sk_rx_lost;
-static uint32_t bt_sk_tx_logged, bt_sk_rx_logged;   /* (the first 400 slots each way are written down, 12 bytes of each) */
+static uint32_t bt_sk_tx_logged;                   /* (the first 300 commands are written down by opcode) */
+static struct {
+	uint8_t type, header[4];
+	uint32_t have, need, body, at;          /* (bytes of the header had; header size; body length; body bytes had) */
+	bool patch;                             /* (this is the Command Complete of 0x1002) */
+	uint8_t first[6];                       /* (an event's first parameter bytes: ncmd, opcode, status) */
+} bt_sk_parse;
+static uint32_t bt_sk_events_logged, bt_sk_acl_in, bt_sk_bad_bytes;
+
 static uint8_t bt_sk_rx_buf[16384];
 static uint32_t bt_sk_rx_head, bt_sk_rx_count;  /* (head: the first byte not yet given; count: bytes waiting) */
 
@@ -1273,6 +1281,7 @@ bt_sk_connected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nex
 {
 	lck_mtx_lock(&bt_sk_lock);
 	bt_sk_rx_head = bt_sk_rx_count = 0;
+	bt_sk_parse.type = 0;
 	lck_mtx_unlock(&bt_sk_lock);
 	bt_sk_open = true;
 	say("bt6t: sk: THE CHANNEL IS CONNECTED (pid %d)\n", proc_selfpid());
@@ -1288,8 +1297,8 @@ bt_sk_pre_disconnect(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_
 static void
 bt_sk_disconnected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
 {
-	say("bt6t: sk: channel disconnected: %u bytes to the controller, %u from it, %u lost\n", bt_sk_tx_bytes,
-	    bt_sk_rx_bytes, bt_sk_rx_lost);
+	say("bt6t: sk: channel disconnected: %u bytes to the controller, %u from it, %u lost, %u ACL in, %u bytes out of step\n",
+	    bt_sk_tx_bytes, bt_sk_rx_bytes, bt_sk_rx_lost, bt_sk_acl_in, bt_sk_bad_bytes);
 }
 
 static errno_t
@@ -1314,6 +1323,95 @@ bt_sk_ring_fini(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nex
 	}
 }
 
+/*
+ * Commands bluetoothd will not go on without but the WCN3990 has not got: answered here with a Command Complete of
+ * status 0, never sent, and marked as supported in the controller's answer to Read Local Supported Commands (0x1002;
+ * the bit in its 64-byte mask, Core 5.0 Vol 2 Part E 6.27). Run 185844: bluetoothd gives up ("HCI initialization
+ * failed", status 628) on Write Default Erroneous Data Reporting, octet 18 bit 3, clear on this chip (0x83).
+ */
+static const struct {
+	uint16_t opcode;
+	uint8_t octet, bit;
+	const char *what;
+} bt_sk_emulated[] = {
+	{ 0x0c5b, 18, 3, "Write Default Erroneous Data Reporting" },
+};
+
+static void bt_sk_put(const uint8_t *bytes, uint32_t n);
+
+/*
+ * The controller's H4 stream, packet by packet (bytes come in pieces of any size): events written down by code and,
+ * for a Command Complete or Status, opcode and status -- never their parameters, which hold addresses -- and the
+ * supported-commands mask patched as above. ACL and SCO packets are counted.
+ */
+
+static void
+bt_sk_parse_byte(uint8_t *byte)
+{
+	if (bt_sk_parse.type == 0) {
+		if (*byte != 0x02 && *byte != 0x03 && *byte != 0x04) {
+			bt_sk_bad_bytes++;
+			return;
+		}
+		bt_sk_parse.type = *byte;
+		bt_sk_parse.have = bt_sk_parse.at = 0;
+		bt_sk_parse.need = *byte == 0x02 ? 4 : *byte == 0x03 ? 3 : 2;
+		bt_sk_parse.patch = false;
+		return;
+	}
+	if (bt_sk_parse.have < bt_sk_parse.need) {
+		bt_sk_parse.header[bt_sk_parse.have++] = *byte;
+		if (bt_sk_parse.have < bt_sk_parse.need) {
+			return;
+		}
+		bt_sk_parse.body = bt_sk_parse.type == 0x02 ? (uint32_t)(bt_sk_parse.header[2] | bt_sk_parse.header[3] << 8) :
+		    bt_sk_parse.type == 0x03 ? bt_sk_parse.header[2] : bt_sk_parse.header[1];
+		if (bt_sk_parse.body != 0) {
+			return;
+		}
+	} else {
+		uint32_t at = bt_sk_parse.at++;
+
+		if (at < sizeof(bt_sk_parse.first)) {
+			bt_sk_parse.first[at] = *byte;
+			if (at == 2 && bt_sk_parse.type == 0x04 && bt_sk_parse.header[0] == 0x0e &&
+			    (bt_sk_parse.first[1] | bt_sk_parse.first[2] << 8) == 0x1002) {
+				bt_sk_parse.patch = true;
+			}
+		}
+		if (bt_sk_parse.patch && at >= 4) {
+			for (unsigned i = 0; i < sizeof(bt_sk_emulated) / sizeof(bt_sk_emulated[0]); i++) {
+				if (at == 4u + bt_sk_emulated[i].octet) {
+					*byte |= (uint8_t)(1u << bt_sk_emulated[i].bit);
+				}
+			}
+		}
+		if (bt_sk_parse.at < bt_sk_parse.body) {
+			return;
+		}
+	}
+	/* a whole packet */
+	if (bt_sk_parse.type == 0x04) {
+		if (bt_sk_events_logged++ < 300) {
+			uint8_t code = bt_sk_parse.header[0];
+
+			if (code == 0x0e && bt_sk_parse.body >= 4) {
+				say("bt6t: sk: < Command Complete 0x%04x status 0x%02x%s\n", bt_sk_parse.first[1] | bt_sk_parse.first[2] << 8,
+				    bt_sk_parse.first[3], bt_sk_parse.patch ? " (the mask patched for the emulated commands)" : "");
+			} else if (code == 0x0f && bt_sk_parse.body >= 4) {
+				say("bt6t: sk: < Command Status 0x%04x status 0x%02x\n", bt_sk_parse.first[2] | bt_sk_parse.first[3] << 8,
+				    bt_sk_parse.first[0]);
+			} else {
+				say("bt6t: sk: < event 0x%02x (%u bytes)%s\n", code, bt_sk_parse.body,
+				    code == 0x3e && bt_sk_parse.body >= 1 ? " LE meta" : "");
+			}
+		}
+	} else {
+		bt_sk_acl_in++;
+	}
+	bt_sk_parse.type = 0;
+}
+
 /* bluetoothd's H4 bytes, slot by slot, to the controller */
 static errno_t
 bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, kern_channel_ring_t ring,
@@ -1336,12 +1434,27 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 		if (length > BT_SK_BUF_SIZE) {
 			length = BT_SK_BUF_SIZE;
 		}
-		if (bt_sk_tx_logged < 400) {
-			char line[3 * 12 + 1];
+		if (length >= 4 && data[0] == 0x01) {
+			uint16_t opcode = (uint16_t)(data[1] | data[2] << 8);
+			bool emulated = false;
 
-			bt_sk_tx_logged++;
-			hex_line(line, sizeof(line), data, length, 12);
-			say("bt6t: sk: > %u: %s\n", length, line);
+			for (unsigned i = 0; i < sizeof(bt_sk_emulated) / sizeof(bt_sk_emulated[0]); i++) {
+				if (bt_sk_emulated[i].opcode == opcode) {
+					uint8_t complete[] = { 0x04, 0x0e, 0x04, 0x01, data[1], data[2], 0x00 };
+
+					say("bt6t: sk: > command 0x%04x (%s): answered here, not sent\n", opcode, bt_sk_emulated[i].what);
+					bt_sk_put(complete, sizeof(complete));
+					emulated = true;
+				}
+			}
+			if (emulated) {
+				continue;
+			}
+			if (bt_sk_tx_logged++ < 300) {
+				say("bt6t: sk: > command 0x%04x (%u bytes)\n", opcode, length);
+			}
+		} else if (bt_sk_tx_logged++ < 300) {
+			say("bt6t: sk: > %s packet, %u bytes\n", length && data[0] == 0x02 ? "ACL" : "other", length);
 		}
 		bt_sk_tx_bytes += length;
 		uart_write(data, length);
@@ -1388,13 +1501,6 @@ bt_sk_sync_rx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 		bt_sk_rx_head = (bt_sk_rx_head + n) % sizeof(bt_sk_rx_buf);
 		bt_sk_rx_count -= n;
 		lck_mtx_unlock(&bt_sk_lock);
-		if (bt_sk_rx_logged < 400) {
-			char line[3 * 12 + 1];
-
-			bt_sk_rx_logged++;
-			hex_line(line, sizeof(line), data, n, 12);
-			say("bt6t: sk: < %u: %s\n", n, line);
-		}
 		bt_sk_rx_bytes += n;
 		kern_packet_clear_flow_uuid(ph);
 		if (kern_buflet_set_data_offset(buf, 0) != 0 || kern_buflet_set_data_length(buf, (uint16_t)n) != 0 ||
@@ -1585,9 +1691,31 @@ bt_sk_give(const uint8_t *bytes, uint32_t n)
 {
 	kern_channel_ring_t ring = bt_sk_rxring;
 
+	uint8_t copy[64];
+
 	if (!bt_sk_open || ring == NULL) {
 		return false;
 	}
+	while (n != 0) {
+		uint32_t k = n < sizeof(copy) ? n : (uint32_t)sizeof(copy);
+
+		memcpy(copy, bytes, k);
+		for (uint32_t i = 0; i < k; i++) {
+			bt_sk_parse_byte(&copy[i]);
+		}
+		bt_sk_put(copy, k);
+		bytes += k;
+		n -= k;
+	}
+	return true;
+}
+
+/* Bytes for bluetoothd's RX ring (the controller's, or a Command Complete of ours), and the ring told. */
+static void
+bt_sk_put(const uint8_t *bytes, uint32_t n)
+{
+	kern_channel_ring_t ring = bt_sk_rxring;
+
 	lck_mtx_lock(&bt_sk_lock);
 	for (uint32_t i = 0; i < n; i++) {
 		if (bt_sk_rx_count == sizeof(bt_sk_rx_buf)) {
@@ -1598,8 +1726,9 @@ bt_sk_give(const uint8_t *bytes, uint32_t n)
 		bt_sk_rx_count++;
 	}
 	lck_mtx_unlock(&bt_sk_lock);
-	kern_channel_notify(ring, 0);
-	return true;
+	if (ring != NULL) {
+		kern_channel_notify(ring, 0);
+	}
 }
 #else
 static void
