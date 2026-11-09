@@ -1026,9 +1026,62 @@ input_thread(__unused void *arg)
 	return NULL;
 }
 
+/*
+ * -[BKIOHIDService _setUpInitialProperties] reads a service's usage page once, as
+ * [self propertyForKey:@"PrimaryUsagePage"].intValue. For our touch screen that question goes to
+ * service_copy_property() through the event server, and once (run 172151, 1 run in 132) it came
+ * back empty while backboardd was starting: "strangeness: primary page is zero; primary usage
+ * is:4", then "unexpected digitizer usage pair", and every touch "ignoring digitizer event ...
+ * from unsupported service" -- a home screen that looks frozen. So after the original, a page of
+ * 0 is asked for again (up to a second) and given to the service with -setPrimaryUsagePage:,
+ * before anyone decides what kind of service it is.
+ */
+static IMP set_up_initial_properties_original;
+
+static void
+set_up_initial_properties(id self, SEL selector)
+{
+	SEL page_getter = sel_registerName("primaryUsagePage");
+
+	((void (*)(id, SEL))set_up_initial_properties_original)(self, selector);
+	if (((int (*)(id, SEL))objc_msgSend)(self, page_getter) != 0) {
+		return;
+	}
+	for (int attempt = 1; attempt <= 10; attempt++) {
+		id value = ((id (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("propertyForKey:"),
+		    (id)CFSTR("PrimaryUsagePage"));
+		int page = value ? ((int (*)(id, SEL))objc_msgSend)(value, sel_registerName("intValue")) : 0;
+
+		if (page != 0) {
+			((void (*)(id, SEL, int))objc_msgSend)(self, sel_registerName("setPrimaryUsagePage:"), page);
+			say("hakios: input: a HID service came with usage page 0; asked again (attempt %d): %#x\n",
+			    attempt, page);
+			return;
+		}
+		usleep(100000);
+	}
+}
+
+static void
+hid_service_fixes(void)
+{
+	Class cls = objc_getClass("BKIOHIDService");
+	Method method = cls ? class_getInstanceMethod(cls, sel_registerName("_setUpInitialProperties")) : NULL;
+	IMP original = method ? method_getImplementation(method) : NULL;
+
+	if (original == NULL || (uintptr_t)original != 0x1be1936f4UL + slide) {
+		say("hakios: -[BKIOHIDService _setUpInitialProperties]: found %#lx, not what was expected; left alone\n",
+		    original ? (uintptr_t)original - slide : 0);
+		return;
+	}
+	set_up_initial_properties_original = original;
+	method_setImplementation(method, (IMP)set_up_initial_properties);
+}
+
 static void
 input_start(void)
 {
+	hid_service_fixes();
 	pthread_t thread;
 
 	input_services_made = dispatch_semaphore_create(0);
