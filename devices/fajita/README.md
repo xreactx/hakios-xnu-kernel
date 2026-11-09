@@ -761,11 +761,18 @@ bluetoothd in a run's log (its `reason=`: 3602 a vendor command it will not do w
 Where it stands: Settings shows Bluetooth on and the devices around, and a Pixel 6 Pro paired with the phone (8
 November); with the modem and the Wi-Fi on beside it (run 201902) bluetoothd stays up, the Wi-Fi carries 30 MB and
 the modem registers. It is on by default: `CONFIG_BT6T=5` in `configs/fajita.config`, and `userland/build.sh` puts
-bluetoothd in (its and BlueTool's log on the console, the scripts, the library) for `DEVICE=fajita` unless
-`BLUETOOTHD=0`. `XL_CMDLINE="bt6t=0"` leaves Bluetooth off for a run.
+bluetoothd in (the scripts, the library; its and BlueTool's log on the console only with `BTLOG=1`) for
+`DEVICE=fajita` unless `BLUETOOTHD=0`. `XL_CMDLINE="bt6t=0"` leaves Bluetooth off for a run.
 
-Not done: audio (SCO and A2DP need the chip's PCM and the audio DSP), the chip's sleep (in-band sleep is off),
-higher UART rates, and the chip powered down at the run's end.
+**A2DP works** (run 172605, 9 November): a Bluetooth speaker paired under iOS shows in Control Center's AirPlay list
+and plays (a Voice Memo, heard by the user). A2DP is ACL data, so it needs no PCM: the UART runs at 3 Mbit/s
+(`bt6t_baud`), `BTAudioHALPlugin.driver` is in the system image (`select-system.py`) and mediaserverd streams SBC at
+44.1 kHz to bluetoothd. Never build an audio test with mediaserverd in `OSLOG`: every os_log line on the console costs
+it ~30 ms, a route change to Bluetooth logs hundreds, and mediaserverd's own watchdog then kills it ("Mach message
+timeout ... Apparently deadlocked", run 220544) before the stream starts.
+
+Not done: SCO (calls; needs the chip's PCM and the audio DSP), the chip's sleep (in-band sleep is off), and the chip
+powered down at the run's end.
 
 ## Firmware
 
