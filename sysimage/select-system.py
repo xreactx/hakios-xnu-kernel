@@ -94,7 +94,8 @@ BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, .
 # headset to it over XPC, com.apple.BTAudioHALPlugin.xpc, and through it the audio server plays to the device);
 # userland/build.sh puts the port's own device (HakiosAudio.driver) beside it.
 AUDIO = ('Library/Audio/Plug-Ins/', 'Library/Audio/Tunings/D22/', 'Library/Audio/Tunings/Generic/',
-         'System/Library/Audio/UISounds/', 'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/')
+         'System/Library/Audio/UISounds/', 'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/',
+         'Library/Ringtones/')   # the ringtones and alert tones Settings > Sounds plays (61 files, 17 MB)
 SKIP_AUDIO = ('System/Library/Audio/UISounds/nano/',)
 KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
 
