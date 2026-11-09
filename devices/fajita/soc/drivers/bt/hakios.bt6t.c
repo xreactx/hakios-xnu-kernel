@@ -1331,10 +1331,28 @@ bt_sk_ring_fini(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nex
  */
 static const struct {
 	uint16_t opcode;
-	uint8_t octet, bit;
+	int16_t sub;                            /* (the first parameter byte to match, a vendor command's sub-command; -1 any) */
+	uint8_t octet, bit;                     /* (octet 0xff: not in the mask -- a vendor command) */
+	uint8_t reply;                          /* (bytes of return parameters after the status: the sub-command, then zeros) */
 	const char *what;
 } bt_sk_emulated[] = {
-	{ 0x0c5b, 18, 3, "Write Default Erroneous Data Reporting" },
+	{ 0x0c5b, -1, 18, 3, 0, "Write Default Erroneous Data Reporting" },
+	/*
+	 * Apple's own (Broadcom) vendor commands: the QCA firmware answers "unknown command" (0x01), which bluetoothd takes
+	 * for most of them (its "status 701": BD_VSC_LE_META_ENA_FEATURES 0xfce9, OLYMPIC_CHANGE_LE_SETTINGS 0xfce2/0x0b,
+	 * OLYMPIC_SET_MIN_AFH_LE_CHANNELS 0xfce2/0x1c, ENABLE_EXTENDED_DUPLICATE_FILTER 0xfd47), but not for this one:
+	 * BD_VSC_OLYMPIC_ANTENNA_PREF_B, 0xfce2 sub-command 0x15, whose answer must hold at least 2 bytes past the status
+	 * (bluetoothd 0x100125fa8), or it restarts (reason 3602, runs 190934, 191425). Answered with no preference.
+	 */
+	/*
+	 * 0xfce2 carries all of Apple's OLYMPIC settings (the first parameter byte is which: 0x0b CHANGE_LE_SETTINGS, 0x15
+	 * ANTENNA_PREF_B, 0x1c SET_MIN_AFH_LE_CHANNELS, 0x36 SET_RETAIN_LE_SCAN_DUPLICATES_ON_START, ...): knobs of Apple's
+	 * own chips, which this one has not got. Some of them bluetoothd lets fail, others not (0x15 run 191425, 0x36 run
+	 * 192506): every one is taken here, as set, with its sub-command echoed and zeros.
+	 */
+	{ 0xfce2, -1, 0xff, 0, 8, "Apple vendor OLYMPIC setting" },
+	/* BD_VSC_FACTORY_CAL_READ_TABLE, 0xfd1b <table>: no data is fatal too (run 191957); an empty table of zeros */
+	{ 0xfd1b, -1, 0xff, 0, 16, "Apple vendor FACTORY_CAL_READ_TABLE" },
 };
 
 static void bt_sk_put(const uint8_t *bytes, uint32_t n);
@@ -1381,7 +1399,7 @@ bt_sk_parse_byte(uint8_t *byte)
 		}
 		if (bt_sk_parse.patch && at >= 4) {
 			for (unsigned i = 0; i < sizeof(bt_sk_emulated) / sizeof(bt_sk_emulated[0]); i++) {
-				if (at == 4u + bt_sk_emulated[i].octet) {
+				if (bt_sk_emulated[i].octet != 0xff && at == 4u + bt_sk_emulated[i].octet) {
 					*byte |= (uint8_t)(1u << bt_sk_emulated[i].bit);
 				}
 			}
@@ -1439,11 +1457,14 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 			bool emulated = false;
 
 			for (unsigned i = 0; i < sizeof(bt_sk_emulated) / sizeof(bt_sk_emulated[0]); i++) {
-				if (bt_sk_emulated[i].opcode == opcode) {
-					uint8_t complete[] = { 0x04, 0x0e, 0x04, 0x01, data[1], data[2], 0x00 };
+				if (bt_sk_emulated[i].opcode == opcode &&
+				    (bt_sk_emulated[i].sub < 0 || (length > 4 && data[4] == bt_sk_emulated[i].sub))) {
+					uint8_t complete[7 + 32] = { 0x04, 0x0e, (uint8_t)(4 + bt_sk_emulated[i].reply), 0x01, data[1], data[2],
+						                     0x00, bt_sk_emulated[i].reply ? data[4] : 0 };
 
-					say("bt6t: sk: > command 0x%04x (%s): answered here, not sent\n", opcode, bt_sk_emulated[i].what);
-					bt_sk_put(complete, sizeof(complete));
+					say("bt6t: sk: > command 0x%04x/%02x (%s): answered here, not sent\n", opcode, length > 4 ? data[4] : 0,
+					    bt_sk_emulated[i].what);
+					bt_sk_put(complete, 7u + bt_sk_emulated[i].reply);
 					emulated = true;
 				}
 			}
@@ -1451,7 +1472,15 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 				continue;
 			}
 			if (bt_sk_tx_logged++ < 300) {
-				say("bt6t: sk: > command 0x%04x (%u bytes)\n", opcode, length);
+				if ((opcode >> 10) == 0x3f) {
+					/* (a vendor command's parameters in full: they are settings, not addresses) */
+					char line[3 * 24 + 1];
+
+					hex_line(line, sizeof(line), data + 4, length - 4, 24);
+					say("bt6t: sk: > vendor command 0x%04x: %s\n", opcode, line);
+				} else {
+					say("bt6t: sk: > command 0x%04x (%u bytes)\n", opcode, length);
+				}
 			}
 		} else if (bt_sk_tx_logged++ < 300) {
 			say("bt6t: sk: > %s packet, %u bytes\n", length && data[0] == 0x02 ? "ACL" : "other", length);
