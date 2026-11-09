@@ -44,6 +44,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/conf.h>
+#include <sys/random.h>
 #include <sys/tty.h>
 #include <sys/proc.h>
 #include <miscfs/devfs/devfs.h>
@@ -1265,6 +1266,10 @@ static struct {
 	uint8_t first[6];                       /* (an event's first parameter bytes: ncmd, opcode, status) */
 } bt_sk_parse;
 static uint32_t bt_sk_events_logged, bt_sk_acl_in, bt_sk_bad_bytes;
+/* (a packet is handed on whole once it is all there -- or not at all: the Command Complete of a command of ours) */
+static uint8_t bt_sk_pkt[4 + 1100];
+static uint32_t bt_sk_pkt_len, bt_sk_swallow_2005;
+static bool bt_sk_random_set;                   /* (LE Set Random Address done since the last HCI_Reset) */
 
 static uint8_t bt_sk_rx_buf[16384];
 static uint32_t bt_sk_rx_head, bt_sk_rx_count;  /* (head: the first byte not yet given; count: bytes waiting) */
@@ -1282,6 +1287,9 @@ bt_sk_connected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nex
 	lck_mtx_lock(&bt_sk_lock);
 	bt_sk_rx_head = bt_sk_rx_count = 0;
 	bt_sk_parse.type = 0;
+	bt_sk_pkt_len = 0;
+	bt_sk_swallow_2005 = 0;
+	bt_sk_random_set = false;
 	lck_mtx_unlock(&bt_sk_lock);
 	bt_sk_open = true;
 	say("bt6t: sk: THE CHANNEL IS CONNECTED (pid %d)\n", proc_selfpid());
@@ -1338,6 +1346,13 @@ static const struct {
 } bt_sk_emulated[] = {
 	{ 0x0c5b, -1, 18, 3, 0, "Write Default Erroneous Data Reporting" },
 	/*
+	 * LE Read Periodic Advertiser List Size: one of the commands that puts a 5.0 controller in its "extended" LE mode
+	 * (Core 5.0 Vol 4 Part E 3.1.1), after which it refuses the legacy scan and advertising commands bluetoothd goes on
+	 * to use (LE Set Scan Parameters 0x0c, Command Disallowed, and a restart, reason 712: run 193008). Answered here --
+	 * a list of 0 -- so the WCN3990 stays in legacy mode.
+	 */
+	{ 0x204a, -1, 0xff, 0, 1, "LE Read Periodic Advertiser List Size (kept legacy)" },
+	/*
 	 * Apple's own (Broadcom) vendor commands: the QCA firmware answers "unknown command" (0x01), which bluetoothd takes
 	 * for most of them (its "status 701": BD_VSC_LE_META_ENA_FEATURES 0xfce9, OLYMPIC_CHANGE_LE_SETTINGS 0xfce2/0x0b,
 	 * OLYMPIC_SET_MIN_AFH_LE_CHANNELS 0xfce2/0x1c, ENABLE_EXTENDED_DUPLICATE_FILTER 0xfd47), but not for this one:
@@ -1363,8 +1378,36 @@ static void bt_sk_put(const uint8_t *bytes, uint32_t n);
  * supported-commands mask patched as above. ACL and SCO packets are counted.
  */
 
+static void bt_sk_parse_one(uint8_t *byte);
+
 static void
 bt_sk_parse_byte(uint8_t *byte)
+{
+	bool starting = bt_sk_parse.type == 0;
+
+	bt_sk_parse_one(byte);
+	if (starting && bt_sk_parse.type == 0) {
+		bt_sk_put(byte, 1);                     /* (a byte out of step: passed on as it is) */
+		return;
+	}
+	if (bt_sk_pkt_len < sizeof(bt_sk_pkt)) {
+		bt_sk_pkt[bt_sk_pkt_len++] = *byte;
+	}
+	if (bt_sk_parse.type == 0) {                    /* (the packet is whole) */
+		bool drop = bt_sk_pkt_len >= 6 && bt_sk_pkt[0] == 0x04 && bt_sk_pkt[1] == 0x0e &&
+		    (bt_sk_pkt[4] | bt_sk_pkt[5] << 8) == 0x2005 && bt_sk_swallow_2005 > 0;
+
+		if (drop) {
+			bt_sk_swallow_2005--;
+		} else {
+			bt_sk_put(bt_sk_pkt, bt_sk_pkt_len);
+		}
+		bt_sk_pkt_len = 0;
+	}
+}
+
+static void
+bt_sk_parse_one(uint8_t *byte)
 {
 	if (bt_sk_parse.type == 0) {
 		if (*byte != 0x02 && *byte != 0x03 && *byte != 0x04) {
@@ -1460,7 +1503,8 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 				if (bt_sk_emulated[i].opcode == opcode &&
 				    (bt_sk_emulated[i].sub < 0 || (length > 4 && data[4] == bt_sk_emulated[i].sub))) {
 					uint8_t complete[7 + 32] = { 0x04, 0x0e, (uint8_t)(4 + bt_sk_emulated[i].reply), 0x01, data[1], data[2],
-						                     0x00, bt_sk_emulated[i].reply ? data[4] : 0 };
+						                     0x00, bt_sk_emulated[i].reply && (opcode >> 10) == 0x3f && length > 4 ?
+						                     data[4] : 0 };
 
 					say("bt6t: sk: > command 0x%04x/%02x (%s): answered here, not sent\n", opcode, length > 4 ? data[4] : 0,
 					    bt_sk_emulated[i].what);
@@ -1470,6 +1514,46 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 			}
 			if (emulated) {
 				continue;
+			}
+			/*
+			 * A random own address with none set: Apple's controllers make their private addresses themselves (the
+			 * LE_META IRK vendor commands, which this one refuses), so bluetoothd never sends LE Set Random Address,
+			 * and LE Set Scan Enable is refused, Invalid HCI Command Parameters (0x12, Core 5.0 Vol 2 Part E 7.8.11;
+			 * reason 718, run 194208). Given here before the command that needs it: a non-resolvable private address,
+			 * new after every HCI_Reset (which clears it), its answer kept from bluetoothd.
+			 */
+			if (opcode == 0x0c03) {
+				bt_sk_random_set = false;
+			} else if (opcode == 0x2005) {
+				bt_sk_random_set = true;
+			} else if (!bt_sk_random_set && (((opcode == 0x200b || opcode == 0x2006) && length > 9 &&
+			    (data[9] == 0x01 || data[9] == 0x03)) || (opcode == 0x200d && length > 16 &&
+			    (data[16] == 0x01 || data[16] == 0x03)))) {
+				uint8_t set[4 + 6] = { 0x01, 0x05, 0x20, 0x06 };
+
+				read_random(set + 4, 6);
+				set[9] &= 0x3f;                 /* (the top two bits 00: non-resolvable private) */
+				set[4] |= 0x01;                 /* (not all zeros) */
+				lck_mtx_lock(&bt_sk_lock);
+				bt_sk_swallow_2005++;
+				lck_mtx_unlock(&bt_sk_lock);
+				uart_write(set, sizeof(set));
+				bt_sk_random_set = true;
+				say("bt6t: sk: > LE Set Random Address (a non-resolvable private one, ours) before command 0x%04x\n",
+				    opcode);
+			}
+			/*
+			 * LE Set Scan Enable's Filter_Duplicates is 0 or 1 for a legacy scan; Apple's stack asks for more (2, "reset
+			 * each period", is an extended scan's), which the WCN3990 refuses as invalid parameters (0x12) -- and
+			 * bluetoothd restarts, reason 718 (run 193613). Made 1: duplicates filtered.
+			 */
+			if (opcode == 0x200c && length == 6 && data[5] > 1) {
+				static uint32_t told;
+
+				if (told++ < 4) {
+					say("bt6t: sk: > LE Set Scan Enable %u with Filter_Duplicates %u: sent as 1\n", data[4], data[5]);
+				}
+				data[5] = 1;
 			}
 			if (bt_sk_tx_logged++ < 300) {
 				if ((opcode >> 10) == 0x3f) {
@@ -1730,9 +1814,8 @@ bt_sk_give(const uint8_t *bytes, uint32_t n)
 
 		memcpy(copy, bytes, k);
 		for (uint32_t i = 0; i < k; i++) {
-			bt_sk_parse_byte(&copy[i]);
+			bt_sk_parse_byte(&copy[i]);     /* (which hands each packet on when it is whole) */
 		}
-		bt_sk_put(copy, k);
 		bytes += k;
 		n -= k;
 	}
