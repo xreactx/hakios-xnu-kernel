@@ -8,17 +8,26 @@
  * (20F66, at 0x10001625c); a customer install's answer skips the override altogether. On the 6T the kernel does the
  * chip's boot itself (devices/fajita/soc/drivers/bt/hakios.bt6t.c, bt6t=5) and the script only opens the tty and
  * resets the controller (userland/bluetool.boot.script), so BlueTool, and only BlueTool, is told "Vendor". Every
- * other question goes to MobileGestalt as it is.
+ * other question but WifiVendor (below) goes to MobileGestalt as it is.
  */
 #include <CoreFoundation/CoreFoundation.h>
 
 extern CFTypeRef MGCopyAnswer(CFStringRef key);
 
+/*
+ * And WifiVendor answered "none" at once: BlueTool asks it (twice for each script) only to pick among Broadcom
+ * modules, which this phone has not got, and MobileGestalt takes 5 s for each -- or, early in the boot, never
+ * answers: BlueTool hung in the "boot" script, bluetoothd waited on it with its stack "busy", and logged that
+ * hundreds of times a second over the screen (run 211622).
+ */
 static CFTypeRef
 our_answer(CFStringRef key)
 {
 	if (key != NULL && CFEqual(key, CFSTR("ReleaseType"))) {
 		return CFRetain(CFSTR("Vendor"));
+	}
+	if (key != NULL && CFEqual(key, CFSTR("WifiVendor"))) {
+		return NULL;
 	}
 	return MGCopyAnswer(key);
 }
