@@ -14,6 +14,7 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <execinfo.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
@@ -320,6 +321,25 @@ __attribute__((used)) static struct {
 	(const void *)watched_spawn, (const void *)posix_spawn
 };
 
+/*
+ * An uncaught Objective-C exception, the usual SIGABRT of an application: its name and reason, which
+ * Foundation says only through os_log ("*** Terminating app due to uncaught exception ..."), on the console.
+ */
+static void
+uncaught(id exception)
+{
+	const char *(*string)(id, SEL) = (const char *(*)(id, SEL))objc_msgSend;
+	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+	id name = get(exception, sel_registerName("name")), reason = get(exception, sel_registerName("reason"));
+	char line[900];
+	int n;
+
+	n = snprintf(line, sizeof(line), "hakios: %s: UNCAUGHT EXCEPTION %s: %s\n", who,
+	    name != NULL ? string(name, sel_registerName("UTF8String")) : "?",
+	    reason != NULL ? string(reason, sel_registerName("UTF8String")) : "(no reason)");
+	say(line, (size_t)(n > 0 ? (n < (int)sizeof(line) ? n : (int)sizeof(line) - 1) : 0));
+}
+
 /* Put ours in the place of a method, keeping the one that was there. */
 static void
 watch(const char *name, const char *selector, IMP ours, void *theirs)
@@ -361,6 +381,13 @@ hakios_app_init(void)
 	sigemptyset(&action.sa_mask);
 	for (unsigned i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
 		sigaction(signals[i], &action, NULL);
+	}
+	{
+		void (*set_handler)(void (*)(id)) = (void (*)(void (*)(id)))dlsym(RTLD_DEFAULT, "NSSetUncaughtExceptionHandler");
+
+		if (set_handler != NULL) {
+			set_handler(uncaught);
+		}
 	}
 	if (strcmp(name, "Sileo") == 0) {
 		dispatch_async(dispatch_get_main_queue(), ^{ keep_to_the_repositories(); });
