@@ -26,6 +26,7 @@ phone is here; the kernel, loader and user space are the common ones. `device.co
 | Temperatures | tsens v2, 21 sensors (TM `0xc263000`, `0xc265000`) | | `hakios.thermal.c` (`thermal=1`), reading only |
 | GPU | Adreno 630 (chipid `0x6030001`) | Adreno 642L | `hakios.adreno.c`'s steps hold; registers, GMU firmware and RPMh levels are a630's (Linux `a6xx_gmu.c`, the a630 paths) |
 | Wi-Fi | WCN3990, `icnss`; its firmware a domain of the modem's (`wlan_pd`) | WCN6750 | Linux's ath10k_snoc on the LinuxKPI layer redwood's ath11k uses (`tools/mk-ath10k.sh`, `wifi/lx/ath10k/`, the kernel built `ATH=ath10k`); joins WPA2 and carries iOS's traffic (step 11) |
+| Bluetooth | WCN3990's Bluetooth half on a UART (QUP0 SE6, GPIO 45-48), Qualcomm's rampatch and NVM | WCN6750 | `hakios.bt6t.c` (`bt6t=5`): the firmware, then iOS's own `bluetoothd` over a kernel control and a Skywalk kernel pipe (step 13) |
 | Audio | ADSP (TrustZone PAS 1, 26 MB at `0x8c500000`), Q6 APR; the loudspeaker a TFA9894 on QUAT MI2S; WCD934x "tavil" on SLIMbus for the rest | ADSP; AW88261s on TDM | rework of `hakios.adsp.c` / `hakios.sound.c`, a TFA9894 driver (step 10) |
 | Battery, charging | PMI8998 (fuel gauge, SMB2) | through the ADSP | through the loader from UEFI, as redwood's first way was, but with other protocols (step 7) |
 | Haptics | PMI8998 haptics block (slave 3, peripheral `0xc0`), an LRA | Awinic AW86927 on I2C | `hakios.pmi_haptics.c` (`pmi_haptics=4`), through the PMIC arbiter; Darwin's side is redwood's (`/dev/hakios-haptic`) |
@@ -731,6 +732,42 @@ the modem is stopped as Linux's `q6v5_stop()` does, its own region and the IPA l
 still leaves it running). `modem_stop=1..3` ends step 7 early. USB brings the run's log back short: read it from
 `logdump` on a fresh loader (`xl reboot`, `xl enter`, `xl flash-read logdump 0 166000 F`). Every run on a fresh
 loader: one reused after a run stops answering.
+
+**13. Bluetooth** (done 8 November 2026). The WCN3990's Bluetooth half is a UART (QUP0 serial engine 6 at
+`0x898000`, pins 45-48 function 1, its clock 7.3728 MHz from the GCC) and needs neither the modem nor the Wi-Fi.
+`hakios.bt6t.c` goes in levels: `bt6t=1` looks, `=2` sets the clock and pins, `=3` makes the engine a polled UART
+(115200, RFR by the hardware) and wakes the chip (the power pulses `0xC0`/`0xFC`, then the version: product 0x0a, ROM
+2.1, SoC `0x40010214`), `=4` loads Qualcomm's rampatch and NVM as Linux's `btqca.c` does (`fw-bt/bt/image/crbtfw21.tlv`
+and `crnv21.bin`, from the phone's `bluetooth_b`; the NVM edited for no in-band sleep and 115200), resets it, gives it
+the phone's own address and scans (classic and LE: test only), and `=5` hands the controller to iOS. The address is
+the one Android shows (`adb shell settings get secure bluetooth_address`) saved into `fw-bt/bdaddr`, which `xl`
+passes as `bt6t_bdaddr=`; nothing of it goes into the repository, and the logs show only its last two octets.
+
+How iOS takes it (bluetoothd of 20F66, found by reading it): an IOService named `bluetooth` with `transport-encoding`
+1 (H4; `hakios.bt6t_ioreg.cpp`); BlueTool asked to "boot" and "init" the chip, which it does only from
+`/etc/bluetool/<ProductHash>.<boot|init|deepsleep>.script` on a vendor install -- the scripts (`userland/bluetool.boot.script`,
+a wait of 10 ms: the kernel has booted the chip) and `libhakios.bluetool.dylib`, which tells BlueTool alone that
+MobileGestalt's `ReleaseType` is `Vendor`; then the transport, which on iOS 16 is not a tty but a kernel control
+`com.apple.uart.sk.bluetooth` (termios by socket options, a 12-byte setting, the UUID of a nexus) and a Skywalk
+channel, here a kernel pipe as utun's, its instance bound to bluetoothd's pid. Between bluetoothd and the chip the
+kernel answers what Apple's own controllers have and this one has not (`bt_sk_emulated[]`: Write Default Erroneous
+Data Reporting, marked supported in the command mask; every `0xfce2` OLYMPIC setting; `0xfd1b` FACTORY_CAL_READ_TABLE),
+keeps the chip in legacy LE mode (LE Read Periodic Advertiser List Size answered here), and sets a non-resolvable
+private address before a scan, advertising or connection that wants a random one (Apple's controllers make their own).
+Other Apple vendor commands get the chip's "unknown command", which bluetoothd takes. Each of these was a restart of
+bluetoothd in a run's log (its `reason=`: 3602 a vendor command it will not do without, 712 a legacy command refused,
+718 Scan Enable refused); the kernel's log names every command and event by opcode and status, never its parameters.
+
+Where it stands: Settings shows Bluetooth on and the devices around, and a Pixel 6 Pro paired with the phone (8
+November). Build with `BLUETOOTHD=1` (bluetoothd in, its and BlueTool's log on the console, the scripts and the
+library), then:
+
+```sh
+XL_SECS=330 XL_CMDLINE="bt6t=5" ./xl run
+```
+
+Not done: audio (SCO and A2DP need the chip's PCM and the audio DSP), the chip's sleep (in-band sleep is off),
+higher UART rates, and the chip powered down at the run's end.
 
 ## Firmware
 
