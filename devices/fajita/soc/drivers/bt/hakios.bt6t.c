@@ -1341,9 +1341,12 @@ static struct {
 	uint8_t type, header[4];
 	uint32_t have, need, body, at;          /* (bytes of the header had; header size; body length; body bytes had) */
 	bool patch;                             /* (this is the Command Complete of 0x1002) */
-	uint8_t first[6];                       /* (an event's first parameter bytes: ncmd, opcode, status) */
+	uint8_t first[17];                      /* (an event's first parameter bytes: ncmd, opcode, status; a
+	                                           Synchronous Connection Complete's up to its air mode) */
 } bt_sk_parse;
 static uint32_t bt_sk_events_logged, bt_sk_acl_in, bt_sk_bad_bytes;
+/* (SCO, the voice of a call: packets each way, their sizes the first few times -- never their contents) */
+static uint32_t bt_sk_sco_in, bt_sk_sco_out;
 /* (a packet is handed on whole once it is all there -- or not at all: the Command Complete of a command of ours) */
 static uint8_t bt_sk_pkt[4 + 1100];
 static uint32_t bt_sk_pkt_len, bt_sk_swallow_2005, bt_sk_vendor_dropped, bt_sk_debug_dropped;
@@ -1415,6 +1418,7 @@ bt_sk_disconnected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t 
 	say("bt6t: sk: channel disconnected: %u bytes to the controller, %u from it, %u lost, %u ACL in, %u bytes out of step; "
 	    "%u syncs left bytes behind, %u notifies again\n", bt_sk_tx_bytes, bt_sk_rx_bytes, bt_sk_rx_lost, bt_sk_acl_in,
 	    bt_sk_bad_bytes, bt_sk_rx_short, bt_sk_renotify);
+	say("bt6t: sk: SCO (a call's voice): %u packets from the controller, %u to it\n", bt_sk_sco_in, bt_sk_sco_out);
 	say("bt6t: sk: %u QCA vendor events and %u debug-log ACL packets kept back; %u UART writes failed; the last packets (way, type, length, opcode/event/handle, ms, bytes waiting/64):\n",
 	    bt_sk_vendor_dropped, bt_sk_debug_dropped, bt_sk_tx_failed);
 	{
@@ -1592,6 +1596,27 @@ bt_sk_parse_one(uint8_t *byte)
 	}
 	/* a whole packet */
 	if (bt_sk_parse.type == 0x04) {
+		uint8_t sync_code = bt_sk_parse.header[0];
+		uint16_t status_opcode = bt_sk_parse.first[2] | bt_sk_parse.first[3] << 8;
+
+		/*
+		 * Whatever the count, the setting up of a call's voice link: Synchronous Connection Complete (0x2c: status,
+		 * handle, -address-, link type 0 SCO 2 eSCO, intervals, packet lengths, air mode 2 CVSD 3 transparent) and
+		 * Changed (0x2d), and the Command Status of the commands that ask for one.
+		 */
+		if (sync_code == 0x2c && bt_sk_parse.body >= 17) {
+			const uint8_t *e = bt_sk_parse.first;
+
+			say("bt6t: sk: < Synchronous Connection Complete: status 0x%02x handle 0x%03x link type %u interval %u "
+			    "window %u rx %u tx %u bytes, air mode %u\n", e[0], (e[1] | e[2] << 8) & 0xfff, e[9], e[10], e[11],
+			    e[12] | e[13] << 8, e[14] | e[15] << 8, e[16]);
+		} else if (sync_code == 0x2d && bt_sk_parse.body >= 4) {
+			say("bt6t: sk: < Synchronous Connection Changed: status 0x%02x handle 0x%03x\n", bt_sk_parse.first[0],
+			    (bt_sk_parse.first[1] | bt_sk_parse.first[2] << 8) & 0xfff);
+		} else if (sync_code == 0x0f && bt_sk_parse.body >= 4 && (status_opcode == 0x0428 || status_opcode == 0x0429 ||
+		    status_opcode == 0x043d || status_opcode == 0x043e)) {
+			say("bt6t: sk: < Command Status 0x%04x status 0x%02x (a voice link)\n", status_opcode, bt_sk_parse.first[0]);
+		}
 		if (bt_sk_events_logged++ < 300) {
 			uint8_t code = bt_sk_parse.header[0];
 
@@ -1605,6 +1630,11 @@ bt_sk_parse_one(uint8_t *byte)
 				say("bt6t: sk: < event 0x%02x (%u bytes)%s\n", code, bt_sk_parse.body,
 				    code == 0x3e && bt_sk_parse.body >= 1 ? " LE meta" : "");
 			}
+		}
+	} else if (bt_sk_parse.type == 0x03) {
+		if (bt_sk_sco_in++ < 3) {
+			say("bt6t: sk: < SCO packet, handle 0x%03x, %u bytes of voice\n",
+			    (bt_sk_parse.header[0] | bt_sk_parse.header[1] << 8) & 0xfff, bt_sk_parse.body);
 		}
 	} else {
 		bt_sk_acl_in++;
@@ -1694,6 +1724,18 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 				}
 				data[5] = 1;
 			}
+			if ((opcode == 0x0428 || opcode == 0x0429) && length >= 20) {
+				/* (Setup/Accept: bandwidths, latency, voice setting, retransmission effort, packet types) */
+				const uint8_t *c = data + 4 + (opcode == 0x0428 ? 2 : 6);
+
+				say("bt6t: sk: > %s Synchronous Connection: tx %u rx %u B/s, latency %u ms, voice setting 0x%03x, "
+				    "retransmission %u, packet types 0x%04x\n", opcode == 0x0428 ? "Setup" : "Accept",
+				    c[0] | c[1] << 8 | c[2] << 16 | (uint32_t)c[3] << 24, c[4] | c[5] << 8 | c[6] << 16 | (uint32_t)c[7] << 24,
+				    c[8] | c[9] << 8, c[10] | c[11] << 8, c[12], c[13] | c[14] << 8);
+			} else if (opcode == 0x043d || opcode == 0x043e) {
+				say("bt6t: sk: > Enhanced %s Synchronous Connection (%u bytes)\n", opcode == 0x043d ? "Setup" : "Accept",
+				    length);
+			}
 			if (bt_sk_tx_logged++ < 300) {
 				if ((opcode >> 10) == 0x3f) {
 					/* (a vendor command's parameters in full: they are settings, not addresses) */
@@ -1704,6 +1746,11 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 				} else {
 					say("bt6t: sk: > command 0x%04x (%u bytes)\n", opcode, length);
 				}
+			}
+		} else if (length && data[0] == 0x03) {
+			if (bt_sk_sco_out++ < 3) {
+				say("bt6t: sk: > SCO packet, handle 0x%03x, %u bytes of voice\n",
+				    length >= 3 ? (data[1] | data[2] << 8) & 0xfff : 0, length >= 4 ? data[3] : 0);
 			}
 		} else if (bt_sk_tx_logged++ < 300) {
 			say("bt6t: sk: > %s packet, %u bytes\n", length && data[0] == 0x02 ? "ACL" : "other", length);
