@@ -1346,7 +1346,7 @@ static struct {
 static uint32_t bt_sk_events_logged, bt_sk_acl_in, bt_sk_bad_bytes;
 /* (a packet is handed on whole once it is all there -- or not at all: the Command Complete of a command of ours) */
 static uint8_t bt_sk_pkt[4 + 1100];
-static uint32_t bt_sk_pkt_len, bt_sk_swallow_2005, bt_sk_vendor_dropped;
+static uint32_t bt_sk_pkt_len, bt_sk_swallow_2005, bt_sk_vendor_dropped, bt_sk_debug_dropped;
 static bool bt_sk_random_set;                   /* (LE Set Random Address done since the last HCI_Reset) */
 /*
  * The last 64 packets each way, for the end of a channel: which way, H4 type, length, an event's code or a command's
@@ -1415,8 +1415,8 @@ bt_sk_disconnected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t 
 	say("bt6t: sk: channel disconnected: %u bytes to the controller, %u from it, %u lost, %u ACL in, %u bytes out of step; "
 	    "%u syncs left bytes behind, %u notifies again\n", bt_sk_tx_bytes, bt_sk_rx_bytes, bt_sk_rx_lost, bt_sk_acl_in,
 	    bt_sk_bad_bytes, bt_sk_rx_short, bt_sk_renotify);
-	say("bt6t: sk: %u QCA vendor events kept back; %u UART writes failed; the last packets (way, type, length, opcode/event/handle, ms, bytes waiting/64):\n",
-	    bt_sk_vendor_dropped, bt_sk_tx_failed);
+	say("bt6t: sk: %u QCA vendor events and %u debug-log ACL packets kept back; %u UART writes failed; the last packets (way, type, length, opcode/event/handle, ms, bytes waiting/64):\n",
+	    bt_sk_vendor_dropped, bt_sk_debug_dropped, bt_sk_tx_failed);
 	{
 		uint32_t total = sizeof(bt_sk_marks) / sizeof(bt_sk_marks[0]), first = bt_sk_marks_n > total ? bt_sk_marks_n - total : 0;
 
@@ -1524,11 +1524,20 @@ bt_sk_parse_byte(uint8_t *byte)
 		 * the link given up (reasons 129, 3602; runs 203400, 204010, 204722).
 		 */
 		bool vendor = bt_sk_pkt_len >= 2 && bt_sk_pkt[0] == 0x04 && bt_sk_pkt[1] == 0xff;
+		/*
+		 * Nor its debug log: ACL packets on handle 0xedc (0x2edc with the flags; hci_qca.c QCA_DEBUG_HANDLE, which
+		 * Linux takes out before the stack), some 500 bytes each, many at 3 Mbit/s with a link up. bluetoothd took
+		 * them for data of a connection it never made, waited for the rest, and gave the transport up ("Timed out
+		 * while receiving a packet", every HCI command after it status 129, A2DP's start with them: run 215408).
+		 */
+		bool debug = bt_sk_pkt_len >= 3 && bt_sk_pkt[0] == 0x02 && (bt_sk_pkt[1] | (bt_sk_pkt[2] & 0x0f) << 8) == 0x0edc;
 
 		if (drop) {
 			bt_sk_swallow_2005--;
 		} else if (vendor) {
 			bt_sk_vendor_dropped++;
+		} else if (debug) {
+			bt_sk_debug_dropped++;
 		} else {
 			bt_sk_put(bt_sk_pkt, bt_sk_pkt_len);
 		}

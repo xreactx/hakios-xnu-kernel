@@ -89,9 +89,12 @@ SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
 # sound, outside the directories above: the virtual audio device, a plug-in that all of mediaserverd's
 # audio goes through, with its tunings (signal processing chains) for this model and for any, and the
-# system's own sounds. Not the neural networks among the tunings, nor the sounds of the watch.
+# system's own sounds. Not the neural networks among the tunings, nor the sounds of the watch. And of the audio
+# server's hardware plug-ins only the Bluetooth one (BTAudioHALPlugin: bluetoothd publishes a connected speaker or
+# headset to it over XPC, com.apple.BTAudioHALPlugin.xpc, and through it the audio server plays to the device);
+# userland/build.sh puts the port's own device (HakiosAudio.driver) beside it.
 AUDIO = ('Library/Audio/Plug-Ins/', 'Library/Audio/Tunings/D22/', 'Library/Audio/Tunings/Generic/',
-         'System/Library/Audio/UISounds/')
+         'System/Library/Audio/UISounds/', 'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver/')
 SKIP_AUDIO = ('System/Library/Audio/UISounds/nano/',)
 KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
 
