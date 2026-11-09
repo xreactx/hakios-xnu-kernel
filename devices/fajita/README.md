@@ -759,12 +759,10 @@ bluetoothd in a run's log (its `reason=`: 3602 a vendor command it will not do w
 718 Scan Enable refused); the kernel's log names every command and event by opcode and status, never its parameters.
 
 Where it stands: Settings shows Bluetooth on and the devices around, and a Pixel 6 Pro paired with the phone (8
-November). Build with `BLUETOOTHD=1` (bluetoothd in, its and BlueTool's log on the console, the scripts and the
-library), then:
-
-```sh
-XL_SECS=330 XL_CMDLINE="bt6t=5" ./xl run
-```
+November); with the modem and the Wi-Fi on beside it (run 201902) bluetoothd stays up, the Wi-Fi carries 30 MB and
+the modem registers. It is on by default: `CONFIG_BT6T=5` in `configs/fajita.config`, and `userland/build.sh` puts
+bluetoothd in (its and BlueTool's log on the console, the scripts, the library) for `DEVICE=fajita` unless
+`BLUETOOTHD=0`. `XL_CMDLINE="bt6t=0"` leaves Bluetooth off for a run.
 
 Not done: audio (SCO and A2DP need the chip's PCM and the audio DSP), the chip's sleep (in-band sleep is off),
 higher UART rates, and the chip powered down at the run's end.

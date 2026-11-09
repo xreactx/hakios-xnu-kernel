@@ -61,6 +61,9 @@ battery_stop_poll	k
 battmgr	k
 bootcpu	kl
 bt	k
+bt6t	k
+bt6t_bdaddr	k
+bt6t_rfr	k
 bt_again	k
 buttons	k
 buttons_after	k
@@ -192,6 +195,7 @@ mic_tap	k
 mic_test	k
 mic_wcd	k
 modem	k
+modem_after	k
 modem_again	k
 modem_apn	k
 modem_buffer	k
@@ -376,6 +380,7 @@ wifi_again	k
 wifi_ask	k
 wifi_ba	k
 wifi_cal	k
+wifi_debug	k
 wifi_dirty	k
 wifi_file	k
 wifi_fine	k

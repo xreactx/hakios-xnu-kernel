@@ -56,6 +56,9 @@ AUTOUNLOCK	arg	autounlock	User space	u	inject_sb.c
 BATTERY	arg	battery	Audio and battery	kl	hakios.adsp.c,hakios.battery.c,loader.c	
 BATTMGR	arg	battmgr	Audio and battery	k	hakios.adsp.c	every property once, for the log (which number is which on this phone's firmware)
 BT	arg	bt	User space	k	hakios.bt.c	
+BT6T	arg	bt6t	User space	k	hakios.bt6t.c	the clocks voted on (the engine's at 7.3728 MHz) and the pins set, then the same look at the engine
+BT6T_BDADDR	arg	bt6t_bdaddr	User space	k	hakios.bt6t.c	the phone's own address (xl adds it from fw-bt/bdaddr)
+BT6T_RFR	arg	bt6t_rfr	User space	k	hakios.bt6t.c	RFR held ready instead of by the hardware
 BT_AGAIN	arg	bt_again	User space	k	hakios.bt.c	the second look this many seconds later (0: no second look; 30)
 BUTTONS	arg	buttons	Touch and buttons	k	hakios.buttons.c	
 BUTTONS_AFTER	arg	buttons_after	Touch and buttons	k	hakios.buttons.c	
@@ -176,6 +179,7 @@ MIC_SECS	arg	mic_secs	Audio and battery	k	hakios.mic.c
 MIC_TAP	arg	mic_tap	Audio and battery	k	hakios.mic.c	
 MIC_TEST	arg	mic_test	Audio and battery	k	hakios.mic.c	
 MIC_WCD	arg	mic_wcd	Audio and battery	k	hakios.mic.c	
+MODEM_AFTER	arg	modem_after	Cellular	k	hakios.mpss.c	
 MODEM_APN	arg	modem_apn	Cellular	k	hakios.mpss.c	a session to that APN instead of the default profile
 MODEM_DATA_NOBIND	arg	modem_data_nobind	Cellular	k	hakios.mpss.c	
 MODEM_DATA_OFF	arg	modem_data_off	Cellular	k	hakios.mpss.c	
@@ -342,6 +346,7 @@ WIFI_AGAIN	arg	wifi_again	Wi-Fi	k	hakios.wifi.c	start the DSP although the one b
 WIFI_ASK	arg	wifi_ask	Wi-Fi	k	hakios.wifi.c	step 14 also asks that service a question (its capabilities) and writes down the beginning of an answer
 WIFI_BA	arg	wifi_ba	Wi-Fi	k	lx_80211.c	
 WIFI_CAL	arg	wifi_cal	Wi-Fi	k	hakios.wlfw.c	
+WIFI_DEBUG	arg	wifi_debug	Wi-Fi	k	lx_snoc.c	
 WIFI_DIRTY	arg	wifi_dirty	Wi-Fi	k	hakios.wifi.c	
 WIFI_FILE	arg	wifi_file	Wi-Fi	k	hakios.wifi.c	with wifi=1: the network of fw/network is not joined at the start
 WIFI_FINE	arg	wifi_fine	Wi-Fi	k	hakios.wifi.c	such a step waits like that before every single write and call
@@ -357,7 +362,7 @@ WIFI_MAC	arg	wifi_mac	Wi-Fi	k	hakios.wifi.c	the radio's own address for the driv
 WIFI_MISSION	arg	wifi_mission	Wi-Fi	k	hakios.wlfw.c	
 WIFI_NEW	arg	wifi_new	Wi-Fi	k	hakios.wifi.c	steps K and later have not been seen to work (default: the last one)
 WIFI_PAUSE	arg	wifi_pause	Wi-Fi	k	hakios.wifi.c	
-WIFI_QUIET	arg	wifi_quiet	Wi-Fi	k	lx_bus.c,lx_snoc.c	
+WIFI_QUIET	arg	wifi_quiet	Wi-Fi	k	lx_80211.c,lx_bus.c,lx_snoc.c	
 WIFI_RADIO_READ	arg	wifi_radio_read	Wi-Fi	k	hakios.wifi.c	step 16 does read (2: whatever mode the firmware is in)
 WIFI_READY	arg	wifi_ready	Wi-Fi	k	hakios.wlfw.c	
 WIFI_RETURN	arg	wifi_return	Wi-Fi	k	hakios.wifi.c	when all is over, go back to the loader instead of starting the system

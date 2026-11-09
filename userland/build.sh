@@ -129,8 +129,10 @@ DARWIN_JOBS=${JOBS-"
 [ "${WIFID-1}" != 0 ] && DARWIN_JOBS="$DARWIN_JOBS com.apple.wifid"
 # Darwin's own Bluetooth daemon, for the 6T's WCN3990 (devices/fajita/soc/drivers/bt/hakios.bt6t.c, bt6t=5): the kernel
 # brings the controller up and hands it over as /dev/cu.bluetooth with the IOService "bluetooth" (transport-encoding
-# 1, H4), which is how bluetoothd takes a UART controller. BLUETOOTHD=1 puts it in, its os_log on the console. Off
-# by default until it is known what it does on a phone without the kernel's side (bt6t=5).
+# 1, H4), which is how bluetoothd takes a UART controller. BLUETOOTHD=1 puts it in, its os_log on the console.
+# On by default for the 6T (its kernel hands the controller over with bt6t=5, in its configuration since 8 November);
+# BLUETOOTHD=0 leaves it out, BLUETOOTHD=1 puts it in for another phone.
+[ -z "${BLUETOOTHD+set}" ] && { [ "${DEVICE:-}" = fajita ] && BLUETOOTHD=1 || BLUETOOTHD=0; }
 BT_PLATFORM=fd079b298144a7deb4d7c87fef3eb474d8f0e7eb      # (MobileGestalt's ProductHash on this port, BlueTool's log)
 if [ "${BLUETOOTHD-0}" != 0 ]; then
 	DARWIN_JOBS="$DARWIN_JOBS com.apple.bluetoothd"
