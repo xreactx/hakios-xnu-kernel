@@ -3539,7 +3539,7 @@ index 2c2186ffbca5..0dacde2b8c47 100644
  /*
   * Video information..
 diff --git a/osfmk/kern/thread_policy.c b/osfmk/kern/thread_policy.c
-index 1073c7edc2af..384474332b72 100644
+index 1073c7edc2af..2fc4567ac74a 100644
 --- a/osfmk/kern/thread_policy.c
 +++ b/osfmk/kern/thread_policy.c
 @@ -27,6 +27,7 @@
@@ -3630,7 +3630,20 @@ index 1073c7edc2af..384474332b72 100644
  			result = KERN_INVALID_ARGUMENT;
  			break;
  		}
-@@ -407,6 +449,14 @@ thread_policy_set_internal(
+@@ -404,9 +446,27 @@ thread_policy_set_internal(
+ 		info = (thread_time_constraint_with_priority_policy_t)policy_info;
+ 
+ 
++		/*
++		 * HakiOS: iOS's audio (caulk, AURemoteIO's I/O thread) asks for a computation of 1200000 ticks, which is
++		 * exactly the 50 ms maximum on Apple's 24 MHz timebase -- but 62.5 ms on this phone's 19.2 MHz one, more
++		 * than max_rt_quantum, and the refusal kills every recording through a Bluetooth headset (run 194124:
++		 * period 4915200, computation 1200000, constraint 4915200). Too long a computation is cut to the maximum
++		 * instead, which is what the caller meant.
++		 */
++		if (info->computation > max_rt_quantum && info->constraint >= max_rt_quantum) {
++			info->computation = max_rt_quantum;
++		}
  		if (info->constraint < info->computation ||
  		    info->computation > max_rt_quantum ||
  		    info->computation < min_rt_quantum) {
