@@ -1604,6 +1604,26 @@ bt_sk_parse_byte(uint8_t *byte)
 		 */
 		bool debug = bt_sk_pkt_len >= 3 && bt_sk_pkt[0] == 0x02 && (bt_sk_pkt[1] | (bt_sk_pkt[2] & 0x0f) << 8) == 0x0edc;
 
+		/*
+		 * btslim>=4: the voice goes by the SLIMbus at 8 kHz, so the link must be CVSD -- with a transparent (mSBC)
+		 * link the chip codes the voice itself and wants 16 kHz on the bus: its RX 16 underran and the headset heard
+		 * nothing (run 212152). Read Local Supported Features answered without LMP feature byte 2 bit 3 (transparent
+		 * synchronous data): bluetoothd then offers the headset CVSD alone.
+		 */
+		if (bt_sk_pkt_len >= 15 && bt_sk_pkt[0] == 0x04 && bt_sk_pkt[1] == 0x0e && (bt_sk_pkt[4] | bt_sk_pkt[5] << 8) == 0x1003) {
+			static int slim_level = -1;
+
+			if (slim_level < 0) {
+				uint32_t l = 0;
+
+				(void)PE_parse_boot_argn("btslim", &l, sizeof(l));
+				slim_level = (int)l;
+			}
+			if (slim_level >= 4 && (bt_sk_pkt[9] & 0x08)) {
+				bt_sk_pkt[9] &= (uint8_t)~0x08;
+				say("bt6t: sk: < Read Local Supported Features: transparent SCO hidden (btslim: CVSD at 8 kHz on the SLIMbus)\n");
+			}
+		}
 		if (bt_sk_esco_pending > 0 && bt_sk_pkt_len >= 7 && bt_sk_pkt[0] == 0x04 && bt_sk_pkt[1] == 0x0f &&
 		    (bt_sk_pkt[5] | bt_sk_pkt[6] << 8) == 0x043d) {
 			bt_sk_esco_pending--;
