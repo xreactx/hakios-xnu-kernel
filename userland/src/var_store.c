@@ -95,6 +95,60 @@ static const char *const SKIP[] = {
 
 enum { ENT_DIR = 1, ENT_FILE = 2, ENT_SYMLINK = 3, ENT_HARDLINK = 4, ENT_DIRTIME = 5 };
 
+/*
+ * What takes the room: the bytes of the files saved, by their path's first three parts (containers/Data/Application,
+ * mobile/Library/Mail, ...), the largest said after every save -- so that when the archive outgrows its slot what
+ * grew is in the log, not guessed.
+ */
+#define TALLIES 96
+static struct { char key[96]; uint64_t bytes; } tallies[TALLIES];
+static unsigned tally_count;
+
+static void
+tally(const char *relative, uint64_t bytes)
+{
+	char key[96];
+	unsigned parts = 0, i = 0;
+
+	for (; relative[i] != 0 && i < sizeof(key) - 1; i++) {
+		if (relative[i] == '/' && ++parts == 3) {
+			break;
+		}
+		key[i] = relative[i];
+	}
+	key[i] = 0;
+	for (unsigned t = 0; t < tally_count; t++) {
+		if (strcmp(tallies[t].key, key) == 0) {
+			tallies[t].bytes += bytes;
+			return;
+		}
+	}
+	if (tally_count < TALLIES) {
+		memcpy(tallies[tally_count].key, key, i + 1);   /* (key and its NUL: i < 96) */
+		tallies[tally_count++].bytes = bytes;
+	}
+}
+
+static void
+tally_say(void)
+{
+	for (int shown = 0; shown < 12; shown++) {
+		unsigned best = TALLIES;
+
+		for (unsigned t = 0; t < tally_count; t++) {
+			if (tallies[t].bytes != 0 && (best == TALLIES || tallies[t].bytes > tallies[best].bytes)) {
+				best = t;
+			}
+		}
+		if (best == TALLIES) {
+			break;
+		}
+		printf("var_store:   %8llu KB  %s\n", (unsigned long long)(tallies[best].bytes / 1024), tallies[best].key);
+		tallies[best].bytes = 0;
+	}
+	tally_count = 0;
+}
+
 #define HEAD_MAGIC      "RDWVAR\0"
 #define HEAD_VERSION    1
 
@@ -619,6 +673,13 @@ is_skipped(const char *relative)
 			return 1;
 		}
 	}
+	/*
+	 * a tmp anywhere: every container has its own, which iOS empties itself (a video app's buffers there took the
+	 * archive past its 201 MiB slot on 9 November: "the archive does not fit in its slot", run 214700)
+	 */
+	if (n >= 4 && strcmp(relative + n - 4, "/tmp") == 0) {
+		return 1;
+	}
 	/* a Library/Caches anywhere: the user's, a container's, a daemon's (what is in a cache is to be had again) */
 	return n >= c && strcmp(relative + n - c, caches) == 0 && (n == c || relative[n - c - 1] == '/');
 }
@@ -715,6 +776,7 @@ pack_one(const char *relative, const struct stat *st)
 	case S_IFREG:
 		kind = ENT_FILE;
 		size = (uint64_t)st->st_size;
+		tally(relative, size);
 		if (st->st_nlink > 1) {
 			first = link_name(st->st_ino, relative);
 			if (first != NULL) {
@@ -998,6 +1060,8 @@ save(void)
 	    (unsigned long long)h.generation, (unsigned long long)h.entries, (unsigned long long)h.bytes,
 	    h.crc, skipped_kinds ? " (sockets and the like left out)" : "",
 	    skipped_big ? " (something too big left out)" : "");
+	printf("var_store: the largest parts of what was saved:\n");
+	tally_say();
 	if (last_saved_at != 0) {
 		printf("var_store: %llu entries and %llu bytes of it were written since the last save "
 		    "(%llu seconds ago)\n", (unsigned long long)changed_entries,
@@ -1442,6 +1506,8 @@ watch(int seconds)
 
 			if (!ok) {
 				printf("var_store: this save came to nothing; the store keeps what it had\n");
+				printf("var_store: the largest parts of what it tried to save:\n");
+				tally_say();
 			}
 			last = (uint64_t)tv.tv_sec;
 			if (asked) {
