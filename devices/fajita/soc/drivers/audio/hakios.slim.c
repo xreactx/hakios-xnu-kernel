@@ -1091,30 +1091,57 @@ btslim_channels(uint8_t pgd, uint8_t ifd, bool on, unsigned which)
 		return false;
 	}
 	for (int dir = 0; dir < 2 && ok; dir++) {
-		bool tx = dir == 0;
+		bool tx = dir == 0, live = false;
 
 		if (!(which & (tx ? BTSLIM_TX : BTSLIM_RX))) {
 			continue;
 		}
-		tid = slim_tid++;
-		payload[0] = pgd; payload[1] = tx ? CHRK_PORT_TX_SCO : CHRK_PORT_RX_SCO; payload[2] = tx ? BTSLIM_CH_TX : BTSLIM_CH_RX;
-		payload[3] = tid;
-		ok &= ngd_ask_manager(tx ? "btslim: port TX 0 the source of channel 159" : "btslim: port RX 16 the sink of channel 157",
-		    tx ? SLIM_USR_MC_CONNECT_SRC : SLIM_USR_MC_CONNECT_SINK, payload, 4, tid);
-		/* DEF_ACT_CHAN (Linux qcom_slim_ngd_enable_stream): 8 kHz -> ratem 2, segment interval 1536/2 = 768, a multiple of 3 */
-		tid = slim_tid++;
-		payload[0] = pgd;
-		payload[1] = 16 >> 2;           /* 16 bits a sample; segment interval a multiple of 3: bit 5 clear */
-		payload[2] = 0 << 4 | 0;        /* exponent 0, isochronous */
-		payload[3] = 0x11 | 0x80;       /* 8000 Hz, channel content fixed */
-		payload[4] = tid;
-		payload[5] = tx ? BTSLIM_CH_TX : BTSLIM_CH_RX;
-		ok &= ngd_ask_manager(tx ? "btslim: channel 159 defined and activated" : "btslim: channel 157 defined and activated",
-		    SLIM_USR_MC_DEF_ACT_CHAN, payload, 6, tid);
-		tid = slim_tid++;
-		payload[0] = tid;
-		payload[1] = pgd;
-		ok &= ngd_ask_manager("btslim: reconfigure now", SLIM_USR_MC_RECONFIG_NOW, payload, 2, tid);
+		/*
+		 * The channel's definition for 8 kHz, three ways until the manager takes RECONFIGURE_NOW (step 3: run 205546
+		 * had exponent 0, Linux's shortcut, refused). 8000 = 4000 x 2^1: root 4 kHz (bit 5 clear), exponent 1.
+		 *   A: as the codec's 48 kHz channel is sent (laddr, rate code | content fixed), exponent 1
+		 *   B: as downstream's ngd_allocbw() sends it: dataf LPCM << 5 | laddr's low 5 bits, rate code alone
+		 *   C: B's first byte, A's rate byte
+		 */
+		for (int variant = 0; variant < 3 && !live; variant++) {
+			uint8_t first = variant == 0 ? pgd : (uint8_t)(1u << 5 | (pgd & 0x1f));
+			uint8_t rate = variant == 1 ? 0x11 : 0x11 | 0x80;
+
+			tid = slim_tid++;
+			payload[0] = pgd; payload[1] = tx ? CHRK_PORT_TX_SCO : CHRK_PORT_RX_SCO;
+			payload[2] = tx ? BTSLIM_CH_TX : BTSLIM_CH_RX; payload[3] = tid;
+			if (!ngd_ask_manager(tx ? "btslim: port TX 0 the source of channel 159" :
+			    "btslim: port RX 16 the sink of channel 157", tx ? SLIM_USR_MC_CONNECT_SRC : SLIM_USR_MC_CONNECT_SINK,
+			    payload, 4, tid)) {
+				ok = false;
+				break;
+			}
+			tid = slim_tid++;
+			payload[0] = first;
+			payload[1] = 16 >> 2;           /* 16 bits a sample; root 4 kHz: bit 5 clear */
+			payload[2] = 1 << 4 | 0;        /* exponent 1, isochronous */
+			payload[3] = rate;
+			payload[4] = tid;
+			payload[5] = tx ? BTSLIM_CH_TX : BTSLIM_CH_RX;
+			printf("btslim: channel %u, variant %c: %02x %02x %02x %02x\n", payload[5], 'A' + variant, payload[0], payload[1],
+			    payload[2], payload[3]);
+			if (ngd_ask_manager(tx ? "btslim: channel 159 defined and activated" : "btslim: channel 157 defined and activated",
+			    SLIM_USR_MC_DEF_ACT_CHAN, payload, 6, tid)) {
+				tid = slim_tid++;
+				payload[0] = tid;
+				payload[1] = pgd;
+				live = ngd_ask_manager("btslim: reconfigure now", SLIM_USR_MC_RECONFIG_NOW, payload, 2, tid);
+			}
+			if (live) {
+				printf("btslim: CHANNEL %u LIVE with variant %c\n", tx ? BTSLIM_CH_TX : BTSLIM_CH_RX, 'A' + variant);
+			} else {
+				tid = slim_tid++;
+				payload[0] = pgd; payload[1] = tx ? CHRK_PORT_TX_SCO : CHRK_PORT_RX_SCO; payload[2] = tid;
+				(void)ngd_ask_manager("btslim: port disconnected for the next variant", SLIM_USR_MC_DISCONNECT_PORT,
+				    payload, 3, tid);
+			}
+		}
+		ok &= live;
 	}
 	return ok;
 }
