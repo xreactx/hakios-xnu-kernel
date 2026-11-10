@@ -57,9 +57,16 @@ BATTERY	arg	battery	Audio and battery	kl	hakios.adsp.c,hakios.battery.c,loader.c
 BATTMGR	arg	battmgr	Audio and battery	k	hakios.adsp.c	every property once, for the log (which number is which on this phone's firmware)
 BT	arg	bt	User space	k	hakios.bt.c	
 BT6T	arg	bt6t	User space	k	hakios.bt6t.c	the clocks voted on (the engine's at 7.3728 MHz) and the pins set, then the same look at the engine
+BT6T_BAUD	arg	bt6t_baud	User space	k	hakios.bt6t.c	
 BT6T_BDADDR	arg	bt6t_bdaddr	User space	k	hakios.bt6t.c	the phone's own address (xl adds it from fw-bt/bdaddr)
+BT6T_CTS	arg	bt6t_cts	User space	k	hakios.bt6t.c	
+BT6T_ESCO	arg	bt6t_esco	User space	k	hakios.bt6t.c	bluetoothd's Setup Synchronous Connection (0x0428) sent as Enhanced Setup Synchronous Connection
+BT6T_NVM	arg	bt6t_nvm	User space	k	hakios.bt6t.c	
+BT6T_NVMFILE	arg	bt6t_nvmfile	User space	k	hakios.bt6t.c	another NVM of the small image's fw/ for a run (userland/build.sh takes every crnv21*.bin of ../fw-bt) -- crnv21-t44.bin is the phone's with the tag
 BT6T_RFR	arg	bt6t_rfr	User space	k	hakios.bt6t.c	RFR held ready instead of by the hardware
 BT_AGAIN	arg	bt_again	User space	k	hakios.bt.c	the second look this many seconds later (0: no second look; 30)
+BTSLIM	arg	btslim	User space	k	hakios.bt6t.c,hakios.slim.c	the voice goes by the SLIMbus; bluetoothd's own over HCI is kept from the chip
+BTSLIM_RATE	arg	btslim_rate	Audio and battery	k	hakios.mic.c,hakios.slim.c	
 BUTTONS	arg	buttons	Touch and buttons	k	hakios.buttons.c	
 BUTTONS_AFTER	arg	buttons_after	Touch and buttons	k	hakios.buttons.c	
 BUTTONS_POLL_MS	arg	buttons_poll_ms	Touch and buttons	k	hakios.buttons.c	

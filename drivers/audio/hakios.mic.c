@@ -1271,7 +1271,7 @@ static uint32_t mic_port = 0xb037, wcd;
 static uint32_t mic_rate = 48000;               /* (8000 for the Bluetooth headset's microphone: hakios_mic_bt_probe) */
 static uint32_t mic_slim_device, mic_slim_channel = 128;       /* (the AFE's SLIMbus device 1 = 0, its channel) */
 static bool mic_bt;                                     /* (the probe: SLIMBUS_7_TX of the Bluetooth chip's bus) */
-static uint32_t bt_rate = 8000;                 /* btslim_rate=16000: the wideband link's 16 kHz */
+static uint32_t bt_rate = 16000;                /* the wideband link's 16 kHz (btslim_rate=8000 for CVSD) */
 #define MIC_RATE                                mic_rate
 #define MIC_PERIODS                             8
 #define MIC_PERIOD_FRAMES                       (mic_rate / 50) /* 20 ms, one channel of 16 bits */
@@ -2242,7 +2242,7 @@ bt_bridge_thread(__unused void *parameter, __unused wait_result_t result)
 	quiet = false;
 	mic_bt = true;
 	(void)PE_parse_boot_argn("btslim_rate", &bt_rate, sizeof(bt_rate));
-	bt_rate = bt_rate == 16000 ? 16000 : 8000;
+	bt_rate = bt_rate == 8000 ? 8000 : 16000;
 	mic_rate = bt_rate;
 	mic_slim_device = 1;
 	mic_slim_channel = 159;
@@ -2362,7 +2362,7 @@ bt_probe_thread(void *parameter, __unused wait_result_t result)
 	quiet = false;
 	mic_bt = true;
 	(void)PE_parse_boot_argn("btslim_rate", &bt_rate, sizeof(bt_rate));
-	bt_rate = bt_rate == 16000 ? 16000 : 8000;
+	bt_rate = bt_rate == 8000 ? 8000 : 16000;
 	mic_rate = bt_rate;
 	mic_slim_device = 1;
 	mic_slim_channel = 159;

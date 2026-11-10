@@ -1617,7 +1617,7 @@ bt_sk_parse_byte(uint8_t *byte)
 			static int slim_level = -1;
 
 			if (slim_level < 0) {
-				uint32_t l = 0;
+				uint32_t l = 6;         /* (btslim's default: the call-audio bridge) */
 
 				(void)PE_parse_boot_argn("btslim", &l, sizeof(l));
 				slim_level = (int)l;
@@ -1708,10 +1708,11 @@ bt_sk_parse_one(uint8_t *byte)
 			    "window %u rx %u tx %u bytes, air mode %u\n", e[0], (e[1] | e[2] << 8) & 0xfff, e[9], e[10], e[11],
 			    e[12] | e[13] << 8, e[14] | e[15] << 8, e[16]);
 			if (e[0] == 0) {
-				uint32_t slim_level = 0;
+				uint32_t slim_level = 6;        /* (the bridge is the default; btslim=0 leaves it out) */
 
-				/* step 3 of a call's voice over the SLIMbus: the headset's microphone listened to (hakios.mic.c) */
-				if (PE_parse_boot_argn("btslim", &slim_level, sizeof(slim_level)) && slim_level >= 6) {
+				/* steps 3 and 4 of a call's voice over the SLIMbus (hakios.mic.c) */
+				(void)PE_parse_boot_argn("btslim", &slim_level, sizeof(slim_level));
+				if (slim_level >= 6) {
 					say("bt6t: sk: a voice link is up: its voice bridged to the SLIMbus (btslim=6)\n");
 					hakios_mic_bt_bridge(true, (uint16_t)((e[1] | e[2] << 8) & 0xfff));
 				} else if (slim_level >= 4) {
@@ -1942,7 +1943,7 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 				    length >= 3 ? (data[1] | data[2] << 8) & 0xfff : 0, length >= 4 ? data[3] : 0, length, line);
 			}
 			if (slim_level < 0) {
-				uint32_t l = 0;
+				uint32_t l = 6;         /* (btslim's default: the call-audio bridge) */
 
 				(void)PE_parse_boot_argn("btslim", &l, sizeof(l));
 				slim_level = (int)l;

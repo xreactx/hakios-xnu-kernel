@@ -62,9 +62,16 @@ battmgr	k
 bootcpu	kl
 bt	k
 bt6t	k
+bt6t_baud	k
 bt6t_bdaddr	k
+bt6t_cts	k
+bt6t_esco	k
+bt6t_nvm	k
+bt6t_nvmfile	k
 bt6t_rfr	k
 bt_again	k
+btslim	k
+btslim_rate	k
 buttons	k
 buttons_after	k
 buttons_poll_ms	k

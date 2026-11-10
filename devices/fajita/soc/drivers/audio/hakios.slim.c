@@ -1031,7 +1031,7 @@ btslim_leave(void)
 }
 
 static uint32_t btslim_level;
-static uint32_t btslim_rate = 8000;     /* btslim_rate=16000: a wideband (mSBC) link, which the chip codes from 16 kHz */
+static uint32_t btslim_rate = 16000;    /* the wideband (mSBC) links iOS makes, which the chip codes from 16 kHz; btslim_rate=8000 for CVSD */
 static uint8_t btslim_pgd, btslim_ifd;          /* the chip's two devices' logical addresses, once found */
 static bool btslim_sco_on;
 
@@ -1368,7 +1368,7 @@ btslim_up(uint32_t level)
 	int rc;
 
 	(void)PE_parse_boot_argn("btslim_rate", &btslim_rate, sizeof(btslim_rate));
-	btslim_rate = btslim_rate == 16000 ? 16000 : 8000;
+	btslim_rate = btslim_rate == 8000 ? 8000 : 16000;
 	printf("btslim: level %u: the Bluetooth chip's SLIMbus (instance %u), its channels at %u Hz\n", level, BTSLIM_QMI_INSTANCE,
 	    btslim_rate);
 	btslim_level = level;
@@ -1461,8 +1461,9 @@ slim_thread(__unused void *parameter, __unused wait_result_t result)
 		if (level >= 3 && slim_ngd != NULL && (ngd_rd(NGD_STATUS) & NGD_LADDR)) {
 			codec_up();
 		}
-		level = 0;
-		if (PE_parse_boot_argn("btslim", &level, sizeof(level)) && level != 0) {
+		level = 6;      /* (the call-audio bridge is the default: btslim=0 leaves the Bluetooth SLIMbus alone) */
+		(void)PE_parse_boot_argn("btslim", &level, sizeof(level));
+		if (level != 0) {
 			btslim_up(level);
 		}
 	}

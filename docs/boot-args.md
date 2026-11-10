@@ -2,7 +2,7 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **410 arguments**: 339 read by the kernel, 14 by the loader, 68 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **417 arguments**: 346 read by the kernel, 14 by the loader, 68 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
@@ -217,7 +217,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `soc_pas_mpss` | K | `hakios.mpss.c` | `CONFIG_SOC_PAS_MPSS` |  |
 | `soc_smem` | K | `hakios.adsp.c`, `hakios.mpss.c`, `hakios.socinfo.c` | `CONFIG_SOC_SMEM` |  |
 
-## Audio and battery (46)
+## Audio and battery (47)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -237,6 +237,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `battery_stop` | K | `hakios.battguard.c` | `CONFIG_BATTERY_STOP` |  |
 | `battery_stop_poll` | K | `hakios.battguard.c` | `CONFIG_BATTERY_STOP_POLL` |  |
 | `battmgr` | K | `hakios.adsp.c` | `CONFIG_BATTMGR` |  |
+| `btslim_rate` | K | `hakios.mic.c`, `hakios.slim.c` | `CONFIG_BTSLIM_RATE` |  |
 | `mic` | K | `hakios.mic.c` | `CONFIG_MIC` |  |
 | `mic_adc` | K | `hakios.mic.c` | `CONFIG_MIC_ADC` |  |
 | `mic_input` | K | `hakios.mic.c` | `CONFIG_MIC_INPUT` |  |
@@ -436,16 +437,22 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ufs` | L | `loader.c` | `CONFIG_UFS` |  |
 | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
 
-## User space (52)
+## User space (58)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
 | `autounlock` | U | `inject_sb.c` | `CONFIG_AUTOUNLOCK` |  |
 | `bt` | K | `hakios.bt.c` | `CONFIG_BT` |  |
 | `bt6t` | K | `hakios.bt6t.c` | `CONFIG_BT6T` |  |
+| `bt6t_baud` | K | `hakios.bt6t.c` | `CONFIG_BT6T_BAUD` |  |
 | `bt6t_bdaddr` | K | `hakios.bt6t.c` | `CONFIG_BT6T_BDADDR` |  |
+| `bt6t_cts` | K | `hakios.bt6t.c` | `CONFIG_BT6T_CTS` |  |
+| `bt6t_esco` | K | `hakios.bt6t.c` | `CONFIG_BT6T_ESCO` |  |
+| `bt6t_nvm` | K | `hakios.bt6t.c` | `CONFIG_BT6T_NVM` |  |
+| `bt6t_nvmfile` | K | `hakios.bt6t.c` | `CONFIG_BT6T_NVMFILE` |  |
 | `bt6t_rfr` | K | `hakios.bt6t.c` | `CONFIG_BT6T_RFR` |  |
 | `bt_again` | K | `hakios.bt.c` | `CONFIG_BT_AGAIN` |  |
+| `btslim` | K | `hakios.bt6t.c`, `hakios.slim.c` | `CONFIG_BTSLIM` |  |
 | `ca_metallib` | U | `inject.c` | `CONFIG_CA_METALLIB` |  |
 | `ca_prof` | U | `HakiosMetalCA.m` | `CONFIG_CA_PROF` |  |
 | `ca_vbl` | U | `inject.c` | `CONFIG_CA_VBL` |  |
