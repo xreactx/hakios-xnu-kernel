@@ -1031,6 +1031,7 @@ btslim_leave(void)
 }
 
 static uint32_t btslim_level;
+static uint32_t btslim_rate = 8000;     /* btslim_rate=16000: a wideband (mSBC) link, which the chip codes from 16 kHz */
 static uint8_t btslim_pgd, btslim_ifd;          /* the chip's two devices' logical addresses, once found */
 static bool btslim_sco_on;
 
@@ -1119,8 +1120,8 @@ btslim_channels(uint8_t pgd, uint8_t ifd, bool on, unsigned which)
 			tid = slim_tid++;
 			payload[0] = first;
 			payload[1] = 16 >> 2;           /* 16 bits a sample; root 4 kHz: bit 5 clear */
-			payload[2] = 1 << 4 | 0;        /* exponent 1, isochronous */
-			payload[3] = rate;
+			payload[2] = (btslim_rate == 16000 ? 2 : 1) << 4 | 0;   /* 4000 x 2^exponent, isochronous */
+			payload[3] = btslim_rate == 16000 ? (uint8_t)(rate + 1) : rate;     /* rate code 0x12 for 16000 */
 			payload[4] = tid;
 			payload[5] = tx ? BTSLIM_CH_TX : BTSLIM_CH_RX;
 			printf("btslim: channel %u, variant %c: %02x %02x %02x %02x\n", payload[5], 'A' + variant, payload[0], payload[1],
@@ -1366,7 +1367,10 @@ btslim_up(uint32_t level)
 	struct slimbus_power_resp_msg_v01 powered = { { 0, 0 } };
 	int rc;
 
-	printf("btslim: level %u: the Bluetooth chip's SLIMbus (instance %u)\n", level, BTSLIM_QMI_INSTANCE);
+	(void)PE_parse_boot_argn("btslim_rate", &btslim_rate, sizeof(btslim_rate));
+	btslim_rate = btslim_rate == 16000 ? 16000 : 8000;
+	printf("btslim: level %u: the Bluetooth chip's SLIMbus (instance %u), its channels at %u Hz\n", level, BTSLIM_QMI_INSTANCE,
+	    btslim_rate);
 	btslim_level = level;
 	rc = hakios_qmi_handle_init_transport(&btslim_qmi, SLIMBUS_QMI_POWER_REQ_MAX_MSG_LEN + 64, &btslim_qmi_ops,
 	    slim_qmi_handlers, transport);
