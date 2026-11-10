@@ -3539,36 +3539,72 @@ index 2c2186ffbca5..0dacde2b8c47 100644
  /*
   * Video information..
 diff --git a/osfmk/kern/thread_policy.c b/osfmk/kern/thread_policy.c
-index 1073c7edc2af..edead7463adf 100644
+index 1073c7edc2af..384474332b72 100644
 --- a/osfmk/kern/thread_policy.c
 +++ b/osfmk/kern/thread_policy.c
-@@ -273,6 +273,9 @@ thread_policy_set(
+@@ -27,6 +27,7 @@
+  */
+ 
+ #include <mach/mach_types.h>
++#include <stdarg.h>
+ #include <mach/thread_act_server.h>
+ 
+ #include <kern/kern_types.h>
+@@ -260,6 +261,27 @@ thread_qos_scaled_relative_priority(int qos, int qos_relprio)
+  */
+ static TUNABLE(bool, allow_qos_policy_set, "-qos-policy-allow", false);
+ 
++/*
++ * HakiOS: a refused real-time request, said where xl reads it -- the loader's log, as the drivers say things
++ * (a plain printf after the boot never reaches it).
++ */
++extern void loader_log_putc(char c);
++
++static void __printflike(1, 2)
++hakios_rt_say(const char *format, ...)
++{
++	char line[240];
++	va_list list;
++
++	va_start(list, format);
++	vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	printf("%s", line);
++}
++
+ kern_return_t
+ thread_policy_set(
+ 	thread_t                                thread,
+@@ -273,6 +295,9 @@ thread_policy_set(
  	req_qos.qos_tier = THREAD_QOS_UNSPECIFIED;
  
  	if (thread == THREAD_NULL) {
 +		if (flavor == THREAD_TIME_CONSTRAINT_POLICY || flavor == THREAD_TIME_CONSTRAINT_WITH_PRIORITY_POLICY) {
-+			printf("thread_policy_set realtime REFUSED (pid %d): no thread (flavor %d)\n", proc_selfpid(), flavor);
++			hakios_rt_say("thread_policy_set realtime REFUSED (pid %d): no thread (flavor %d)\n", proc_selfpid(), flavor);
 +		}
  		return KERN_INVALID_ARGUMENT;
  	}
  
-@@ -287,10 +290,15 @@ thread_policy_set(
+@@ -287,10 +312,15 @@ thread_policy_set(
  
  		if (flavor == THREAD_TIME_CONSTRAINT_WITH_PRIORITY_POLICY) {
  			if (count < THREAD_TIME_CONSTRAINT_WITH_PRIORITY_POLICY_COUNT) {
-+				printf("thread_policy_set realtime REFUSED (pid %d): with priority, count %u\n", proc_selfpid(), count);
++				hakios_rt_say("thread_policy_set realtime REFUSED (pid %d): with priority, count %u\n", proc_selfpid(), count);
  				return KERN_INVALID_ARGUMENT;
  			}
  			thread_time_constraint_with_priority_policy_t info = (thread_time_constraint_with_priority_policy_t)policy_info;
  			if (info->priority != BASEPRI_RTQUEUES) {
 +				/* HakiOS: which priority was asked for (Voice Memos with a Bluetooth headset, run 191616) */
-+				printf("thread_policy_set realtime REFUSED (pid %d): priority %u, not %d; period %u computation %u "
++				hakios_rt_say("thread_policy_set realtime REFUSED (pid %d): priority %u, not %d; period %u computation %u "
 +				    "constraint %u\n", proc_selfpid(), info->priority, BASEPRI_RTQUEUES, info->period, info->computation,
 +				    info->constraint);
  				return KERN_INVALID_ARGUMENT;
  			}
  		}
-@@ -321,6 +329,16 @@ thread_policy_set(
+@@ -321,6 +351,16 @@ thread_policy_set(
  
  	kr = thread_policy_set_internal(thread, flavor, policy_info, count);
  
@@ -3577,7 +3613,7 @@ index 1073c7edc2af..edead7463adf 100644
 +		static uint32_t hakios_rt_failed;
 +
 +		if (hakios_rt_failed++ < 8) {
-+			printf("thread_policy_set realtime FAILED (pid %d): flavor %d count %u -> kr %d\n", proc_selfpid(), flavor,
++			hakios_rt_say("thread_policy_set realtime FAILED (pid %d): flavor %d count %u -> kr %d\n", proc_selfpid(), flavor,
 +			    count, kr);
 +		}
 +	}
@@ -3585,16 +3621,16 @@ index 1073c7edc2af..edead7463adf 100644
  	if (req_qos.qos_tier != THREAD_QOS_UNSPECIFIED) {
  		if (kr != KERN_SUCCESS) {
  			/* Reset back to our original tier as the set failed. */
-@@ -397,6 +415,8 @@ thread_policy_set_internal(
+@@ -397,6 +437,8 @@ thread_policy_set_internal(
  		    THREAD_TIME_CONSTRAINT_WITH_PRIORITY_POLICY_COUNT);
  
  		if (count < min_count) {
-+			printf("thread_policy_set realtime REFUSED (pid %d): flavor %d, count %u < %u\n", proc_selfpid(), flavor,
++			hakios_rt_say("thread_policy_set realtime REFUSED (pid %d): flavor %d, count %u < %u\n", proc_selfpid(), flavor,
 +			    count, min_count);
  			result = KERN_INVALID_ARGUMENT;
  			break;
  		}
-@@ -407,6 +427,14 @@ thread_policy_set_internal(
+@@ -407,6 +449,14 @@ thread_policy_set_internal(
  		if (info->constraint < info->computation ||
  		    info->computation > max_rt_quantum ||
  		    info->computation < min_rt_quantum) {
@@ -3602,7 +3638,7 @@ index 1073c7edc2af..edead7463adf 100644
 +			static uint32_t hakios_rt_refused;
 +
 +			if (hakios_rt_refused++ < 8) {
-+				printf("thread_policy_set realtime REFUSED (pid %d): period %u computation %u constraint %u "
++				hakios_rt_say("thread_policy_set realtime REFUSED (pid %d): period %u computation %u constraint %u "
 +				    "(abs; allowed computation %u..%u)\n", proc_selfpid(), info->period, info->computation,
 +				    info->constraint, min_rt_quantum, max_rt_quantum);
 +			}
