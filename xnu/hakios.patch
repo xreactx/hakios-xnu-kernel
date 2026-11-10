@@ -3538,3 +3538,22 @@ index 2c2186ffbca5..0dacde2b8c47 100644
  
  /*
   * Video information..
+diff --git a/osfmk/kern/thread_policy.c b/osfmk/kern/thread_policy.c
+index 1073c7edc2af..19a3c422aaa9 100644
+--- a/osfmk/kern/thread_policy.c
++++ b/osfmk/kern/thread_policy.c
+@@ -407,6 +407,14 @@ thread_policy_set_internal(
+ 		if (info->constraint < info->computation ||
+ 		    info->computation > max_rt_quantum ||
+ 		    info->computation < min_rt_quantum) {
++			/* HakiOS: which numbers were refused (Voice Memos with a Bluetooth headset, run 190111) */
++			static uint32_t hakios_rt_refused;
++
++			if (hakios_rt_refused++ < 8) {
++				printf("thread_policy_set realtime REFUSED (pid %d): period %u computation %u constraint %u "
++				    "(abs; allowed computation %u..%u)\n", proc_selfpid(), info->period, info->computation,
++				    info->constraint, min_rt_quantum, max_rt_quantum);
++			}
+ 			result = KERN_INVALID_ARGUMENT;
+ 			break;
+ 		}
