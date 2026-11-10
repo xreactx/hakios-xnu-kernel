@@ -529,7 +529,7 @@ window_server_fixes(void)
 		say("hakios: the shader compiler of CoreAnimation is %s\n", orig_compile_shader ? "watched" : "NOT watched");
 		watch_for_faults();
 		{
-			char arguments[1024] = "";
+			char arguments[2048] = "";
 			size_t size = sizeof(arguments) - 1;
 
 			if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
@@ -953,7 +953,7 @@ input_thread(__unused void *arg)
 
 	pthread_setname_np("redwood input");
 	{
-		char arguments[1024] = "";
+		char arguments[2048] = "";
 		size_t size = sizeof(arguments) - 1;
 
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
@@ -1131,7 +1131,7 @@ container_manager_fixes(void)
 static void
 opengl_es(void)
 {
-	char arguments[1024] = "";
+	char arguments[2048] = "";
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 	io_service_t gpu;
@@ -1268,7 +1268,7 @@ hakios_init(void)
 	}
 	slide = (uintptr_t)cache - CACHE_BASE;
 	if (strcmp(name, "backboardd") == 0) {
-		char arguments[1024] = "";
+		char arguments[2048] = "";
 		size_t size = sizeof(arguments) - 1;
 
 		/*

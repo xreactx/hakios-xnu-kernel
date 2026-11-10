@@ -193,7 +193,7 @@ stall_watch(void *argument)
 static void
 watch_main_loop(void)
 {
-	char args[1024] = "";
+	char args[2048] = "";
 	size_t size = sizeof(args) - 1;
 	const char *arg;
 
@@ -739,7 +739,7 @@ battery_post_notifications(void)
 static bool
 gpu_draws(void)
 {
-	char arguments[1024] = "";
+	char arguments[2048] = "";
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 	io_service_t gpu;
@@ -808,7 +808,7 @@ plain_vibrancy(void)
 static void
 ui_lite(void)
 {
-	char arguments[1024] = "";
+	char arguments[2048] = "";
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 	CFBooleanRef on;
@@ -1361,7 +1361,7 @@ wallpaper_freeze_say(unsigned times)
 static void
 wallpaper_freeze(void)
 {
-	char arguments[1024] = "";
+	char arguments[2048] = "";
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 
@@ -1410,7 +1410,7 @@ status_bar_fallback_is_split(void)
 {
 	Class fallback = objc_getClass("_UIStatusBarVisualProvider_Fallback");
 	/* (no UIScreen here: this runs in the library's constructor, before UIKit is up -- +[UIScreen mainScreen] asserted) */
-	char args[1024] = "";
+	char args[2048] = "";
 	size_t size = sizeof(args) - 1;
 	const char *at;
 	unsigned width = 1125;
@@ -1464,7 +1464,7 @@ status_bar_fallback_is_split(void)
 static void
 wallpaper_cache(void)
 {
-	char arguments[1024] = "";
+	char arguments[2048] = "";
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 
@@ -1508,7 +1508,7 @@ switcher_wallpaper_overlay(id self, SEL selector)
 	static unsigned told;
 
 	if (wanted < 0) {
-		char args[1024] = "";
+		char args[2048] = "";
 		size_t size = sizeof(args) - 1;
 		const char *at;
 
@@ -2034,7 +2034,7 @@ animation_rates(const char *arguments)
 static void
 display_link_rates(void)
 {
-	char arguments[1024] = "";
+	char arguments[2048] = "";
 	size_t size = sizeof(arguments) - 1;
 	Class link = objc_getClass("CADisplayLink");
 	Method made, fps, range;
@@ -2070,7 +2070,7 @@ display_link_rates(void)
 static void
 accessibility_settings(void)
 {
-	char arguments[1024] = "";
+	char arguments[2048] = "";
 	size_t size = sizeof(arguments) - 1;
 	static const struct {
 		const char *arg, *setter, *what;
@@ -2130,7 +2130,7 @@ load_tweaks(void)
 static void
 caenv(void)
 {
-	char arguments[1024] = "";
+	char arguments[2048] = "";
 	size_t size = sizeof(arguments) - 1;
 
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
@@ -2285,7 +2285,7 @@ hakios_springboard_init(void)
 	    original_battery_view_set_charge_percent ? "ok" : "NO",
 	    original_ring_charging_level ? "ok" : "NO");
 	{
-		char args[1024] = "";
+		char args[2048] = "";
 		size_t size = sizeof(args) - 1;
 		const char *delay;
 
@@ -2310,7 +2310,7 @@ hakios_springboard_init(void)
 		}
 		watch_main_loop();
 		{
-			char arguments[1024] = "";
+			char arguments[2048] = "";
 			size_t size = sizeof(arguments) - 1;
 
 			if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
@@ -2343,7 +2343,7 @@ hakios_springboard_init(void)
 	 * (to show the phone starting the way an iPhone does).
 	 */
 	{
-		char args[1024] = "";
+		char args[2048] = "";
 		size_t size = sizeof(args) - 1;
 		const char *arg;
 

@@ -4222,7 +4222,7 @@ install(void)
 	};
 	Class class = objc_getClass("EAGLContext");
 	unsigned replaced = 0;
-	char arguments[1024] = "";
+	char arguments[2048] = "";
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 
