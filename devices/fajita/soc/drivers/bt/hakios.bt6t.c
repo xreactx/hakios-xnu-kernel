@@ -1902,6 +1902,23 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 		} else if (length && data[0] == 0x03) {
 			static int slim_level = -1;
 
+			{
+				/* their rate: 192 bytes every 6 ms is 16 kHz of 16-bit PCM, every 12 ms 8 kHz (step 4) */
+				static uint64_t first_at;
+				static uint32_t counted, bytes;
+
+				if (counted == 0) {
+					first_at = mach_absolute_time();
+				}
+				bytes += length >= 4 ? data[3] : 0;
+				if (++counted == 500) {
+					uint64_t ns;
+
+					absolutetime_to_nanoseconds(mach_absolute_time() - first_at, &ns);
+					say("bt6t: sk: 500 SCO packets to the controller (%u bytes of voice) in %llu ms: %llu bytes a second\n", bytes,
+					    ns / 1000000, ns ? (uint64_t)bytes * 1000000000ull / ns : 0);
+				}
+			}
 			if (bt_sk_sco_out++ < 3) {
 				char line[3 * 48 + 1];
 
