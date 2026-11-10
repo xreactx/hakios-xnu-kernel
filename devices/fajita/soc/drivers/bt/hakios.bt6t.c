@@ -1903,8 +1903,12 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 			static int slim_level = -1;
 
 			if (bt_sk_sco_out++ < 3) {
-				say("bt6t: sk: > SCO packet, handle 0x%03x, %u bytes of voice\n",
-				    length >= 3 ? (data[1] | data[2] << 8) & 0xfff : 0, length >= 4 ? data[3] : 0);
+				char line[3 * 48 + 1];
+
+				/* (its first bytes: mSBC frames begin 01 x8 ad, PCM does not -- step 4's question) */
+				hex_line(line, sizeof(line), data + 4, length > 4 ? length - 4 : 0, 48);
+				say("bt6t: sk: > SCO packet, handle 0x%03x, %u bytes of voice (%u in the slot): %s\n",
+				    length >= 3 ? (data[1] | data[2] << 8) & 0xfff : 0, length >= 4 ? data[3] : 0, length, line);
 			}
 			if (slim_level < 0) {
 				uint32_t l = 0;
