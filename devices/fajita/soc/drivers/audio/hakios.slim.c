@@ -685,12 +685,15 @@ ngd_ask_manager(const char *what, uint8_t mc, uint8_t *payload, unsigned length,
 	message[2] = (uint8_t)(first >> 16);
 	memcpy(message + 3, payload, length);
 	got = ngd_transact(message, 3 + length, SLIM_MSG_MT_SRC_REFERRED_USER, SLIM_USR_MC_GENERIC_ACK, tid, reply);
-	printf("slim: stream: %s: %s", what, got ? "ACKNOWLEDGED (" : "NO ACKNOWLEDGEMENT\n");
+	/* (byte 4 is the answer: bit 5 set, MSM_SAT_SUCCSS, for done -- 0x20, 0x2f; else refused, as 0x0f: run 205051) */
+	bool done = got >= 5 && (reply[4] & 0x20) != 0;
+
+	printf("slim: stream: %s: %s", what, !got ? "NO ACKNOWLEDGEMENT\n" : done ? "ACKNOWLEDGED (" : "REFUSED (");
 	for (unsigned i = 4; got && i < got; i++) {
 		printf("%s%02x", i == 4 ? "" : " ", reply[i]);
 	}
 	printf(got ? ")\n" : "");
-	return got != 0;
+	return done;
 }
 
 #define EAR_PORT        16              /* the codec's RX0: its port 16 (WCD934X_RX_START + 0) */
@@ -1059,14 +1062,24 @@ btslim_sco_ports(uint8_t ifd, bool on)
 }
 
 /* the chip's ports and the manager's channels for a call (codec_lock held, the helpers on this bus) */
+#define BTSLIM_TX       1u      /* the headset's microphone: chip TX 0 -> channel 159 -> SLIMBUS_7_TX */
+#define BTSLIM_RX       2u      /* to the headset: SLIMBUS_7_RX -> channel 157 -> chip RX 16 */
+
+/*
+ * One channel a request, as Android's two DAI links do: a channel defined with only one end connected is taken by the
+ * manager, but defining 159 (both ends) together with 157 (only the chip's) had RECONFIGURE_NOW refused (run 205051).
+ */
 static bool
-btslim_channels(uint8_t pgd, uint8_t ifd, bool on)
+btslim_channels(uint8_t pgd, uint8_t ifd, bool on, unsigned which)
 {
 	uint8_t tid, payload[8];
 	bool ok = true;
 
 	if (!on) {
 		for (int port = 0; port < 2; port++) {
+			if (!(which & (port == 0 ? BTSLIM_TX : BTSLIM_RX))) {
+				continue;
+			}
 			tid = slim_tid++;
 			payload[0] = pgd; payload[1] = port == 0 ? CHRK_PORT_TX_SCO : CHRK_PORT_RX_SCO; payload[2] = tid;
 			ok &= ngd_ask_manager(port == 0 ? "btslim: port TX 0 disconnected" : "btslim: port RX 16 disconnected",
@@ -1077,26 +1090,32 @@ btslim_channels(uint8_t pgd, uint8_t ifd, bool on)
 	if (!btslim_sco_ports(ifd, true)) {
 		return false;
 	}
-	tid = slim_tid++;
-	payload[0] = pgd; payload[1] = CHRK_PORT_TX_SCO; payload[2] = BTSLIM_CH_TX; payload[3] = tid;
-	ok &= ngd_ask_manager("btslim: port TX 0 the source of channel 159", SLIM_USR_MC_CONNECT_SRC, payload, 4, tid);
-	tid = slim_tid++;
-	payload[0] = pgd; payload[1] = CHRK_PORT_RX_SCO; payload[2] = BTSLIM_CH_RX; payload[3] = tid;
-	ok &= ngd_ask_manager("btslim: port RX 16 the sink of channel 157", SLIM_USR_MC_CONNECT_SINK, payload, 4, tid);
-	/* DEF_ACT_CHAN (Linux qcom_slim_ngd_enable_stream): 8 kHz -> ratem 2, segment interval 1536/2 = 768, a multiple of 3 */
-	tid = slim_tid++;
-	payload[0] = pgd;
-	payload[1] = 16 >> 2;                   /* 16 bits a sample; segment interval a multiple of 3: bit 5 clear */
-	payload[2] = 0 << 4 | 0;                /* exponent 0, isochronous */
-	payload[3] = 0x11 | 0x80;               /* 8000 Hz, channel content fixed */
-	payload[4] = tid;
-	payload[5] = BTSLIM_CH_TX;
-	payload[6] = BTSLIM_CH_RX;
-	ok &= ngd_ask_manager("btslim: channels 159 and 157 defined and activated", SLIM_USR_MC_DEF_ACT_CHAN, payload, 7, tid);
-	tid = slim_tid++;
-	payload[0] = tid;
-	payload[1] = pgd;
-	ok &= ngd_ask_manager("btslim: reconfigure now", SLIM_USR_MC_RECONFIG_NOW, payload, 2, tid);
+	for (int dir = 0; dir < 2 && ok; dir++) {
+		bool tx = dir == 0;
+
+		if (!(which & (tx ? BTSLIM_TX : BTSLIM_RX))) {
+			continue;
+		}
+		tid = slim_tid++;
+		payload[0] = pgd; payload[1] = tx ? CHRK_PORT_TX_SCO : CHRK_PORT_RX_SCO; payload[2] = tx ? BTSLIM_CH_TX : BTSLIM_CH_RX;
+		payload[3] = tid;
+		ok &= ngd_ask_manager(tx ? "btslim: port TX 0 the source of channel 159" : "btslim: port RX 16 the sink of channel 157",
+		    tx ? SLIM_USR_MC_CONNECT_SRC : SLIM_USR_MC_CONNECT_SINK, payload, 4, tid);
+		/* DEF_ACT_CHAN (Linux qcom_slim_ngd_enable_stream): 8 kHz -> ratem 2, segment interval 1536/2 = 768, a multiple of 3 */
+		tid = slim_tid++;
+		payload[0] = pgd;
+		payload[1] = 16 >> 2;           /* 16 bits a sample; segment interval a multiple of 3: bit 5 clear */
+		payload[2] = 0 << 4 | 0;        /* exponent 0, isochronous */
+		payload[3] = 0x11 | 0x80;       /* 8000 Hz, channel content fixed */
+		payload[4] = tid;
+		payload[5] = tx ? BTSLIM_CH_TX : BTSLIM_CH_RX;
+		ok &= ngd_ask_manager(tx ? "btslim: channel 159 defined and activated" : "btslim: channel 157 defined and activated",
+		    SLIM_USR_MC_DEF_ACT_CHAN, payload, 6, tid);
+		tid = slim_tid++;
+		payload[0] = tid;
+		payload[1] = pgd;
+		ok &= ngd_ask_manager("btslim: reconfigure now", SLIM_USR_MC_RECONFIG_NOW, payload, 2, tid);
+	}
 	return ok;
 }
 
@@ -1115,7 +1134,7 @@ hakios_btslim_sco(bool on)
 	}
 	lck_mtx_lock(&codec_lock);
 	btslim_enter();
-	ok = btslim_channels(btslim_pgd, btslim_ifd, on);
+	ok = btslim_channels(btslim_pgd, btslim_ifd, on, BTSLIM_TX);    /* (the speaker's 157 once SLIMBUS_7_RX is played to) */
 	btslim_leave();
 	lck_mtx_unlock(&codec_lock);
 	btslim_sco_on = on && ok;
