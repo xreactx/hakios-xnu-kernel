@@ -148,18 +148,19 @@ static const struct qmi_msg_handler slim_qmi_handlers[] = { { 0 } };
 
 /* One request and its answer: what the DSP said (its result and error), or a negative errno of ours. */
 static int
-slim_qmi_request(const char *what, int msg_id, size_t largest, const struct qmi_elem_info *req_ei, const void *req,
-    const struct qmi_elem_info *resp_ei, struct qmi_response_type_v01 *resp)
+slim_qmi_request_on(struct qmi_handle *handle, const char *what, int msg_id, size_t largest,
+    const struct qmi_elem_info *req_ei, const void *req, const struct qmi_elem_info *resp_ei,
+    struct qmi_response_type_v01 *resp)
 {
 	struct qmi_txn txn;
 	int rc;
 
-	rc = qmi_txn_init(&slim_qmi, &txn, resp_ei, resp);
+	rc = qmi_txn_init(handle, &txn, resp_ei, resp);
 	if (rc < 0) {
 		printf("slim: qmi: %s: no transaction (%d)\n", what, rc);
 		return rc;
 	}
-	rc = qmi_send_request(&slim_qmi, NULL, &txn, msg_id, largest, req_ei, req);
+	rc = qmi_send_request(handle, NULL, &txn, msg_id, largest, req_ei, req);
 	if (rc < 0) {
 		printf("slim: qmi: %s: not sent (%d)\n", what, rc);
 		qmi_txn_cancel(&txn);
@@ -174,6 +175,7 @@ slim_qmi_request(const char *what, int msg_id, size_t largest, const struct qmi_
 	    resp->result == QMI_RESULT_SUCCESS_V01 ? ": DONE" : ": REFUSED");
 	return resp->result == QMI_RESULT_SUCCESS_V01 ? 0 : EIO;
 }
+#define slim_qmi_request(...) slim_qmi_request_on(&slim_qmi, __VA_ARGS__)
 
 /* ---- the NGD (Linux: qcom-ngd-ctrl.c; its registers' register mode: the downstream slim-msm-ngd.c) ------------ */
 
@@ -949,6 +951,175 @@ codec_up(void)
 	codec_talk();
 }
 
+/* ---- the Bluetooth SLIMbus: the WCN3990's voice (btslim=N) ---------------------------------------------------- */
+
+/*
+ * The second SLIMbus controller (dt: slim@17240000, cell-index 3, its BAM 0x17204000), on which the WCN3990's
+ * Bluetooth half is a device (qcom,btfmslim_slave, EA 00 01 20 02 17 02): Android's btfm_slim driver sends a call's
+ * voice over it to and from the audio DSP (AFE SLIMBUS_7_RX/TX, channels 157 and 159), and the chip gives none of it
+ * back over HCI (bsd/dev/hakios.bt6t.c, runs 190111..195751). Downstream's slim-msm-ngd.c for it: QMI select instance
+ * ctrl.nr >> 1 = 1 on the same DSP service, NGD_BASE_V2(3) = 0x1000. References: ~/oneplus6t-ref/bt-slimbus.
+ *
+ * btslim=1: the QMI part (instance 1, powered); btslim=2: its NGD too, a logical address, where the chip is and its
+ * hardware revision (CHRK_SB_SLAVE_HW_REV_MSB/LSB). Run after the codec's bus is up; the NGD helpers above are pointed
+ * at this controller under codec_lock and back after.
+ */
+#define BTSLIM_CTRL_PHYS        0x17240000ull
+#define BTSLIM_QMI_INSTANCE     1
+#define CHRK_SB_SLAVE_HW_REV_MSB 0x1
+#define CHRK_SB_SLAVE_HW_REV_LSB 0x2
+
+static struct qmi_handle btslim_qmi;
+static volatile bool btslim_server_there;
+static volatile uint32_t btslim_server_node, btslim_server_port;
+static volatile uint32_t *btslim_ctrl;
+
+static int
+btslim_new_server(__unused struct qmi_handle *qmi, struct qmi_service *service)
+{
+	btslim_server_node = service->node;
+	btslim_server_port = service->port;
+	btslim_server_there = true;
+	return 0;
+}
+
+static void
+btslim_del_server(__unused struct qmi_handle *qmi, __unused struct qmi_service *service)
+{
+	btslim_server_there = false;
+}
+
+static const struct qmi_ops btslim_qmi_ops = { .new_server = btslim_new_server, .del_server = btslim_del_server };
+
+/* the NGD helpers on the Bluetooth controller for a while (codec_lock held by the caller) */
+static volatile uint32_t *btslim_saved_ctrl, *btslim_saved_ngd;
+
+static void
+btslim_enter(void)
+{
+	btslim_saved_ctrl = slim_ctrl;
+	btslim_saved_ngd = slim_ngd;
+	slim_ctrl = btslim_ctrl;
+	slim_ngd = btslim_ctrl + SLIM_NGD / 4;
+}
+
+static void
+btslim_leave(void)
+{
+	slim_ctrl = btslim_saved_ctrl;
+	slim_ngd = btslim_saved_ngd;
+}
+
+static void
+btslim_ngd(void)
+{
+	static const uint8_t chip_pgd[6] = { 0x00, 0x01, 0x20, 0x02, 0x17, 0x02 };
+	uint8_t message[40];
+	bool answered = false, addressed = false;
+	uint8_t la;
+
+	btslim_ctrl = (volatile uint32_t *)ml_io_map(BTSLIM_CTRL_PHYS, SLIM_CTRL_SIZE);
+	if (btslim_ctrl == NULL) {
+		printf("btslim: the controller cannot be mapped\n");
+		return;
+	}
+	lck_mtx_lock(&codec_lock);
+	btslim_enter();
+	printf("btslim: the controller (%#llx) is version %#x; NGD: cfg %#x status %#x int en %#x stat %#x\n", BTSLIM_CTRL_PHYS,
+	    slim_ctrl[0] >> 16, ngd_rd(NGD_CFG), ngd_rd(NGD_STATUS), ngd_rd(NGD_INT_EN), ngd_rd(NGD_INT_STAT));
+	ngd_wr(NGD_INT_EN, DEF_NGD_INT_MASK);
+	ngd_wr(NGD_RX_MSGQ_CFG, ngd_rd(NGD_RX_MSGQ_CFG) | SLIM_RX_MSGQ_TIMEOUT_VAL);
+	ngd_wr(NGD_CFG, (ngd_rd(NGD_CFG) & ~(NGD_CFG_RX_MSGQ_EN | NGD_CFG_TX_MSGQ_EN)) | NGD_CFG_ENABLE);
+	printf("btslim: NGD enabled in register mode (cfg %#x); waiting for the master's capability\n", ngd_rd(NGD_CFG));
+	for (int ms = 0; ms < 3000; ms++) {
+		unsigned length = ngd_receive(message);
+
+		if (length >= 2 && (message[0] >> 5) == SLIM_MSG_MT_SRC_REFERRED_USER &&
+		    (message[1] & 0x7f) == SLIM_USR_MC_MASTER_CAPABILITY && !answered) {
+			uint32_t first = SLIM_MSG_ASM_FIRST_WORD(7, SLIM_MSG_MT_SRC_REFERRED_USER, SLIM_USR_MC_REPORT_SATELLITE, 0,
+			    SLIM_LA_MGR);
+			uint8_t reply[8] = { (uint8_t)first, (uint8_t)(first >> 8), (uint8_t)(first >> 16), SAT_MAGIC_LSB, SAT_MAGIC_MSB,
+				             SAT_MSG_VER, SAT_MSG_PROT, 0 };
+
+			printf("btslim: the master's capability: answered with REPORT_SATELLITE\n");
+			answered = ngd_send(reply, 7);
+		} else if (length >= 2) {
+			printf("btslim: a message: MT %u MC %#x, %u bytes\n", message[0] >> 5, message[1] & 0x7f, length);
+		}
+		if (answered && (ngd_rd(NGD_STATUS) & NGD_LADDR)) {
+			printf("btslim: THE NGD HAS ITS LOGICAL ADDRESS after %d ms\n", ms);
+			addressed = true;
+			break;
+		}
+		{
+			uint32_t stat = ngd_rd(NGD_INT_STAT) & ~(NGD_INT_RX_MSG_RCVD | NGD_INT_TX_MSG_SENT);
+
+			if (stat != 0) {
+				printf("btslim: int stat %#x\n", stat);
+				ngd_wr(NGD_INT_CLR, stat);
+			}
+		}
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+	if (!addressed) {
+		printf("btslim: no logical address: cfg %#x status %#x int stat %#x%s\n", ngd_rd(NGD_CFG), ngd_rd(NGD_STATUS),
+		    ngd_rd(NGD_INT_STAT), answered ? "" : "; NO CAPABILITY CAME");
+		goto done;
+	}
+	la = codec_laddr(chip_pgd, "WCN3990's Bluetooth device");
+	if (la != 0) {
+		int msb = codec_read(la, CHRK_SB_SLAVE_HW_REV_MSB), lsb = codec_read(la, CHRK_SB_SLAVE_HW_REV_LSB);
+
+		printf("btslim: THE WCN3990 ON THE BUS: logical address %#x, hardware revision %#x.%#x\n", la, msb, lsb);
+	}
+done:
+	btslim_leave();
+	lck_mtx_unlock(&codec_lock);
+}
+
+static void
+btslim_up(uint32_t level)
+{
+	const struct hakios_qrtr_ops *transport = hakios_adsp_qrtr();
+	struct slimbus_select_inst_req_msg_v01 select = { .instance = BTSLIM_QMI_INSTANCE, .mode_valid = 1,
+		                                          .mode = SLIMBUS_MODE_MASTER_V01 };
+	struct slimbus_select_inst_resp_msg_v01 selected = { { 0, 0 } };
+	struct slimbus_power_req_msg_v01 power = { .pm_req = SLIMBUS_PM_ACTIVE_V01, .resp_type_valid = 1,
+		                                   .resp_type = SLIMBUS_RESP_SYNCHRONOUS_V01 };
+	struct slimbus_power_resp_msg_v01 powered = { { 0, 0 } };
+	int rc;
+
+	printf("btslim: level %u: the Bluetooth chip's SLIMbus (instance %u)\n", level, BTSLIM_QMI_INSTANCE);
+	rc = hakios_qmi_handle_init_transport(&btslim_qmi, SLIMBUS_QMI_POWER_REQ_MAX_MSG_LEN + 64, &btslim_qmi_ops,
+	    slim_qmi_handlers, transport);
+	if (rc < 0) {
+		printf("btslim: qmi: no handle (%d)\n", rc);
+		return;
+	}
+	rc = qmi_add_lookup(&btslim_qmi, SLIMBUS_QMI_SVC_ID, SLIMBUS_QMI_SVC_V1, SLIMBUS_QMI_INS_ID);
+	for (int i = 0; i < 500 && !btslim_server_there && rc == 0; i++) {
+		delay_for_interval(10, NSEC_PER_MSEC);
+	}
+	if (!btslim_server_there || hakios_qmi_connect(btslim_qmi.sock, btslim_server_node, btslim_server_port) != 0) {
+		printf("btslim: the DSP's SLIMbus service: not reached\n");
+		qmi_handle_release(&btslim_qmi);
+		return;
+	}
+	if (slim_qmi_request_on(&btslim_qmi, "btslim: select instance 1, the DSP the master",
+	    SLIMBUS_QMI_SELECT_INSTANCE_REQ_V01, SLIMBUS_QMI_SELECT_INSTANCE_REQ_MAX_MSG_LEN, slimbus_select_inst_req_msg_v01_ei,
+	    &select, slimbus_select_inst_resp_msg_v01_ei, &selected.resp) != 0 ||
+	    slim_qmi_request_on(&btslim_qmi, "btslim: power the bus up", SLIMBUS_QMI_POWER_REQ_V01,
+	    SLIMBUS_QMI_POWER_REQ_MAX_MSG_LEN, slimbus_power_req_msg_v01_ei, &power, slimbus_power_resp_msg_v01_ei,
+	    &powered.resp) != 0) {
+		qmi_handle_release(&btslim_qmi);
+		return;
+	}
+	printf("btslim: THE BLUETOOTH SLIMBUS IS OURS AND POWERED\n");
+	if (level >= 2) {
+		btslim_ngd();
+	}
+}
+
 /* ---- the thread ---------------------------------------------------------------------------------------------- */
 
 static void
@@ -1007,6 +1178,10 @@ slim_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		if (level >= 3 && slim_ngd != NULL && (ngd_rd(NGD_STATUS) & NGD_LADDR)) {
 			codec_up();
+		}
+		level = 0;
+		if (PE_parse_boot_argn("btslim", &level, sizeof(level)) && level != 0) {
+			btslim_up(level);
 		}
 	}
 	return;                                 /* (the handle stays: the bus is to be powered down through it one day) */
