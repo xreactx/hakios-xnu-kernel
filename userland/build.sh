@@ -512,7 +512,8 @@ if [ -f ../fw-wifi/ath10k-wcn3990-firmware-5.bin ]; then
 fi
 # ... and the WCN3990's Bluetooth rampatch and NVM for its ROM 2.1 (devices/fajita/soc/drivers/bt/hakios.bt6t.c, bt6t=4),
 # out of the phone's bluetooth_b partition (FAT; xl flash-read bluetooth_b 0 100000, 7z x) into ../fw-bt/bt/image
-for f in crbtfw21.tlv crnv21.bin; do
+# (and every variant crnv21-*.bin beside it, for bt6t_nvmfile=)
+for f in crbtfw21.tlv crnv21.bin $(cd ../fw-bt/bt/image 2>/dev/null && ls crnv21-*.bin 2>/dev/null); do
 	if [ -f ../fw-bt/bt/image/$f ]; then
 		mkdir -p root/fw
 		cp ../fw-bt/bt/image/$f root/fw/

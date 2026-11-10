@@ -985,10 +985,21 @@ hci_firmware_and_scan(void)
 		return;
 	}
 	delay(10000);
-	file = wait_file("crnv21.bin", &size);
-	if (file == NULL || size < 8) {
-		say("bt6t: no fw/crnv21.bin in the small image\n");
-		return;
+	{
+		/*
+		 * bt6t_nvmfile=NAME: another NVM of the small image's fw/ for a run (userland/build.sh takes every
+		 * crnv21*.bin of ../fw-bt) -- crnv21-t44.bin is the phone's with the tag 44 of Linux's crnv21.bin, which the
+		 * phone's lacks and Linux's and a Chromebook's both have (perhaps where a call's voice goes, runs 190111..195045).
+		 */
+		char nvm_name[48] = "crnv21.bin";
+
+		(void)PE_parse_boot_argn("bt6t_nvmfile", nvm_name, sizeof(nvm_name));
+		file = wait_file(nvm_name, &size);
+		if (file == NULL || size < 8) {
+			say("bt6t: no fw/%s in the small image\n", nvm_name);
+			return;
+		}
+		say("bt6t: the NVM: fw/%s, %llu bytes\n", nvm_name, size);
 	}
 	copy = kalloc_data(size, Z_WAITOK);
 	if (copy == NULL) {
