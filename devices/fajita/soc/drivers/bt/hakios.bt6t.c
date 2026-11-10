@@ -1567,6 +1567,61 @@ static const struct {
 static void bt_sk_put(const uint8_t *bytes, uint32_t n);
 
 /*
+ * bt6t_at=1: the hands-free profile's AT commands written down, both ways -- they are ASCII inside RFCOMM frames on an
+ * ACL link (AT+VGM=n / +VGM: n are the headset microphone's gain, AT+VGS / +VGS its speaker's; the headset's microphone
+ * clipped at full scale in run 180601: does bluetoothd set its gain?). '<' from the controller (the headset said it),
+ * '>' to it (bluetoothd said it). The first 400 lines.
+ */
+static void
+bt_sk_at_scan(char way, const uint8_t *pkt, uint32_t length)
+{
+	static int wanted = -1;
+	static uint32_t lines;
+
+	if (wanted < 0) {
+		uint32_t w = 0;
+
+		(void)PE_parse_boot_argn("bt6t_at", &w, sizeof(w));
+		wanted = w != 0;
+	}
+	if (!wanted || lines >= 400 || length < 5 || pkt[0] != 0x02) {
+		return;
+	}
+	for (uint32_t i = 5; i < length;) {
+		uint32_t start = i;
+		char text[96];
+		uint32_t n = 0;
+		bool at = false;
+
+		while (i < length && ((pkt[i] >= 0x20 && pkt[i] < 0x7f) || pkt[i] == '\r' || pkt[i] == '\n')) {
+			i++;
+		}
+		for (uint32_t j = start; j < i && n < sizeof(text) - 1; j++) {
+			if (pkt[j] == '\r' || pkt[j] == '\n') {
+				if (n > 0 && text[n - 1] != ' ') {
+					text[n++] = ' ';
+				}
+				continue;
+			}
+			text[n++] = (char)pkt[j];
+		}
+		while (n > 0 && text[n - 1] == ' ') {
+			n--;
+		}
+		text[n] = 0;
+		if (n >= 2) {
+			at = (text[0] == 'A' && text[1] == 'T') || text[0] == '+' || (text[0] == 'O' && text[1] == 'K') ||
+			    (n >= 5 && text[0] == 'E' && text[1] == 'R' && text[2] == 'R');
+		}
+		if (at && i - start >= 2) {
+			lines++;
+			say("bt6t: at: %c %s\n", way, text);
+		}
+		i++;
+	}
+}
+
+/*
  * The controller's H4 stream, packet by packet (bytes come in pieces of any size): events written down by code and,
  * for a Command Complete or Status, opcode and status -- never their parameters, which hold addresses -- and the
  * supported-commands mask patched as above. ACL and SCO packets are counted.
@@ -1640,6 +1695,7 @@ bt_sk_parse_byte(uint8_t *byte)
 		} else if (debug) {
 			bt_sk_debug_dropped++;
 		} else {
+			bt_sk_at_scan('<', bt_sk_pkt, bt_sk_pkt_len);
 			bt_sk_put(bt_sk_pkt, bt_sk_pkt_len);
 		}
 		bt_sk_pkt_len = 0;
@@ -1958,6 +2014,7 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 		} else if (bt_sk_tx_logged++ < 300) {
 			say("bt6t: sk: > %s packet, %u bytes\n", length && data[0] == 0x02 ? "ACL" : "other", length);
 		}
+		bt_sk_at_scan('>', data, length);
 		bt_sk_mark('>', length ? data[0] : 0, (uint16_t)length, length >= 3 ? (uint16_t)(data[1] | data[2] << 8) : 0);
 		bt_sk_tx_bytes += length;
 		if (!uart_write(data, length)) {
