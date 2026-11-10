@@ -1395,7 +1395,7 @@ dsp_path_on(void)
 	memory_taken = true;
 	map.low = (uint32_t)mic_address;
 	map.high = (uint32_t)(mic_address >> 32);
-	map.size = MIC_PERIODS * 4096;
+	map.size = bytes >= 2 * MIC_PERIODS * 4096 ? 2 * MIC_PERIODS * 4096 : MIC_PERIODS * 4096;     /* (8..15: writes, bt_play) */
 	hakios_adsp_apr_events_second(mic_events);
 	if (!command("our periods for the microphone, mapped for the DSP", APR_SVC_ASM, ASM_CMD_SHARED_MEM_MAP_REGIONS, &map,
 	    sizeof(map), ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, &answer)) {
@@ -2022,7 +2022,7 @@ tone_fill(unsigned period, uint32_t *at)
 	/* 1 kHz, a peak of 10000 (-10.3 dBFS): 8 samples a cycle at 8 kHz, 16 at 16 kHz */
 	static const int16_t cycle[16] = { 0, 3827, 7071, 9239, 10000, 9239, 7071, 3827, 0, -3827, -7071, -9239, -10000, -9239, -7071,
 		                           -3827 };
-	int16_t *samples = (int16_t *)(mic_memory + 4096 * period);
+	int16_t *samples = (int16_t *)(mic_memory + 4096 * (MIC_PERIODS + period));
 	unsigned step = bt_rate == 16000 ? 1 : 2;
 
 	for (unsigned i = 0; i < TONE_PERIOD_BYTES / 2; i++) {
@@ -2037,15 +2037,35 @@ tone_fill(unsigned period, uint32_t *at)
 static bool
 tone_write(unsigned period)
 {
-	uint32_t write[8] = { (uint32_t)(mic_address + 4096 * period), (uint32_t)((mic_address + 4096 * period) >> 32),
-		              mic_map_handle, TONE_PERIOD_BYTES, period, 0, 0, 0 };
+	uint64_t at = mic_address + 4096 * (MIC_PERIODS + period);
+	uint32_t write[8] = { (uint32_t)at, (uint32_t)(at >> 32), mic_map_handle, TONE_PERIOD_BYTES, period, 0, 0, 0 };
 
 	return hakios_adsp_apr(APR_SVC_ASM, TONE_STREAM_PORT, TONE_TOKEN | period, ASM_DATA_CMD_WRITE_V2, write, sizeof(write), 0,
 	           NULL);
 }
 
+/* the headset's playback side: SLIMBUS_7_RX, channel 157, an ADM path and ASM session 3 writing into it */
+static bool bt_play_stream, bt_play_copp;
+static uint16_t bt_play_copp_id;
+
 static void
-bt_tone(uint32_t secs)
+bt_play_close(void)
+{
+	struct hakios_apr_answer answer;
+
+	if (bt_play_stream) {
+		(void)hakios_adsp_apr(APR_SVC_ASM, TONE_STREAM_PORT, 0, ASM_STREAM_CMD_CLOSE, NULL, 0, APR_WAIT_MS, &answer);
+		bt_play_stream = false;
+	}
+	if (bt_play_copp) {
+		(void)hakios_adsp_apr(APR_SVC_ADM, bt_play_copp_id, 0, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, APR_WAIT_MS, &answer);
+		bt_play_copp = false;
+	}
+	(void)bt_rx_side(false);
+}
+
+static bool
+bt_play_open(void)
 {
 	struct {
 		uint16_t flags, mode, endpoint1, endpoint2;
@@ -2072,42 +2092,50 @@ bt_tone(uint32_t secs)
 		uint16_t session, copps;
 		uint16_t copp[2];
 	} __attribute__((packed)) route = { ADM_MATRIX_AUDIO_RX, 1, TONE_SESSION, 1, { 0, 0 } };
-	uint32_t run[3] = { 0, 0, 0 }, at = 0, sent = 0;
+	uint32_t run[3] = { 0, 0, 0 };
 	struct hakios_apr_answer answer;
-	bool stream = false, copp = false;
-	uint16_t copp_id = 0;
-	uint64_t began, now;
 
-	if (!mic_mapped) {
-		say("mic: bt tone: no DSP memory\n");
-		return;
-	}
-	if (!bt_rx_side(true)) {
-		return;
+	if (!mic_mapped || !bt_rx_side(true)) {
+		return false;
 	}
 	if (!hakios_adsp_apr(APR_SVC_ADM, BT_RX_PORT, 0, ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), APR_WAIT_MS, &answer) ||
 	    answer.opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || answer.words[0] != 0) {
-		say("mic: bt tone: the playback path to 0x400e: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[0]);
-		goto out;
+		say("mic: bt play: the playback path to 0x400e: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[0]);
+		goto fail;
 	}
-	copp = true;
-	copp_id = (uint16_t)(answer.words[1] & 0xffff);
-	route.copp[0] = copp_id;
-	say("mic: bt tone: the playback path to 0x400e is open: COPP %u (1 channel of 16 bits at %u Hz)\n", copp_id, bt_rate);
+	bt_play_copp = true;
+	bt_play_copp_id = (uint16_t)(answer.words[1] & 0xffff);
+	route.copp[0] = bt_play_copp_id;
 	if (!hakios_adsp_apr(APR_SVC_ASM, TONE_STREAM_PORT, 0, ASM_STREAM_CMD_OPEN_WRITE_V3, &writing, sizeof(writing), APR_WAIT_MS,
 	    &answer) || answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
-		say("mic: bt tone: the stream (session 3) for writing: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
-		goto out;
+		say("mic: bt play: the stream (session 3) for writing: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
+		goto fail;
 	}
-	stream = true;
-	if (!command("bt tone: session 3 routed to the playback path", APR_SVC_ADM, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route,
+	bt_play_stream = true;
+	if (!command("bt play: session 3 routed to the playback path", APR_SVC_ADM, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route,
 	    sizeof(route), 0, NULL) ||
 	    !hakios_adsp_apr(APR_SVC_ASM, TONE_STREAM_PORT, 0, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, &format, sizeof(format), APR_WAIT_MS,
 	    &answer) || answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0 ||
 	    !hakios_adsp_apr(APR_SVC_ASM, TONE_STREAM_PORT, 0, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), APR_WAIT_MS, &answer) ||
 	    answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
-		say("mic: bt tone: the stream's format or run: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
-		goto out;
+		say("mic: bt play: the stream's format or run: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
+		goto fail;
+	}
+	say("mic: bt play: the playback path to the headset is open: COPP %u, %u Hz\n", bt_play_copp_id, bt_rate);
+	return true;
+fail:
+	bt_play_close();
+	return false;
+}
+
+static void
+bt_tone(uint32_t secs)
+{
+	uint32_t at = 0, sent = 0;
+	uint64_t began, now;
+
+	if (!bt_play_open()) {
+		return;
 	}
 	say("mic: bt tone: THE TONE PLAYS NOW for %u s: 1 kHz at -10 dBFS, into the headset\n", secs);
 	tone_returned = tone_done = tone_errors = 0;
@@ -2130,14 +2158,189 @@ bt_tone(uint32_t secs)
 	} while (now < (uint64_t)secs * NSEC_PER_SEC);
 	sleep_ms(200);
 	say("mic: bt tone: %u writes sent, %u given back, %u errors (50 expected a second)\n", sent, tone_done, tone_errors);
-out:
-	if (stream) {
-		(void)hakios_adsp_apr(APR_SVC_ASM, TONE_STREAM_PORT, 0, ASM_STREAM_CMD_CLOSE, NULL, 0, APR_WAIT_MS, &answer);
+	bt_play_close();
+}
+
+/*
+ * STEP 4, the bridge (btslim=6): a call's voice between bluetoothd and the SLIMbus for as long as the link is up.
+ * bluetoothd sends and wants 16-bit PCM in its SCO packets (16 kHz on a wideband link: 32365 bytes a second, run 214043;
+ * the chip would code it as Apple's do), while the WCN3990 here takes and gives its voice by the SLIMbus. So: bluetoothd's
+ * SCO voice (hakios_mic_bt_sco_out, from hakios.bt6t.c) goes into a ring and from it to SLIMBUS_7_RX in 20 ms writes; the
+ * headset's microphone, read from SLIMBUS_7_TX in 20 ms reads, goes back to bluetoothd as the controller's SCO packets
+ * (hakios_bt6t_sco_in). Reads on the DSP pages 0..7, writes on 8..15.
+ */
+extern void hakios_bt6t_sco_in(uint16_t handle, const uint8_t *pcm, uint32_t bytes);   /* hakios.bt6t.c */
+
+#define BT_RING_SAMPLES 16384                   /* ~1 s at 16 kHz */
+static int16_t bt_ring[BT_RING_SAMPLES];
+static volatile uint32_t bt_ring_in, bt_ring_out;       /* (free-running; one writer: bt6t's TX, one reader: the bridge) */
+static volatile bool bt_bridging, bt_bridge_stop;
+static uint16_t bt_bridge_handle;
+static uint32_t bt_ring_dropped, bt_ring_dry;
+
+bool
+hakios_mic_bt_bridging(void)
+{
+	return bt_bridging;
+}
+
+void
+hakios_mic_bt_sco_out(const uint8_t *pcm, uint32_t bytes)
+{
+	uint32_t in = bt_ring_in, n = bytes / 2;
+
+	if (!bt_bridging) {
+		return;
 	}
-	if (copp) {
-		(void)hakios_adsp_apr(APR_SVC_ADM, copp_id, 0, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, APR_WAIT_MS, &answer);
+	if (in + n - __atomic_load_n(&bt_ring_out, __ATOMIC_ACQUIRE) > BT_RING_SAMPLES) {
+		bt_ring_dropped += n;
+		return;
 	}
-	(void)bt_rx_side(false);
+	for (uint32_t i = 0; i < n; i++) {
+		bt_ring[(in + i) % BT_RING_SAMPLES] = (int16_t)(pcm[2 * i] | pcm[2 * i + 1] << 8);
+	}
+	__atomic_store_n(&bt_ring_in, in + n, __ATOMIC_RELEASE);
+}
+
+/* one write period from the ring (silence where it has none yet) */
+static void
+bridge_fill(unsigned period)
+{
+	int16_t *samples = (int16_t *)(mic_memory + 4096 * (MIC_PERIODS + period));
+	uint32_t want = TONE_PERIOD_BYTES / 2, out = bt_ring_out, have = __atomic_load_n(&bt_ring_in, __ATOMIC_ACQUIRE) - out;
+
+	for (uint32_t i = 0; i < want; i++) {
+		samples[i] = i < have ? bt_ring[(out + i) % BT_RING_SAMPLES] : 0;
+	}
+	if (have < want) {
+		bt_ring_dry += want - have;
+	}
+	__atomic_store_n(&bt_ring_out, out + (have < want ? have : want), __ATOMIC_RELEASE);
+	for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + TONE_PERIOD_BYTES; line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+}
+
+static void
+bt_bridge_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint32_t saved_port = mic_port, saved_wcd = wcd, saved_level = level, run[3] = { 0, 0, 0 };
+	bool saved_quiet = quiet, played = false, reading = false;
+	uint32_t reads = 0, writes = 0, next = 0, sent_bytes = 0;
+	struct hakios_apr_answer answer;
+	uint64_t began, ns;
+
+	lck_mtx_lock(&mic_lock);
+	if (darwin_wants) {
+		say("mic: bt bridge: Darwin records from the handset: not now\n");
+		goto out_unlocked_params;
+	}
+	mic_port = 0x400f;
+	wcd = 1;
+	level = 3;
+	quiet = false;
+	mic_bt = true;
+	(void)PE_parse_boot_argn("btslim_rate", &bt_rate, sizeof(bt_rate));
+	bt_rate = bt_rate == 16000 ? 16000 : 8000;
+	mic_rate = bt_rate;
+	mic_slim_device = 1;
+	mic_slim_channel = 159;
+	say("mic: bt bridge: a call's voice between bluetoothd (SCO handle 0x%03x) and the SLIMbus, %u Hz\n", bt_bridge_handle,
+	    bt_rate);
+	bt_ring_in = bt_ring_out = bt_ring_dropped = bt_ring_dry = 0;
+	if (!path_up()) {
+		goto down;
+	}
+	read_ready = 0;
+	reads_done = read_errors = 0;
+	if (!hakios_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, 0, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), APR_WAIT_MS, &answer) ||
+	    answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
+		say("mic: bt bridge: the reading session's run: REFUSED OR NO ANSWER\n");
+		goto down;
+	}
+	for (unsigned p = 0; p < MIC_PERIODS; p++) {
+		reading |= mic_read(p);
+	}
+	played = bt_play_open();
+	tone_returned = tone_done = tone_errors = 0;
+	if (played) {
+		for (unsigned p = 0; p < 4; p++) {      /* (80 ms of latency in the DSP's hands) */
+			bridge_fill(p);
+			writes += tone_write(p);
+		}
+	}
+	bt_bridging = true;
+	say("mic: bt bridge: UP (reads %s, writes %s)\n", reading ? "queued" : "NOT QUEUED", played ? "queued" : "NOT QUEUED");
+	began = mach_absolute_time();
+	while (!bt_bridge_stop && !stopping) {
+		uint32_t back = played ? __atomic_exchange_n(&tone_returned, 0, __ATOMIC_ACQ_REL) : 0;
+
+		for (unsigned p = 0; p < 4; p++) {
+			if (back & (1u << p)) {
+				bridge_fill(p);
+				writes += tone_write(p);
+			}
+		}
+		while (read_ready & (1u << next)) {
+			int16_t *samples = (int16_t *)(mic_memory + 4096 * next);
+			uint32_t got = read_sizes[next];
+
+			OSBitAndAtomic(~(1u << next), &read_ready);
+			got = got > MIC_PERIOD_BYTES ? MIC_PERIOD_BYTES : got;
+			for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + MIC_PERIOD_BYTES; line += 64) {
+				__asm__ volatile ("dc ivac, %0" : : "r" (line));
+			}
+			__asm__ volatile ("dsb sy");
+			hakios_bt6t_sco_in(bt_bridge_handle, (const uint8_t *)samples, got);
+			sent_bytes += got;
+			reads++;
+			(void)mic_read(next);
+			next = (next + 1) % MIC_PERIODS;
+		}
+		sleep_ms(2);
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	say("mic: bt bridge: DOWN after %llu ms: %u reads (%u bytes to bluetoothd), %u writes (%u given back, %u errors); "
+	    "bluetoothd's voice: %u samples taken, %u dropped, %u short\n", ns / 1000000, reads, sent_bytes, writes, tone_done,
+	    tone_errors, bt_ring_in, bt_ring_dropped, bt_ring_dry);
+down:
+	bt_bridging = false;
+	if (played) {
+		bt_play_close();
+	}
+	undo();
+	broken = false;
+	mic_bt = false;
+	mic_rate = 48000;
+	mic_slim_device = 0;
+	mic_slim_channel = 128;
+out_unlocked_params:
+	mic_port = saved_port;
+	wcd = saved_wcd;
+	level = saved_level;
+	quiet = saved_quiet;
+	lck_mtx_unlock(&mic_lock);
+	thread_terminate(current_thread());
+}
+
+void
+hakios_mic_bt_bridge(bool on, uint16_t handle)
+{
+	thread_t thread;
+
+	if (!on) {
+		bt_bridge_stop = true;
+		return;
+	}
+	if (bt_bridging) {
+		return;
+	}
+	bt_bridge_stop = false;
+	bt_bridge_handle = handle;
+	if (kernel_thread_start(bt_bridge_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
 }
 
 static void

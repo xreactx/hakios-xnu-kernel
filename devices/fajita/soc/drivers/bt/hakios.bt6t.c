@@ -52,6 +52,9 @@
 
 extern void loader_log_putc(char c);
 extern void hakios_mic_bt_probe(uint32_t secs);    /* hakios.mic.c */
+extern void hakios_mic_bt_bridge(bool on, uint16_t handle);     /* hakios.mic.c: step 4 */
+extern bool hakios_mic_bt_bridging(void);
+extern void hakios_mic_bt_sco_out(const uint8_t *pcm, uint32_t bytes);
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 static int
@@ -1708,11 +1711,19 @@ bt_sk_parse_one(uint8_t *byte)
 				uint32_t slim_level = 0;
 
 				/* step 3 of a call's voice over the SLIMbus: the headset's microphone listened to (hakios.mic.c) */
-				if (PE_parse_boot_argn("btslim", &slim_level, sizeof(slim_level)) && slim_level >= 4) {
+				if (PE_parse_boot_argn("btslim", &slim_level, sizeof(slim_level)) && slim_level >= 6) {
+					say("bt6t: sk: a voice link is up: its voice bridged to the SLIMbus (btslim=6)\n");
+					hakios_mic_bt_bridge(true, (uint16_t)((e[1] | e[2] << 8) & 0xfff));
+				} else if (slim_level >= 4) {
 					say("bt6t: sk: a voice link is up: the headset's microphone through the SLIMbus, 10 s (btslim=4)\n");
 					hakios_mic_bt_probe(10);
 				}
 			}
+		} else if (sync_code == 0x05 && bt_sk_parse.body >= 4 && hakios_mic_bt_bridging()) {
+			/* Disconnection Complete: if it is the voice link's, the bridge goes down */
+			say("bt6t: sk: < Disconnection Complete: status 0x%02x handle 0x%03x reason 0x%02x: the voice bridge stops\n",
+			    bt_sk_parse.first[0], (bt_sk_parse.first[1] | bt_sk_parse.first[2] << 8) & 0xfff, bt_sk_parse.first[3]);
+			hakios_mic_bt_bridge(false, 0);
 		} else if (sync_code == 0x2d && bt_sk_parse.body >= 4) {
 			say("bt6t: sk: < Synchronous Connection Changed: status 0x%02x handle 0x%03x\n", bt_sk_parse.first[0],
 			    (bt_sk_parse.first[1] | bt_sk_parse.first[2] << 8) & 0xfff);
@@ -1918,6 +1929,9 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 					say("bt6t: sk: 500 SCO packets to the controller (%u bytes of voice) in %llu ms: %llu bytes a second\n", bytes,
 					    ns / 1000000, ns ? (uint64_t)bytes * 1000000000ull / ns : 0);
 				}
+			}
+			if (length >= 4 && hakios_mic_bt_bridging()) {
+				hakios_mic_bt_sco_out(data + 4, length - 4 < data[3] ? length - 4 : data[3]);
 			}
 			if (bt_sk_sco_out++ < 3) {
 				char line[3 * 48 + 1];
@@ -2220,6 +2234,40 @@ bt_sk_idle(void)
 }
 
 /* Bytes for bluetoothd's RX ring (the controller's, or a Command Complete of ours), and the ring told. */
+static void
+bt_sk_put(const uint8_t *bytes, uint32_t n);
+
+/*
+ * hakios.mic.c's bridge (step 4): the headset's microphone, as the controller would give it over HCI -- SCO packets of
+ * the link's handle, 192 bytes of 16-bit PCM each as bluetoothd's own are -- to bluetoothd.
+ */
+void
+hakios_bt6t_sco_in(uint16_t handle, const uint8_t *pcm, uint32_t bytes)
+{
+	static uint32_t told;
+	uint8_t packet[4 + 192];
+
+	if (bt_sk_rxring == NULL) {
+		return;
+	}
+	if (told++ == 0) {
+		say("bt6t: sk: < SCO packets from the bridge (the headset's microphone by the SLIMbus) to bluetoothd: from here on\n");
+	}
+	while (bytes > 0) {
+		uint32_t n = bytes > 192 ? 192 : bytes;
+
+		packet[0] = 0x03;
+		packet[1] = (uint8_t)handle;
+		packet[2] = (uint8_t)((handle >> 8) & 0x0f);
+		packet[3] = (uint8_t)n;
+		memcpy(packet + 4, pcm, n);
+		bt_sk_put(packet, 4 + n);
+		bt_sk_sco_in++;
+		pcm += n;
+		bytes -= n;
+	}
+}
+
 static void
 bt_sk_put(const uint8_t *bytes, uint32_t n)
 {

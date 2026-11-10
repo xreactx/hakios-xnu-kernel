@@ -93,6 +93,9 @@ bool hakios_btslim_sco(bool on);      /* the Bluetooth chip's SLIMbus: its SCO p
 bool hakios_btslim_sco_rx(bool on);   /* to the headset: channel 157 into the chip's RX 16, up or down (SLIMBUS_7_RX running) */
 void hakios_btslim_status(const char *when);    /* the chip's SCO ports' status registers, logged */
 void hakios_mic_bt_probe(uint32_t secs);        /* the headset's microphone through SLIMBUS_7_TX for secs, levels logged */
+void hakios_mic_bt_bridge(bool on, uint16_t handle);     /* step 4: a call's voice between bluetoothd and the SLIMbus */
+bool hakios_mic_bt_bridging(void);
+void hakios_mic_bt_sco_out(const uint8_t *pcm, uint32_t bytes);
 bool hakios_slim_mic(bool on);         /* the codec's handset microphone (AMIC4) and the bus's channel from it, up or down */    /* the codec's EAR path and the bus's channel to it, up (once the AFE port runs) or down */
 /* the amplifiers' own temperature and battery voltage read (every second while they play): the reduction they call for */
 uint32_t hakios_speaker_monitor(bool tell);
