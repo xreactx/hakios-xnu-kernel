@@ -96,9 +96,10 @@ static const char *const SKIP[] = {
 enum { ENT_DIR = 1, ENT_FILE = 2, ENT_SYMLINK = 3, ENT_HARDLINK = 4, ENT_DIRTIME = 5 };
 
 /*
- * What takes the room: the bytes of the files saved, by their path's first three parts (containers/Data/Application,
- * mobile/Library/Mail, ...), the largest said after every save -- so that when the archive outgrows its slot what
- * grew is in the log, not guessed.
+ * What takes the room: the bytes of the files saved, by the first two directories of their path (containers/Data,
+ * mobile/Library, ...; a file's own name never: keyed by it, single files filled the table on 9 November and the
+ * parts that mattered went untold), the largest said after every save -- so that when the archive outgrows its slot
+ * what grew is in the log, not guessed. What finds no room in the table is told as "(the rest)".
  */
 #define TALLIES 96
 static struct { char key[96]; uint64_t bytes; } tallies[TALLIES];
@@ -108,25 +109,43 @@ static void
 tally(const char *relative, uint64_t bytes)
 {
 	char key[96];
-	unsigned parts = 0, i = 0;
+	size_t end = 0, parts = 0;
 
-	for (; relative[i] != 0 && i < sizeof(key) - 1; i++) {
-		if (relative[i] == '/' && ++parts == 3) {
-			break;
+	/* the key ends at the second '/' or at the last one, whichever comes first: directories only */
+	for (size_t i = 0; relative[i] != 0; i++) {
+		if (relative[i] == '/') {
+			end = i;
+			if (++parts == 2) {
+				break;
+			}
 		}
-		key[i] = relative[i];
 	}
-	key[i] = 0;
+	if (end == 0) {
+		memcpy(key, "(the top)", sizeof("(the top)"));
+	} else {
+		if (end > sizeof(key) - 1) {
+			end = sizeof(key) - 1;
+		}
+		memcpy(key, relative, end);
+		key[end] = 0;
+	}
 	for (unsigned t = 0; t < tally_count; t++) {
 		if (strcmp(tallies[t].key, key) == 0) {
 			tallies[t].bytes += bytes;
 			return;
 		}
 	}
-	if (tally_count < TALLIES) {
-		memcpy(tallies[tally_count].key, key, i + 1);   /* (key and its NUL: i < 96) */
+	if (tally_count < TALLIES - 1) {
+		memcpy(tallies[tally_count].key, key, strlen(key) + 1);   /* (key and its NUL: under 96) */
 		tallies[tally_count++].bytes = bytes;
+		return;
 	}
+	/* the last slot: everything that found none */
+	if (tally_count == TALLIES - 1) {
+		memcpy(tallies[tally_count].key, "(the rest)", sizeof("(the rest)"));
+		tallies[tally_count++].bytes = 0;
+	}
+	tallies[TALLIES - 1].bytes += bytes;
 }
 
 static void
