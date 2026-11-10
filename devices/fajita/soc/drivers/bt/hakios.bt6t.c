@@ -1394,6 +1394,15 @@ static struct {
 static uint32_t bt_sk_events_logged, bt_sk_acl_in, bt_sk_bad_bytes;
 /* (SCO, the voice of a call: packets each way, their sizes the first few times -- never their contents) */
 static uint32_t bt_sk_sco_in, bt_sk_sco_out;
+/*
+ * bt6t_esco=1: bluetoothd's Setup Synchronous Connection (0x0428) sent as Enhanced Setup Synchronous Connection
+ * (0x043d) with the voice's data path 0, HCI, both ways -- the legacy command leaves the path to the controller, and
+ * this one gives none back over HCI (runs 190111 to 194124: its voice goes to the SLIMbus, Android's way). The
+ * parameters are Linux's (hci_conn.c hci_enhanced_setup_sync) for a transparent link, the host's mSBC, and for CVSD.
+ * The Command Status of 0x043d goes to bluetoothd as that of 0x0428, which it waits for.
+ */
+static int bt_sk_esco = -1;
+static uint32_t bt_sk_esco_pending;
 /* (a packet is handed on whole once it is all there -- or not at all: the Command Complete of a command of ours) */
 static uint8_t bt_sk_pkt[4 + 1100];
 static uint32_t bt_sk_pkt_len, bt_sk_swallow_2005, bt_sk_vendor_dropped, bt_sk_debug_dropped;
@@ -1583,6 +1592,12 @@ bt_sk_parse_byte(uint8_t *byte)
 		 */
 		bool debug = bt_sk_pkt_len >= 3 && bt_sk_pkt[0] == 0x02 && (bt_sk_pkt[1] | (bt_sk_pkt[2] & 0x0f) << 8) == 0x0edc;
 
+		if (bt_sk_esco_pending > 0 && bt_sk_pkt_len >= 7 && bt_sk_pkt[0] == 0x04 && bt_sk_pkt[1] == 0x0f &&
+		    (bt_sk_pkt[5] | bt_sk_pkt[6] << 8) == 0x043d) {
+			bt_sk_esco_pending--;
+			bt_sk_pkt[5] = 0x28;            /* (0x0428 for bluetoothd, which sent that) */
+			bt_sk_pkt[6] = 0x04;
+		}
 		if (drop) {
 			bt_sk_swallow_2005--;
 		} else if (vendor) {
@@ -1770,6 +1785,55 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 					say("bt6t: sk: > LE Set Scan Enable %u with Filter_Duplicates %u: sent as 1\n", data[4], data[5]);
 				}
 				data[5] = 1;
+			}
+			if (bt_sk_esco < 0) {
+				int on = 0;
+
+				(void)PE_parse_boot_argn("bt6t_esco", &on, sizeof(on));
+				bt_sk_esco = on != 0;
+			}
+			if (bt_sk_esco && opcode == 0x0428 && length == 21) {
+				const uint8_t *c = data + 4;          /* handle 2, tx 4, rx 4, latency 2, voice 2, retrans 1, types 2 */
+				uint16_t voice = c[12] | c[13] << 8;
+				bool transparent = (voice & 3) == 3, cvsd = (voice & 3) == 0;
+
+				if (transparent || cvsd) {
+					uint8_t e[4 + 59] = { 0x01, 0x3d, 0x04, 59 }, *q = e + 4;
+
+					*q++ = c[0]; *q++ = c[1];                                       /* handle */
+					*q++ = 0x40; *q++ = 0x1f; *q++ = 0; *q++ = 0;                   /* tx bandwidth 8000 */
+					*q++ = 0x40; *q++ = 0x1f; *q++ = 0; *q++ = 0;                   /* rx bandwidth 8000 */
+					for (int k = 0; k < 2; k++) {                                   /* tx, rx coding format */
+						*q++ = transparent ? 0x03 : 0x02; *q++ = 0; *q++ = 0; *q++ = 0; *q++ = 0;
+					}
+					*q++ = 60; *q++ = 0; *q++ = 60; *q++ = 0;                      /* codec frame sizes */
+					for (int k = 0; k < 2; k++) {                                   /* input, output bandwidth */
+						uint32_t bw = transparent ? 8000 : 16000;
+
+						*q++ = bw & 0xff; *q++ = (bw >> 8) & 0xff; *q++ = 0; *q++ = 0;
+					}
+					for (int k = 0; k < 2; k++) {                                   /* input, output coding format */
+						*q++ = transparent ? 0x03 : 0x04; *q++ = 0; *q++ = 0; *q++ = 0; *q++ = 0;
+					}
+					*q++ = transparent ? 8 : 16; *q++ = 0;                          /* coded data sizes */
+					*q++ = transparent ? 8 : 16; *q++ = 0;
+					*q++ = transparent ? 0 : 2; *q++ = transparent ? 0 : 2;          /* PCM data formats */
+					*q++ = 0; *q++ = 0;                                             /* MSB positions */
+					*q++ = 0; *q++ = 0;                                             /* data paths: HCI */
+					*q++ = transparent ? 1 : 16; *q++ = transparent ? 1 : 16;       /* transport unit sizes */
+					*q++ = c[10]; *q++ = c[11];                                     /* max latency */
+					*q++ = c[15]; *q++ = c[16];                                     /* packet types */
+					*q++ = c[14];                                                   /* retransmission */
+					say("bt6t: sk: > Setup Synchronous Connection (voice 0x%03x) sent as Enhanced, %s, data path HCI "
+					    "(bt6t_esco)\n", voice, transparent ? "transparent (mSBC by the host)" : "CVSD");
+					bt_sk_esco_pending++;
+					bt_sk_mark('>', 0x01, sizeof(e), 0x043d);
+					bt_sk_tx_bytes += sizeof(e);
+					if (!uart_write(e, sizeof(e))) {
+						bt_sk_tx_failed++;
+					}
+					continue;
+				}
 			}
 			if ((opcode == 0x0428 || opcode == 0x0429) && length >= 20) {
 				/* (Setup/Accept: bandwidths, latency, voice setting, retransmission effort, packet types) */
