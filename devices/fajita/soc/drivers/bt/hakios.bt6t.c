@@ -1880,9 +1880,24 @@ bt_sk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus
 				}
 			}
 		} else if (length && data[0] == 0x03) {
+			static int slim_level = -1;
+
 			if (bt_sk_sco_out++ < 3) {
 				say("bt6t: sk: > SCO packet, handle 0x%03x, %u bytes of voice\n",
 				    length >= 3 ? (data[1] | data[2] << 8) & 0xfff : 0, length >= 4 ? data[3] : 0);
+			}
+			if (slim_level < 0) {
+				uint32_t l = 0;
+
+				(void)PE_parse_boot_argn("btslim", &l, sizeof(l));
+				slim_level = (int)l;
+			}
+			/* btslim=5: the voice goes by the SLIMbus; bluetoothd's own over HCI is kept from the chip */
+			if (slim_level >= 5) {
+				if (bt_sk_sco_out == 1) {
+					say("bt6t: sk: SCO packets to the controller are DROPPED (btslim=5: the voice is the SLIMbus's)\n");
+				}
+				continue;
 			}
 		} else if (bt_sk_tx_logged++ < 300) {
 			say("bt6t: sk: > %s packet, %u bytes\n", length && data[0] == 0x02 ? "ACL" : "other", length);

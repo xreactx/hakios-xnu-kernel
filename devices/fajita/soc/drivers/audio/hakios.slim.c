@@ -1169,6 +1169,38 @@ hakios_btslim_sco(bool on)
 	return ok;
 }
 
+/*
+ * The chip's view of its SCO ports (btfm_slim_wcn3990.h): their status and interrupt status -- whether the data of
+ * channel 157 reaches RX 16 at all, and over- or underruns -- read through its interface device.
+ */
+void
+hakios_btslim_status(const char *when)
+{
+	static const struct { const char *name; uint32_t reg; } regs[] = {
+		{ "frame status", 0x14 }, { "PGD dev int status", 0x23 },
+		{ "port int status RX 0-7", 0x34 }, { "port int status TX 0-7", 0x36 },
+		{ "RX 16 cfg", 0x40 }, { "RX 16 status", 0x80 }, { "RX 16 int source", 0x60 },
+		{ "TX 0 cfg", 0x50 }, { "TX 0 status", 0x90 }, { "TX 0 int source", 0x70 },
+		{ "RX 16 multichannel", 0x180 }, { "TX 0 multichannel", 0x100 },
+	};
+	char line[400];
+	int at = 0;
+
+	if (btslim_ifd == 0) {
+		return;
+	}
+	lck_mtx_lock(&codec_lock);
+	btslim_enter();
+	at = snprintf(line, sizeof(line), "btslim: the chip's ports %s:", when);
+	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]) && at < (int)sizeof(line) - 40; i++) {
+		at += snprintf(line + at, sizeof(line) - (size_t)at, " %s %#x", regs[i].name,
+		    codec_read(btslim_ifd, CHRK_ELEMENT(regs[i].reg)));
+	}
+	btslim_leave();
+	lck_mtx_unlock(&codec_lock);
+	printf("%s\n", line);
+}
+
 /* to the headset: SLIMBUS_7_RX's channel 157 into the chip's RX 16, on its own (the DSP's port runs first) */
 bool
 hakios_btslim_sco_rx(bool on)

@@ -1984,7 +1984,11 @@ bt_probe_thread(void *parameter, __unused wait_result_t result)
 	if (path_up()) {
 		bool looped = bt_loopback(true);
 
+		hakios_btslim_status("before the loopback runs a second");
+		sleep_ms(1000);
+		hakios_btslim_status("after a second of loopback");
 		listen(false);
+		hakios_btslim_status("at the end");
 		if (looped) {
 			(void)bt_loopback(false);
 		}
