@@ -745,6 +745,50 @@ tlv_download(const char *what, const uint8_t *data, uint32_t size, uint8_t mode)
 }
 
 /*
+ * bt6t_nvm=TAG.OFFSET=VALUE[,TAG.OFFSET=VALUE...] (decimal tag and offset into the tag's data, VALUE in hex): one
+ * byte of the NVM set for a run, to find what a tag does without a build. First use: tag 36 byte 12, which is 02 in the
+ * OnePlus 6T's NVM, 00 in Linux's crnv21.bin and 01 in a Chromebook's crnv32.bin -- perhaps where a call's voice goes
+ * (on the 6T it comes back over no HCI SCO at all, run 190111).
+ */
+static void
+nvm_override(uint16_t id, uint8_t *data, uint16_t tag_length)
+{
+	char text[128];
+	const char *p = text;
+
+	if (!PE_parse_boot_argn("bt6t_nvm", text, sizeof(text))) {
+		return;
+	}
+	while (*p != '\0') {
+		uint32_t tag = 0, offset = 0, value = 0;
+
+		while (*p >= '0' && *p <= '9') {
+			tag = tag * 10 + (uint32_t)(*p++ - '0');
+		}
+		if (*p++ != '.') {
+			break;
+		}
+		while (*p >= '0' && *p <= '9') {
+			offset = offset * 10 + (uint32_t)(*p++ - '0');
+		}
+		if (*p++ != '=') {
+			break;
+		}
+		while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+			value = value * 16 + (uint32_t)(*p <= '9' ? *p - '0' : (*p | 0x20) - 'a' + 10);
+			p++;
+		}
+		if (tag == id && offset < tag_length) {
+			say("bt6t: NVM tag %u byte %u: %02x -> %02x (bt6t_nvm)\n", tag, offset, data[offset], value & 0xff);
+			data[offset] = (uint8_t)value;
+		}
+		if (*p == ',') {
+			p++;
+		}
+	}
+}
+
+/*
  * The NVM's tags edited as this side can stand them (btqca.c qca_tlv_check_data() edits them for Linux, which runs
  * the in-band sleep protocol): tag 17 (EDL_TAG_ID_HCI) byte 0 bit 7 off -- no in-band sleep, which this driver does
  * not speak -- and byte 2, the UART rate the controller goes to, 0 (QCA_BAUDRATE_115200; the file's is 0x11,
@@ -787,6 +831,9 @@ nvm_edit(uint8_t *nvm, uint32_t size)
 		} else if (id == 2 && tag_length == 6) {
 			say("bt6t: NVM tag 2 (the address it gives itself): %02x:%02x:%02x:%02x:%02x:%02x\n", tag[17], tag[16], tag[15],
 			    tag[14], tag[13], tag[12]);
+		}
+		if (id != 2) {
+			nvm_override(id, tag + 12, tag_length);
 		}
 		i += 12u + tag_length;
 	}
