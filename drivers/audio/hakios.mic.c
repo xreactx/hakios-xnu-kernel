@@ -1416,7 +1416,7 @@ dsp_path_on(void)
 		say("mic: the stream's format: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
 		return false;
 	}
-	say("mic: the stream's format: 1 channel of 16 bits at 48 kHz: done\n");
+	say("mic: the stream's format: 1 channel of 16 bits at %u Hz: done\n", MIC_RATE);
 	if (!hakios_adsp_apr(APR_SVC_ADM, MIC_PORT, 0, ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), APR_WAIT_MS, &answer) ||
 	    answer.opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || answer.words[0] != 0) {
 		say("mic: a device path from the port: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[0]);
@@ -1425,8 +1425,8 @@ dsp_path_on(void)
 	mic_copp_open = true;
 	mic_copp = answer.words[1] & 0xffff;
 	route.copp[0] = (uint16_t)mic_copp;
-	say("mic: the device path from port %#x is open: COPP %u (live recording, no processing, 1 channel, 16 bits, 48 kHz)\n",
-	    MIC_PORT, mic_copp);
+	say("mic: the device path from port %#x is open: COPP %u (live recording, no processing, 1 channel, 16 bits, %u Hz)\n",
+	    MIC_PORT, mic_copp, MIC_RATE);
 	return command("the device path routed to session 2", APR_SVC_ADM, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route, sizeof(route), 0,
 	           NULL);
 }
@@ -1450,7 +1450,8 @@ dsp_port_on(void)
 		} __attribute__((packed)) slimbus = { 1, (uint16_t)mic_slim_device, 16, 0, 1, { (uint8_t)mic_slim_channel }, MIC_RATE };
 
 		if (!afe_port_param(AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &slimbus, sizeof(slimbus),
-		    mic_bt ? "the port SLIMBUS_7_TX (0x400f): SLIMbus device 2, 1 channel of 16 bits at 8 kHz, channel 159" :
+		    mic_bt ? (mic_rate == 8000 ? "the port SLIMBUS_7_TX (0x400f): SLIMbus device 2, 1 channel of 16 bits at 8 kHz, channel 159" :
+		    "the port SLIMBUS_7_TX (0x400f): SLIMbus device 2, 1 channel of 16 bits at 16 kHz, channel 159") :
 		    "the port SLIMBUS_0_TX (0x4001): SLIMbus device 1, 1 channel of 16 bits at 48 kHz, channel 128")) {
 			return false;
 		}
@@ -2177,6 +2178,13 @@ static volatile uint32_t bt_ring_in, bt_ring_out;       /* (free-running; one wr
 static volatile bool bt_bridging, bt_bridge_stop;
 static uint16_t bt_bridge_handle;
 static uint32_t bt_ring_dropped, bt_ring_dry;
+/*
+ * With rec_sound=N rec_sound_mic=1, the bridge's voice goes into the recording (xl sound), 16 kHz stereo: on the left the
+ * headset's microphone as SLIMBUS_7_TX gives it (what bluetoothd is sent), on the right bluetoothd's voice to the headset
+ * in the latest write -- to hear which side of the bridge dulls it.
+ */
+static int16_t bt_last_fill[320];
+static int16_t bt_rec_stereo[2 * 320];
 
 bool
 hakios_mic_bt_bridging(void)
@@ -2211,6 +2219,9 @@ bridge_fill(unsigned period)
 
 	for (uint32_t i = 0; i < want; i++) {
 		samples[i] = i < have ? bt_ring[(out + i) % BT_RING_SAMPLES] : 0;
+		if (i < sizeof(bt_last_fill) / sizeof(bt_last_fill[0])) {
+			bt_last_fill[i] = samples[i];
+		}
 	}
 	if (have < want) {
 		bt_ring_dry += want - have;
@@ -2249,6 +2260,8 @@ bt_bridge_thread(__unused void *parameter, __unused wait_result_t result)
 	say("mic: bt bridge: a call's voice between bluetoothd (SCO handle 0x%03x) and the SLIMbus, %u Hz\n", bt_bridge_handle,
 	    bt_rate);
 	bt_ring_in = bt_ring_out = bt_ring_dropped = bt_ring_dry = 0;
+	memset(bt_last_fill, 0, sizeof(bt_last_fill));
+	hakios_audio_record_restart(bt_rate);   /* (with rec_sound_mic=1: the recording is the bridge's from here) */
 	if (!path_up()) {
 		goto down;
 	}
@@ -2293,6 +2306,15 @@ bt_bridge_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 			__asm__ volatile ("dsb sy");
 			hakios_bt6t_sco_in(bt_bridge_handle, (const uint8_t *)samples, got);
+			if (hakios_audio_recording_mic()) {
+				uint32_t n = got / 2 > 320 ? 320 : got / 2;
+
+				for (uint32_t j = 0; j < n; j++) {
+					bt_rec_stereo[2 * j] = samples[j];
+					bt_rec_stereo[2 * j + 1] = bt_last_fill[j];
+				}
+				hakios_audio_record_fed(bt_rec_stereo, n);
+			}
 			sent_bytes += got;
 			reads++;
 			(void)mic_read(next);

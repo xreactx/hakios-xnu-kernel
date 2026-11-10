@@ -155,6 +155,8 @@ void hakios_audio_dsp_memory_put(void);
 void hakios_adsp_apr_events_second(hakios_apr_events_t handler);
 /* boot-arg rec_sound_mic=1: the recording (rec_sound=N) has what the microphone hears (given with hakios_audio_record_fed()) */
 bool hakios_audio_recording_mic(void);
+/* the recording begun again, at another rate than the speakers' (what it held dropped) */
+void hakios_audio_record_restart(uint32_t rate);
 void hakios_mic_dsp_up(void);          /* the DSP's audio services are up (adsp=1): boot-arg mic=N begins */
 void hakios_mic_dsp_down(void);        /* before the DSP is shut down at the run's end: what the microphones' path asked for given back */
 #endif

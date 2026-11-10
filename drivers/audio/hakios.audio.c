@@ -143,7 +143,7 @@ audio_record(const int16_t *frames, uint32_t count)
 	header->blocks++;
 	loader_sound[1] = rec_used;
 	if (rec_frames >= rec_frames_max) {
-		printf("hakios-audio: recording finished: %llu s in %u writes\n", rec_frames / HAKIOS_AUDIO_RATE, header->blocks);
+		printf("hakios-audio: recording finished: %llu s in %u writes\n", rec_frames / header->rate, header->blocks);
 	}
 }
 
@@ -157,6 +157,27 @@ bool
 hakios_audio_recording_mic(void)
 {
 	return rec_mic && rec_base != NULL && rec_frames < rec_frames_max;
+}
+
+/*
+ * The recording begun again at another rate than the speakers' (the Bluetooth call bridge's 16 kHz, hakios.mic.c): what
+ * it held is dropped -- in run 174244, before any call, 15 s of it were already the handset microphone's at 48 kHz --
+ * so that it is the bridge's voice alone, at the rate its header says.
+ */
+void
+hakios_audio_record_restart(uint32_t rate)
+{
+	lck_mtx_lock(&audio_lock);
+	if (rec_base != NULL && rec_mic) {      /* (rec_sound_mic=1 only: a speakers' recording is left alone) */
+		struct rec_header *header = (struct rec_header *)rec_base;
+
+		header->rate = rate;
+		header->blocks = 0;
+		rec_used = sizeof(*header);
+		rec_frames = 0;
+		loader_sound[1] = rec_used;
+	}
+	lck_mtx_unlock(&audio_lock);
 }
 
 /* From the speakers' feeder: what the guard let through, into the recording (rec_sound_fed=1). */
