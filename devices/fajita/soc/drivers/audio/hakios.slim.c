@@ -1103,7 +1103,7 @@ btslim_channels(uint8_t pgd, uint8_t ifd, bool on, unsigned which)
 		 *   B: as downstream's ngd_allocbw() sends it: dataf LPCM << 5 | laddr's low 5 bits, rate code alone
 		 *   C: B's first byte, A's rate byte
 		 */
-		for (int variant = 0; variant < 3 && !live; variant++) {
+		for (int variant = 0; variant < 1 && !live; variant++) {    /* (A went live at once: run 210101; B, C kept for reference) */
 			uint8_t first = variant == 0 ? pgd : (uint8_t)(1u << 5 | (pgd & 0x1f));
 			uint8_t rate = variant == 1 ? 0x11 : 0x11 | 0x80;
 
