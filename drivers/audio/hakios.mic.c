@@ -1276,6 +1276,9 @@ static bool mic_bt;                                     /* (the probe: SLIMBUS_7
 #define MIC_PERIOD_FRAMES                       (mic_rate / 50) /* 20 ms, one channel of 16 bits */
 #define MIC_PERIOD_BYTES                        (MIC_PERIOD_FRAMES * 2)
 
+#define TONE_TOKEN                              0x20000000u     /* | the period: the probe's tone writes */
+#define ASM_DATA_EVENT_WRITE_DONE_V2            0x00010d99u
+static volatile uint32_t tone_returned, tone_done, tone_errors;
 static uintptr_t mic_memory;
 static uint64_t mic_address;
 static bool memory_taken, mic_mapped, mic_copp_open, mic_stream_open, mic_port_on;
@@ -1286,6 +1289,17 @@ static volatile uint32_t read_sizes[MIC_PERIODS];
 static bool
 mic_events(uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
 {
+	/* the Bluetooth probe's tone (bt_tone): its writes given back */
+	if (service == APR_SVC_ASM && (token & TONE_TOKEN) && !(token & READ_TOKEN) && (token & 0xffff) < MIC_PERIODS) {
+		if (opcode == ASM_DATA_EVENT_WRITE_DONE_V2 || opcode == APR_BASIC_RSP_RESULT) {
+			if (opcode == APR_BASIC_RSP_RESULT || (length >= 16 && payload[3] != 0)) {
+				OSIncrementAtomic((volatile SInt32 *)&tone_errors);
+			}
+			OSIncrementAtomic((volatile SInt32 *)&tone_done);
+			OSBitOrAtomic(1u << (token & 31), &tone_returned);
+			return true;
+		}
+	}
 	if (service != APR_SVC_ASM || !(token & READ_TOKEN) || (token & 0x3fffffff) >= MIC_PERIODS) {
 		return false;
 	}
@@ -1918,7 +1932,35 @@ hakios_mic_dsp_up(void)
 #define AFE_PARAM_ID_LOOPBACK_CONFIG            0x0001020bu
 #define BT_RX_PORT                              0x400e
 
+/* SLIMBUS_7_RX (0x400e) and channel 157 to the chip's RX 16, up or down */
 static bool
+bt_rx_side(bool on)
+{
+	struct {
+		uint32_t version;
+		uint16_t device, bits, data_format, channels;
+		uint8_t channel_map[8];
+		uint32_t rate;
+	} __attribute__((packed)) slimbus = { 1, 1, 16, 0, 1, { 157 }, 8000 };
+	uint16_t port[2] = { BT_RX_PORT, 0 };
+
+	if (!on) {
+		(void)hakios_btslim_sco_rx(false);
+		return command("bt probe: the port 0x400e, stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, port, sizeof(port), 0, NULL);
+	}
+	if (!afe_port_param_at(BT_RX_PORT, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &slimbus, sizeof(slimbus),
+	    "bt probe: the port SLIMBUS_7_RX (0x400e): SLIMbus device 2, 1 channel of 16 bits at 8 kHz, channel 157") ||
+	    !command("bt probe: the port 0x400e, started", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, port, sizeof(port), 0, NULL)) {
+		return false;
+	}
+	if (!hakios_btslim_sco_rx(true)) {
+		(void)command("bt probe: the port 0x400e, stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, port, sizeof(port), 0, NULL);
+		return false;
+	}
+	return true;
+}
+
+static __unused bool
 bt_loopback(bool on)
 {
 	struct {
@@ -1958,6 +2000,143 @@ bt_loopback(bool on)
 	return true;
 }
 
+/*
+ * The headset's side by a tone of our own (the loopback was not heard, run 211415): SLIMBUS_7_RX and channel 157 up as for
+ * the loopback, then an ADM playback path to 0x400e (1 channel of 16 bits at 8 kHz) and ASM session 3 writing 1 kHz at about
+ * -10 dBFS into it for SECS seconds -- hakios.sound.c's earpiece tone, the port, rate and session changed. The microphone's
+ * DSP memory is used before the microphone reads it.
+ */
+#define ASM_STREAM_CMD_OPEN_WRITE_V3            0x00010db3u
+#define ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2        0x00010d98u
+#define ASM_DATA_CMD_WRITE_V2                   0x00010dabu
+#define ADM_PATH_PLAYBACK                       1
+#define ADM_MATRIX_AUDIO_RX                     0
+#define TONE_SESSION                            3
+#define TONE_STREAM_PORT                        (TONE_SESSION << 8 | 1)
+#define TONE_PERIOD_BYTES                       320             /* 20 ms at 8 kHz, one channel of 16 bits */
+
+static void
+tone_fill(unsigned period, uint32_t *at)
+{
+	/* 1 kHz at 8 kHz: 8 samples a cycle, a peak of 10000 (-10.3 dBFS) */
+	static const int16_t cycle[8] = { 0, 7071, 10000, 7071, 0, -7071, -10000, -7071 };
+	int16_t *samples = (int16_t *)(mic_memory + 4096 * period);
+
+	for (unsigned i = 0; i < TONE_PERIOD_BYTES / 2; i++) {
+		samples[i] = cycle[(*at)++ % 8];
+	}
+	for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + TONE_PERIOD_BYTES; line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+}
+
+static bool
+tone_write(unsigned period)
+{
+	uint32_t write[8] = { (uint32_t)(mic_address + 4096 * period), (uint32_t)((mic_address + 4096 * period) >> 32),
+		              mic_map_handle, TONE_PERIOD_BYTES, period, 0, 0, 0 };
+
+	return hakios_adsp_apr(APR_SVC_ASM, TONE_STREAM_PORT, TONE_TOKEN | period, ASM_DATA_CMD_WRITE_V2, write, sizeof(write), 0,
+	           NULL);
+}
+
+static void
+bt_tone(uint32_t secs)
+{
+	struct {
+		uint16_t flags, mode, endpoint1, endpoint2;
+		uint32_t topology;
+		uint16_t channels, bits;
+		uint32_t rate;
+		uint8_t map[8];
+	} __attribute__((packed)) open = { 0, ADM_PATH_PLAYBACK, BT_RX_PORT, 0xffff, ADM_TOPOLOGY_NONE, 1, 16, 8000,
+		                           { PCM_CHANNEL_FC } };
+	struct {
+		uint32_t flags;
+		uint16_t sink, bits;
+		uint32_t topology, format;
+	} __attribute__((packed)) writing = { 0, 0, 16, ASM_TOPOLOGY_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 };
+	struct {
+		uint32_t size;
+		uint16_t channels, bits;
+		uint32_t rate;
+		uint16_t is_signed, reserved;
+		uint8_t map[8];
+	} __attribute__((packed)) format = { 20, 1, 16, 8000, 1, 0, { PCM_CHANNEL_FC } };
+	struct {
+		uint32_t matrix, sessions;
+		uint16_t session, copps;
+		uint16_t copp[2];
+	} __attribute__((packed)) route = { ADM_MATRIX_AUDIO_RX, 1, TONE_SESSION, 1, { 0, 0 } };
+	uint32_t run[3] = { 0, 0, 0 }, at = 0, sent = 0;
+	struct hakios_apr_answer answer;
+	bool stream = false, copp = false;
+	uint16_t copp_id = 0;
+	uint64_t began, now;
+
+	if (!mic_mapped) {
+		say("mic: bt tone: no DSP memory\n");
+		return;
+	}
+	if (!bt_rx_side(true)) {
+		return;
+	}
+	if (!hakios_adsp_apr(APR_SVC_ADM, BT_RX_PORT, 0, ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), APR_WAIT_MS, &answer) ||
+	    answer.opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || answer.words[0] != 0) {
+		say("mic: bt tone: the playback path to 0x400e: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[0]);
+		goto out;
+	}
+	copp = true;
+	copp_id = (uint16_t)(answer.words[1] & 0xffff);
+	route.copp[0] = copp_id;
+	say("mic: bt tone: the playback path to 0x400e is open: COPP %u (1 channel of 16 bits at 8 kHz)\n", copp_id);
+	if (!hakios_adsp_apr(APR_SVC_ASM, TONE_STREAM_PORT, 0, ASM_STREAM_CMD_OPEN_WRITE_V3, &writing, sizeof(writing), APR_WAIT_MS,
+	    &answer) || answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
+		say("mic: bt tone: the stream (session 3) for writing: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
+		goto out;
+	}
+	stream = true;
+	if (!command("bt tone: session 3 routed to the playback path", APR_SVC_ADM, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route,
+	    sizeof(route), 0, NULL) ||
+	    !hakios_adsp_apr(APR_SVC_ASM, TONE_STREAM_PORT, 0, ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2, &format, sizeof(format), APR_WAIT_MS,
+	    &answer) || answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0 ||
+	    !hakios_adsp_apr(APR_SVC_ASM, TONE_STREAM_PORT, 0, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), APR_WAIT_MS, &answer) ||
+	    answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
+		say("mic: bt tone: the stream's format or run: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
+		goto out;
+	}
+	say("mic: bt tone: THE TONE PLAYS NOW for %u s: 1 kHz at -10 dBFS, into the headset\n", secs);
+	tone_returned = tone_done = tone_errors = 0;
+	for (unsigned p = 0; p < MIC_PERIODS; p++) {
+		tone_fill(p, &at);
+		sent += tone_write(p);
+	}
+	began = mach_absolute_time();
+	do {
+		uint32_t back = __atomic_exchange_n(&tone_returned, 0, __ATOMIC_ACQ_REL);
+
+		for (unsigned p = 0; p < MIC_PERIODS; p++) {
+			if (back & (1u << p)) {
+				tone_fill(p, &at);
+				sent += tone_write(p);
+			}
+		}
+		sleep_ms(5);
+		absolutetime_to_nanoseconds(mach_absolute_time() - began, &now);
+	} while (now < (uint64_t)secs * NSEC_PER_SEC);
+	sleep_ms(200);
+	say("mic: bt tone: %u writes sent, %u given back, %u errors (%u expected a second)\n", sent, tone_done, tone_errors, 50);
+out:
+	if (stream) {
+		(void)hakios_adsp_apr(APR_SVC_ASM, TONE_STREAM_PORT, 0, ASM_STREAM_CMD_CLOSE, NULL, 0, APR_WAIT_MS, &answer);
+	}
+	if (copp) {
+		(void)hakios_adsp_apr(APR_SVC_ADM, copp_id, 0, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0, APR_WAIT_MS, &answer);
+	}
+	(void)bt_rx_side(false);
+}
+
 static void
 bt_probe_thread(void *parameter, __unused wait_result_t result)
 {
@@ -1982,16 +2161,9 @@ bt_probe_thread(void *parameter, __unused wait_result_t result)
 	mic_secs = (uint32_t)(uintptr_t)parameter;
 	say("mic: bt probe: the Bluetooth headset's microphone through SLIMBUS_7_TX, %u s\n", mic_secs);
 	if (path_up()) {
-		bool looped = bt_loopback(true);
-
-		hakios_btslim_status("before the loopback runs a second");
-		sleep_ms(1000);
-		hakios_btslim_status("after a second of loopback");
+		bt_tone(5);
+		hakios_btslim_status("after the tone");
 		listen(false);
-		hakios_btslim_status("at the end");
-		if (looped) {
-			(void)bt_loopback(false);
-		}
 	}
 	say("mic: bt probe: %s; last: %s\n", broken ? "STOPPED" : "listened", last_write);
 	undo();
