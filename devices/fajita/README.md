@@ -733,7 +733,7 @@ still leaves it running). `modem_stop=1..3` ends step 7 early. USB brings the ru
 `logdump` on a fresh loader (`xl reboot`, `xl enter`, `xl flash-read logdump 0 166000 F`). Every run on a fresh
 loader: one reused after a run stops answering.
 
-**13. Bluetooth** (done 8 November 2026). The WCN3990's Bluetooth half is a UART (QUP0 serial engine 6 at
+**13. Bluetooth** (done 8 November 2026; call audio 10 November). The WCN3990's Bluetooth half is a UART (QUP0 serial engine 6 at
 `0x898000`, pins 45-48 function 1, its clock 7.3728 MHz from the GCC) and needs neither the modem nor the Wi-Fi.
 `hakios.bt6t.c` goes in levels: `bt6t=1` looks, `=2` sets the clock and pins, `=3` makes the engine a polled UART
 (115200, RFR by the hardware) and wakes the chip (the power pulses `0xC0`/`0xFC`, then the version: product 0x0a, ROM
@@ -771,8 +771,26 @@ and plays (a Voice Memo, heard by the user). A2DP is ACL data, so it needs no PC
 it ~30 ms, a route change to Bluetooth logs hundreds, and mediaserverd's own watchdog then kills it ("Mach message
 timeout ... Apparently deadlocked", run 220544) before the stream starts.
 
-Not done: SCO (calls; needs the chip's PCM and the audio DSP), the chip's sleep (in-band sleep is off), and the chip
-powered down at the run's end.
+**Call audio works, both ways** (9-10 November; runs 214700, 173051, 180601). The WCN3990 gives a voice link's
+audio neither to nor from HCI: it uses a second SLIMbus (`slim@17240000`, the DSP its master), on which
+`hakios.slim.c` (`btslim=N`) brings up the chip's SCO ports, channel 159 (headset to us) and 157 (us to the headset).
+iOS always makes a wideband (mSBC) link with an HFP headset, whatever the LMP features say, and bluetoothd sends and
+wants plain 16 kHz 16-bit PCM in its SCO packets, as it would to Apple's own controllers (they code mSBC
+themselves; so does this chip): the bus runs at 16 kHz (rate code `0x12`). `hakios.mic.c`'s bridge, started on the link's
+Synchronous Connection Complete and stopped on its Disconnection Complete, reads SLIMBUS_7_TX (`0x400f`) in 20 ms periods
+and hands them to bluetoothd as the controller's SCO packets, and writes bluetoothd's SCO voice to SLIMBUS_7_RX
+(`0x400e`) through an ASM session and a playback COPP. A Voice Memo recorded through a headset holds the user's voice,
+and Voice Memos' start chime is heard in the headset. It is the drivers' default (`btslim=6 btslim_rate=16000`, no
+characters of the command line); `btslim=0` leaves it out.
+
+Tools for it: `XL_CMDLINE="rec_sound=60 rec_sound_mic=1"` makes the bridge's voice the run's recording (`xl sound`;
+16 kHz stereo, the headset's microphone left, bluetoothd's voice to the headset right); `bt6t_at=1` logs the
+hands-free profile's AT commands both ways. Run 181806: iOS never sends `+VGM` (the headset's microphone gain is
+its own, as with an iPhone); a loud voice close to the headset's microphone reaches full scale before it reaches us
+(run 180601).
+
+Not done: a real call (telephony or FaceTime), the chip's sleep (in-band sleep is off), and the chip powered down at
+the run's end.
 
 ## Firmware
 
