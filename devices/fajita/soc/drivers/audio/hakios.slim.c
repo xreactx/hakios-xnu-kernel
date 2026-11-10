@@ -968,6 +968,23 @@ codec_up(void)
 #define BTSLIM_QMI_INSTANCE     1
 #define CHRK_SB_SLAVE_HW_REV_MSB 0x1
 #define CHRK_SB_SLAVE_HW_REV_LSB 0x2
+/*
+ * The chip's registers (btfm_slim_wcn3990.h), value elements 0x800 on of its INTERFACE device (EA 00 00 20 02 17 02,
+ * dt qcom,btfm-slim-ifd-elemental-addr), unpaged -- unlike the codec's IFD, whose element 0x800 is a page register.
+ */
+#define CHRK_ELEMENT(reg)               (0x800u + (reg))
+#define CHRK_SB_PGD_PORT_RX_CFGN(n)     (0x40 + (n))
+#define CHRK_SB_PGD_PORT_TX_CFGN(n)     (0x50 + (n))
+#define CHRK_SB_PGD_TX_PORTn_MULTI_CHNL_0(n) (0x100 + 4 * (n))
+#define CHRK_SB_PGD_RX_PORTn_MULTI_CHNL_0(n) (0x180 + 4 * (n))
+#define CHRK_SB_PGD_PORT_TX_OR_UR_CFGN(n) (0x1f0 + (n))
+#define CHRK_PORT_ENABLE                0x1
+#define CHRK_PORT_WM_L1                 (0x1 << 1)
+#define CHRK_PORT_WM_LB                 (0xb << 1)
+#define CHRK_PORT_TX_SCO                0       /* the headset's microphone, to the DSP: channel 159 */
+#define CHRK_PORT_RX_SCO                16      /* to the headset, from the DSP: channel 157 */
+#define BTSLIM_CH_RX                    157     /* (sdm845.c msm_wcn_init: rx {157, 158}, tx {159, 160, 161}) */
+#define BTSLIM_CH_TX                    159
 
 static struct qmi_handle btslim_qmi;
 static volatile bool btslim_server_there;
@@ -1008,6 +1025,88 @@ btslim_leave(void)
 {
 	slim_ctrl = btslim_saved_ctrl;
 	slim_ngd = btslim_saved_ngd;
+}
+
+static uint32_t btslim_level;
+
+/* the manager's GENERIC_ACK for one request (ngd_ask_manager), its name prefixed for this bus */
+static bool
+btslim_sco_ports(uint8_t ifd, bool on)
+{
+	bool ok = true;
+
+	if (on) {
+		ok = codec_write(ifd, CHRK_ELEMENT(CHRK_SB_PGD_TX_PORTn_MULTI_CHNL_0(CHRK_PORT_TX_SCO)), 1u << CHRK_PORT_TX_SCO) &&
+		    codec_write(ifd, CHRK_ELEMENT(CHRK_SB_PGD_PORT_TX_OR_UR_CFGN(CHRK_PORT_TX_SCO)), 0x3) &&
+		    codec_write(ifd, CHRK_ELEMENT(CHRK_SB_PGD_PORT_TX_CFGN(CHRK_PORT_TX_SCO)), CHRK_PORT_ENABLE | CHRK_PORT_WM_L1) &&
+		    codec_write(ifd, CHRK_ELEMENT(CHRK_SB_PGD_RX_PORTn_MULTI_CHNL_0(CHRK_PORT_RX_SCO - 16)), 1u << 0) &&
+		    codec_write(ifd, CHRK_ELEMENT(CHRK_SB_PGD_PORT_RX_CFGN(CHRK_PORT_RX_SCO - 16)), CHRK_PORT_ENABLE | CHRK_PORT_WM_LB);
+	} else {
+		ok = codec_write(ifd, CHRK_ELEMENT(CHRK_SB_PGD_PORT_TX_CFGN(CHRK_PORT_TX_SCO)), 0) &&
+		    codec_write(ifd, CHRK_ELEMENT(CHRK_SB_PGD_PORT_RX_CFGN(CHRK_PORT_RX_SCO - 16)), 0);
+	}
+	printf("btslim: the chip's SCO ports (TX 0, RX 16) %s: %s\n", on ? "set up and enabled" : "disabled", ok ? "sent" : "NOT SENT");
+	if (on) {
+		int tx = codec_read(ifd, CHRK_ELEMENT(CHRK_SB_PGD_PORT_TX_CFGN(CHRK_PORT_TX_SCO)));
+		int rx = codec_read(ifd, CHRK_ELEMENT(CHRK_SB_PGD_PORT_RX_CFGN(CHRK_PORT_RX_SCO - 16)));
+
+		printf("btslim: read back: TX 0 cfg %#x (want %#x), RX 16 cfg %#x (want %#x)\n", tx, CHRK_PORT_ENABLE | CHRK_PORT_WM_L1,
+		    rx, CHRK_PORT_ENABLE | CHRK_PORT_WM_LB);
+	}
+	return ok;
+}
+
+/*
+ * btslim=3: the SCO paths as Android's btfm_slim_enable_ch() sets them for a call at 8 kHz -- the chip's ports, TX 0 the
+ * source of channel 159 and RX 16 the sink of channel 157, both channels defined (16-bit LPCM, isochronous, rate code
+ * 0x11 = 8000, Linux's slim_get_prate_code) and activated -- held 3 s and taken down again. The DSP's side is not there
+ * yet (step 3): what this shows is whether the chip and the bus's manager take it.
+ */
+static void
+btslim_sco_test(uint8_t pgd)
+{
+	static const uint8_t chip_ifd_ea[6] = { 0x00, 0x00, 0x20, 0x02, 0x17, 0x02 };
+	uint8_t ifd = codec_laddr(chip_ifd_ea, "WCN3990's Bluetooth interface"), tid, payload[8];
+	int msb, lsb;
+
+	if (ifd == 0) {
+		return;
+	}
+	msb = codec_read(ifd, CHRK_ELEMENT(CHRK_SB_SLAVE_HW_REV_MSB));
+	lsb = codec_read(ifd, CHRK_ELEMENT(CHRK_SB_SLAVE_HW_REV_LSB));
+	printf("btslim: the chip's interface at %#x: hardware revision major %d minor %d step %d\n", ifd,
+	    msb >= 0 ? (msb & 0xf0) >> 4 : -1, msb >= 0 ? msb & 0xf : -1, lsb);
+	if (!btslim_sco_ports(ifd, true)) {
+		return;
+	}
+	tid = slim_tid++;
+	payload[0] = pgd; payload[1] = CHRK_PORT_TX_SCO; payload[2] = BTSLIM_CH_TX; payload[3] = tid;
+	(void)ngd_ask_manager("btslim: port TX 0 the source of channel 159", SLIM_USR_MC_CONNECT_SRC, payload, 4, tid);
+	tid = slim_tid++;
+	payload[0] = pgd; payload[1] = CHRK_PORT_RX_SCO; payload[2] = BTSLIM_CH_RX; payload[3] = tid;
+	(void)ngd_ask_manager("btslim: port RX 16 the sink of channel 157", SLIM_USR_MC_CONNECT_SINK, payload, 4, tid);
+	/* DEF_ACT_CHAN (Linux qcom_slim_ngd_enable_stream): 8 kHz -> ratem 2, segment interval 1536/2 = 768, a multiple of 3 */
+	tid = slim_tid++;
+	payload[0] = pgd;
+	payload[1] = 16 >> 2;                   /* 16 bits a sample; segment interval a multiple of 3: bit 5 clear */
+	payload[2] = 0 << 4 | 0;                /* exponent 0, isochronous */
+	payload[3] = 0x11 | 0x80;               /* 8000 Hz, channel content fixed */
+	payload[4] = tid;
+	payload[5] = BTSLIM_CH_TX;
+	payload[6] = BTSLIM_CH_RX;
+	(void)ngd_ask_manager("btslim: channels 159 and 157 defined and activated", SLIM_USR_MC_DEF_ACT_CHAN, payload, 7, tid);
+	tid = slim_tid++;
+	payload[0] = tid;
+	payload[1] = pgd;
+	(void)ngd_ask_manager("btslim: reconfigure now", SLIM_USR_MC_RECONFIG_NOW, payload, 2, tid);
+	delay_for_interval(3000, NSEC_PER_MSEC);
+	for (int port = 0; port < 2; port++) {
+		tid = slim_tid++;
+		payload[0] = pgd; payload[1] = port == 0 ? CHRK_PORT_TX_SCO : CHRK_PORT_RX_SCO; payload[2] = tid;
+		(void)ngd_ask_manager(port == 0 ? "btslim: port TX 0 disconnected" : "btslim: port RX 16 disconnected",
+		    SLIM_USR_MC_DISCONNECT_PORT, payload, 3, tid);
+	}
+	(void)btslim_sco_ports(ifd, false);
 }
 
 static void
@@ -1070,7 +1169,10 @@ btslim_ngd(void)
 	if (la != 0) {
 		int msb = codec_read(la, CHRK_SB_SLAVE_HW_REV_MSB), lsb = codec_read(la, CHRK_SB_SLAVE_HW_REV_LSB);
 
-		printf("btslim: THE WCN3990 ON THE BUS: logical address %#x, hardware revision %#x.%#x\n", la, msb, lsb);
+		printf("btslim: THE WCN3990 ON THE BUS: logical address %#x (its generic device: %#x.%#x)\n", la, msb, lsb);
+	}
+	if (la != 0 && btslim_level >= 3) {
+		btslim_sco_test(la);
 	}
 done:
 	btslim_leave();
@@ -1090,6 +1192,7 @@ btslim_up(uint32_t level)
 	int rc;
 
 	printf("btslim: level %u: the Bluetooth chip's SLIMbus (instance %u)\n", level, BTSLIM_QMI_INSTANCE);
+	btslim_level = level;
 	rc = hakios_qmi_handle_init_transport(&btslim_qmi, SLIMBUS_QMI_POWER_REQ_MAX_MSG_LEN + 64, &btslim_qmi_ops,
 	    slim_qmi_handlers, transport);
 	if (rc < 0) {
