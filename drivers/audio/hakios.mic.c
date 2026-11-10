@@ -1268,9 +1268,12 @@ static uint32_t mic_port = 0xb037, wcd;
 #define MIC_STREAM_PORT                         (MIC_SESSION << 8 | 1)
 #define READ_TOKEN                              0x40000000u     /* | the period */
 #define PCM_CHANNEL_FC                          3
-#define MIC_RATE                                48000
+static uint32_t mic_rate = 48000;               /* (8000 for the Bluetooth headset's microphone: hakios_mic_bt_probe) */
+static uint32_t mic_slim_device, mic_slim_channel = 128;       /* (the AFE's SLIMbus device 1 = 0, its channel) */
+static bool mic_bt;                                     /* (the probe: SLIMBUS_7_TX of the Bluetooth chip's bus) */
+#define MIC_RATE                                mic_rate
 #define MIC_PERIODS                             8
-#define MIC_PERIOD_FRAMES                       960             /* 20 ms, one channel of 16 bits */
+#define MIC_PERIOD_FRAMES                       (mic_rate / 50) /* 20 ms, one channel of 16 bits */
 #define MIC_PERIOD_BYTES                        (MIC_PERIOD_FRAMES * 2)
 
 static uintptr_t mic_memory;
@@ -1423,13 +1426,15 @@ dsp_port_on(void)
 			uint16_t device, bits, data_format, channels;
 			uint8_t channel_map[8];
 			uint32_t rate;
-		} __attribute__((packed)) slimbus = { 1, 0, 16, 0, 1, { 128 }, MIC_RATE };
+		} __attribute__((packed)) slimbus = { 1, (uint16_t)mic_slim_device, 16, 0, 1, { (uint8_t)mic_slim_channel }, MIC_RATE };
 
 		if (!afe_port_param(AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &slimbus, sizeof(slimbus),
+		    mic_bt ? "the port SLIMBUS_7_TX (0x400f): SLIMbus device 2, 1 channel of 16 bits at 8 kHz, channel 159" :
 		    "the port SLIMBUS_0_TX (0x4001): SLIMbus device 1, 1 channel of 16 bits at 48 kHz, channel 128")) {
 			return false;
 		}
-		mic_port_on = command("the port 0x4001, started", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
+		mic_port_on = command(mic_bt ? "the port 0x400f, started" : "the port 0x4001, started", APR_SVC_AFE,
+		    AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
 		return mic_port_on;
 	}
 	if (!afe_port_param(AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_CODEC_DMA_CONFIG, &config, sizeof(config),
@@ -1708,7 +1713,11 @@ undo(void)
 {
 	if (wcd) {
 		if (mic_port_on) {
-			hakios_slim_mic(false);
+			if (mic_bt) {
+				hakios_btslim_sco(false);
+			} else {
+				hakios_slim_mic(false);
+			}
 		}
 		dsp_off();
 		return;
@@ -1727,6 +1736,10 @@ undo(void)
 static bool
 path_up(void)
 {
+	if (wcd && mic_bt) {
+		/* the DSP's SLIMBUS_7_TX first, then the chip's ports and the bus's channels (Android: AFE start, btfm enable) */
+		return dsp_path_on() && dsp_port_on() && hakios_btslim_sco(true);
+	}
 	if (wcd) {
 		/* the DSP's port started first, then the codec's path and the bus's channel (Linux: prepare, then trigger) */
 		if (!hakios_slim_codec_ready(30000)) {
@@ -1882,6 +1895,64 @@ hakios_mic_dsp_up(void)
 		return;
 	}
 	thread_deallocate(thread);
+}
+
+/*
+ * Step 3 of a call's voice over the Bluetooth SLIMbus (hakios.slim.c btslim=4; started by hakios.bt6t.c when a voice
+ * link comes up): the headset's microphone, as the WCN3990 hands it to the DSP on channel 159, listened to through
+ * SLIMBUS_7_TX at 8 kHz for SECS seconds with the level said every second -- the same path as the handset
+ * microphone's, its port, bus, channel and rate changed for the while and given back after. Not while Darwin records.
+ */
+static void
+bt_probe_thread(void *parameter, __unused wait_result_t result)
+{
+	uint32_t saved_port = mic_port, saved_wcd = wcd, saved_secs = mic_secs, saved_level = level;
+	bool saved_quiet = quiet;
+
+	lck_mtx_lock(&mic_lock);
+	if (darwin_wants) {
+		say("mic: bt probe: Darwin is recording: not now\n");
+		lck_mtx_unlock(&mic_lock);
+		thread_terminate(current_thread());
+		return;
+	}
+	mic_port = 0x400f;
+	wcd = 1;
+	level = 3;
+	quiet = false;
+	mic_bt = true;
+	mic_rate = 8000;
+	mic_slim_device = 1;
+	mic_slim_channel = 159;
+	mic_secs = (uint32_t)(uintptr_t)parameter;
+	say("mic: bt probe: the Bluetooth headset's microphone through SLIMBUS_7_TX, %u s\n", mic_secs);
+	if (path_up()) {
+		listen(false);
+	}
+	say("mic: bt probe: %s; last: %s\n", broken ? "STOPPED" : "listened", last_write);
+	undo();
+	broken = false;
+	mic_bt = false;
+	mic_rate = 48000;
+	mic_slim_device = 0;
+	mic_slim_channel = 128;
+	mic_port = saved_port;
+	wcd = saved_wcd;
+	mic_secs = saved_secs;
+	level = saved_level;
+	quiet = saved_quiet;
+	lck_mtx_unlock(&mic_lock);
+	thread_terminate(current_thread());
+}
+
+void
+hakios_mic_bt_probe(uint32_t secs)
+{
+	thread_t thread;
+
+	if (kernel_thread_start(bt_probe_thread, (void *)(uintptr_t)secs, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
 }
 
 void

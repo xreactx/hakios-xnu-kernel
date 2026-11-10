@@ -1028,6 +1028,8 @@ btslim_leave(void)
 }
 
 static uint32_t btslim_level;
+static uint8_t btslim_pgd, btslim_ifd;          /* the chip's two devices' logical addresses, once found */
+static bool btslim_sco_on;
 
 /* the manager's GENERIC_ACK for one request (ngd_ask_manager), its name prefixed for this bus */
 static bool
@@ -1056,6 +1058,71 @@ btslim_sco_ports(uint8_t ifd, bool on)
 	return ok;
 }
 
+/* the chip's ports and the manager's channels for a call (codec_lock held, the helpers on this bus) */
+static bool
+btslim_channels(uint8_t pgd, uint8_t ifd, bool on)
+{
+	uint8_t tid, payload[8];
+	bool ok = true;
+
+	if (!on) {
+		for (int port = 0; port < 2; port++) {
+			tid = slim_tid++;
+			payload[0] = pgd; payload[1] = port == 0 ? CHRK_PORT_TX_SCO : CHRK_PORT_RX_SCO; payload[2] = tid;
+			ok &= ngd_ask_manager(port == 0 ? "btslim: port TX 0 disconnected" : "btslim: port RX 16 disconnected",
+			    SLIM_USR_MC_DISCONNECT_PORT, payload, 3, tid);
+		}
+		return btslim_sco_ports(ifd, false) && ok;
+	}
+	if (!btslim_sco_ports(ifd, true)) {
+		return false;
+	}
+	tid = slim_tid++;
+	payload[0] = pgd; payload[1] = CHRK_PORT_TX_SCO; payload[2] = BTSLIM_CH_TX; payload[3] = tid;
+	ok &= ngd_ask_manager("btslim: port TX 0 the source of channel 159", SLIM_USR_MC_CONNECT_SRC, payload, 4, tid);
+	tid = slim_tid++;
+	payload[0] = pgd; payload[1] = CHRK_PORT_RX_SCO; payload[2] = BTSLIM_CH_RX; payload[3] = tid;
+	ok &= ngd_ask_manager("btslim: port RX 16 the sink of channel 157", SLIM_USR_MC_CONNECT_SINK, payload, 4, tid);
+	/* DEF_ACT_CHAN (Linux qcom_slim_ngd_enable_stream): 8 kHz -> ratem 2, segment interval 1536/2 = 768, a multiple of 3 */
+	tid = slim_tid++;
+	payload[0] = pgd;
+	payload[1] = 16 >> 2;                   /* 16 bits a sample; segment interval a multiple of 3: bit 5 clear */
+	payload[2] = 0 << 4 | 0;                /* exponent 0, isochronous */
+	payload[3] = 0x11 | 0x80;               /* 8000 Hz, channel content fixed */
+	payload[4] = tid;
+	payload[5] = BTSLIM_CH_TX;
+	payload[6] = BTSLIM_CH_RX;
+	ok &= ngd_ask_manager("btslim: channels 159 and 157 defined and activated", SLIM_USR_MC_DEF_ACT_CHAN, payload, 7, tid);
+	tid = slim_tid++;
+	payload[0] = tid;
+	payload[1] = pgd;
+	ok &= ngd_ask_manager("btslim: reconfigure now", SLIM_USR_MC_RECONFIG_NOW, payload, 2, tid);
+	return ok;
+}
+
+/* hakios.mic.c's probe (and, later, a call): the SCO paths up or down, once the bus is ours (btslim>=4) */
+bool
+hakios_btslim_sco(bool on)
+{
+	bool ok;
+
+	if (btslim_pgd == 0 || btslim_ifd == 0) {
+		printf("btslim: the chip is not found on its bus (btslim=4 among the boot-args?)\n");
+		return false;
+	}
+	if (on == btslim_sco_on) {
+		return true;
+	}
+	lck_mtx_lock(&codec_lock);
+	btslim_enter();
+	ok = btslim_channels(btslim_pgd, btslim_ifd, on);
+	btslim_leave();
+	lck_mtx_unlock(&codec_lock);
+	btslim_sco_on = on && ok;
+	printf("btslim: the SCO paths %s: %s\n", on ? "up" : "down", ok ? "done" : "NOT ALL ACKNOWLEDGED");
+	return ok;
+}
+
 /*
  * btslim=3: the SCO paths as Android's btfm_slim_enable_ch() sets them for a call at 8 kHz -- the chip's ports, TX 0 the
  * source of channel 159 and RX 16 the sink of channel 157, both channels defined (16-bit LPCM, isochronous, rate code
@@ -1076,6 +1143,12 @@ btslim_sco_test(uint8_t pgd)
 	lsb = codec_read(ifd, CHRK_ELEMENT(CHRK_SB_SLAVE_HW_REV_LSB));
 	printf("btslim: the chip's interface at %#x: hardware revision major %d minor %d step %d\n", ifd,
 	    msb >= 0 ? (msb & 0xf0) >> 4 : -1, msb >= 0 ? msb & 0xf : -1, lsb);
+	btslim_pgd = pgd;
+	btslim_ifd = ifd;
+	if (btslim_level >= 4) {
+		printf("btslim: level 4: the SCO paths wait for a voice link (hakios.bt6t.c starts the microphone's probe)\n");
+		return;
+	}
 	if (!btslim_sco_ports(ifd, true)) {
 		return;
 	}

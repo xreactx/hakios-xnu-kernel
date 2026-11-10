@@ -51,6 +51,7 @@
 #include <stdarg.h>
 
 extern void loader_log_putc(char c);
+extern void hakios_mic_bt_probe(uint32_t secs);    /* hakios.mic.c */
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 static int
@@ -1683,6 +1684,15 @@ bt_sk_parse_one(uint8_t *byte)
 			say("bt6t: sk: < Synchronous Connection Complete: status 0x%02x handle 0x%03x link type %u interval %u "
 			    "window %u rx %u tx %u bytes, air mode %u\n", e[0], (e[1] | e[2] << 8) & 0xfff, e[9], e[10], e[11],
 			    e[12] | e[13] << 8, e[14] | e[15] << 8, e[16]);
+			if (e[0] == 0) {
+				uint32_t slim_level = 0;
+
+				/* step 3 of a call's voice over the SLIMbus: the headset's microphone listened to (hakios.mic.c) */
+				if (PE_parse_boot_argn("btslim", &slim_level, sizeof(slim_level)) && slim_level >= 4) {
+					say("bt6t: sk: a voice link is up: the headset's microphone through the SLIMbus, 10 s (btslim=4)\n");
+					hakios_mic_bt_probe(10);
+				}
+			}
 		} else if (sync_code == 0x2d && bt_sk_parse.body >= 4) {
 			say("bt6t: sk: < Synchronous Connection Changed: status 0x%02x handle 0x%03x\n", bt_sk_parse.first[0],
 			    (bt_sk_parse.first[1] | bt_sk_parse.first[2] << 8) & 0xfff);
