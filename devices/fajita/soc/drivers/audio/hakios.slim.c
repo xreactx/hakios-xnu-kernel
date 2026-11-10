@@ -1169,6 +1169,30 @@ hakios_btslim_sco(bool on)
 	return ok;
 }
 
+/* to the headset: SLIMBUS_7_RX's channel 157 into the chip's RX 16, on its own (the DSP's port runs first) */
+bool
+hakios_btslim_sco_rx(bool on)
+{
+	bool ok;
+
+	if (btslim_pgd == 0 || btslim_ifd == 0) {
+		return false;
+	}
+	lck_mtx_lock(&codec_lock);
+	btslim_enter();
+	if (on) {
+		ok = btslim_channels(btslim_pgd, btslim_ifd, true, BTSLIM_RX);
+	} else {
+		uint8_t tid = slim_tid++, payload[3] = { btslim_pgd, CHRK_PORT_RX_SCO, tid };
+
+		ok = ngd_ask_manager("btslim: port RX 16 disconnected", SLIM_USR_MC_DISCONNECT_PORT, payload, 3, tid);
+	}
+	btslim_leave();
+	lck_mtx_unlock(&codec_lock);
+	printf("btslim: the headset's side (channel 157) %s: %s\n", on ? "up" : "down", ok ? "done" : "NOT ALL ACKNOWLEDGED");
+	return ok;
+}
+
 /*
  * btslim=3: the SCO paths as Android's btfm_slim_enable_ch() sets them for a call at 8 kHz -- the chip's ports, TX 0 the
  * source of channel 159 and RX 16 the sink of channel 157, both channels defined (16-bit LPCM, isochronous, rate code

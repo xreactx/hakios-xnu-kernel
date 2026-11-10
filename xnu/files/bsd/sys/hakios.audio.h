@@ -90,6 +90,7 @@ void hakios_tfa9894_quiesce(void);     /* the same without sleeping, and its res
 bool hakios_slim_codec_ready(uint32_t ms);     /* the codec brought up (slim=3), waited for up to ms */
 bool hakios_slim_earpiece(bool on);
 bool hakios_btslim_sco(bool on);      /* the Bluetooth chip's SLIMbus: its SCO ports and channels 159/157, up or down (btslim>=4) */
+bool hakios_btslim_sco_rx(bool on);   /* to the headset: channel 157 into the chip's RX 16, up or down (SLIMBUS_7_RX running) */
 void hakios_mic_bt_probe(uint32_t secs);        /* the headset's microphone through SLIMBUS_7_TX for secs, levels logged */
 bool hakios_slim_mic(bool on);         /* the codec's handset microphone (AMIC4) and the bus's channel from it, up or down */    /* the codec's EAR path and the bus's channel to it, up (once the AFE port runs) or down */
 /* the amplifiers' own temperature and battery voltage read (every second while they play): the reduction they call for */

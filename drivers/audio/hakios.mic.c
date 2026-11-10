@@ -1317,19 +1317,25 @@ mic_read(unsigned period)
 }
 
 static bool
-afe_port_param(uint32_t module, uint32_t param, const void *data, uint16_t size, const char *what)
+afe_port_param_at(uint16_t port, uint32_t module, uint32_t param, const void *data, uint16_t size, const char *what)
 {
 	uint8_t packet[16 + sizeof(struct afe_param) + 64];
 	struct afe_param *p = (struct afe_param *)(packet + 16);
 
 	bzero(packet, sizeof(packet));
-	*(uint16_t *)packet = MIC_PORT;
+	*(uint16_t *)packet = port;
 	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
 	p->module = module;
 	p->param = param;
 	p->size = size;
 	memcpy(packet + 16 + sizeof(*p), data, size);
 	return command(what, APR_SVC_AFE, AFE_PORT_CMD_SET_PARAM_V2, packet, 16 + (uint32_t)sizeof(*p) + size, 0, NULL);
+}
+
+static bool
+afe_port_param(uint32_t module, uint32_t param, const void *data, uint16_t size, const char *what)
+{
+	return afe_port_param_at(MIC_PORT, module, param, data, size, what);
 }
 
 /* the stream and the path, opened, mapped and routed (msm-pcm-q6 and q6adm/q6asm at a recording's open and prepare) */
@@ -1903,6 +1909,55 @@ hakios_mic_dsp_up(void)
  * SLIMBUS_7_TX at 8 kHz for SECS seconds with the level said every second -- the same path as the handset
  * microphone's, its port, bus, channel and rate changed for the while and given back after. Not while Darwin records.
  */
+/*
+ * The headset's side of the probe: SLIMBUS_7_RX (0x400e, SLIMbus device 2, channel 157, 8 kHz) started, the chip's RX 16
+ * connected to 157, and the DSP's loopback from SLIMBUS_7_TX into it (AFE_MODULE_LOOPBACK, LB_MODE_DEFAULT): what the
+ * headset's microphone hears comes back in its ear -- the whole of step 3, the speaker's half, without a stream of ours.
+ */
+#define AFE_MODULE_LOOPBACK                     0x00010205u
+#define AFE_PARAM_ID_LOOPBACK_CONFIG            0x0001020bu
+#define BT_RX_PORT                              0x400e
+
+static bool
+bt_loopback(bool on)
+{
+	struct {
+		uint32_t version;
+		uint16_t device, bits, data_format, channels;
+		uint8_t channel_map[8];
+		uint32_t rate;
+	} __attribute__((packed)) slimbus = { 1, 1, 16, 0, 1, { 157 }, 8000 };
+	struct {
+		uint32_t version;
+		uint16_t destination, mode, enable, reserved;
+	} __attribute__((packed)) loop = { 1, BT_RX_PORT, 1, on ? 1 : 0, 0 };
+	uint16_t port[2] = { BT_RX_PORT, 0 };
+
+	if (!on) {
+		(void)afe_port_param_at(0x400f, AFE_MODULE_LOOPBACK, AFE_PARAM_ID_LOOPBACK_CONFIG, &loop, sizeof(loop),
+		    "bt probe: the loopback SLIMBUS_7_TX -> SLIMBUS_7_RX, off");
+		(void)hakios_btslim_sco_rx(false);
+		return command("bt probe: the port 0x400e, stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, port, sizeof(port), 0, NULL);
+	}
+	if (!afe_port_param_at(BT_RX_PORT, AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_SLIMBUS_CONFIG, &slimbus, sizeof(slimbus),
+	    "bt probe: the port SLIMBUS_7_RX (0x400e): SLIMbus device 2, 1 channel of 16 bits at 8 kHz, channel 157") ||
+	    !command("bt probe: the port 0x400e, started", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, port, sizeof(port), 0, NULL)) {
+		return false;
+	}
+	if (!hakios_btslim_sco_rx(true)) {
+		(void)command("bt probe: the port 0x400e, stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, port, sizeof(port), 0, NULL);
+		return false;
+	}
+	if (!afe_port_param_at(0x400f, AFE_MODULE_LOOPBACK, AFE_PARAM_ID_LOOPBACK_CONFIG, &loop, sizeof(loop),
+	    "bt probe: the loopback SLIMBUS_7_TX -> SLIMBUS_7_RX, on: the headset hears its microphone")) {
+		(void)hakios_btslim_sco_rx(false);
+		(void)command("bt probe: the port 0x400e, stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, port, sizeof(port), 0, NULL);
+		return false;
+	}
+	say("mic: bt probe: THE HEADSET SHOULD HEAR ITS OWN MICROPHONE NOW\n");
+	return true;
+}
+
 static void
 bt_probe_thread(void *parameter, __unused wait_result_t result)
 {
@@ -1927,7 +1982,12 @@ bt_probe_thread(void *parameter, __unused wait_result_t result)
 	mic_secs = (uint32_t)(uintptr_t)parameter;
 	say("mic: bt probe: the Bluetooth headset's microphone through SLIMBUS_7_TX, %u s\n", mic_secs);
 	if (path_up()) {
+		bool looped = bt_loopback(true);
+
 		listen(false);
+		if (looped) {
+			(void)bt_loopback(false);
+		}
 	}
 	say("mic: bt probe: %s; last: %s\n", broken ? "STOPPED" : "listened", last_write);
 	undo();
