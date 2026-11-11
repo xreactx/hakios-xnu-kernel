@@ -258,6 +258,7 @@ net_trace	k
 pmi_charger	k
 pmi_charger_after	k
 pmi_charger_every	k
+pmi_charger_fcc_ma	k
 pmi_haptics	k
 pmi_haptics_after	k
 pmi_haptics_ms	k

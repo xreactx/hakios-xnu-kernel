@@ -238,6 +238,7 @@ MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c
 PMI_CHARGER	arg	pmi_charger	User space	k	hakios.pmi_charger.c	reading only: which blocks answer and what they say they are, then every pmi_charger_every=S seconds (30) one line: the charger's state, its input
 PMI_CHARGER_AFTER	arg	pmi_charger_after	User space	k	hakios.pmi_charger.c	
 PMI_CHARGER_EVERY	arg	pmi_charger_every	User space	k	hakios.pmi_charger.c	
+PMI_CHARGER_FCC_MA	arg	pmi_charger_fcc_ma	User space	k	hakios.pmi_charger.c	
 PMI_HAPTICS	arg	pmi_haptics	User space	k	hakios.pmi_haptics.c	a look, reading only: which channel of the arbiter is the block's and which system may write through it, what the block says it is, and its registers
 PMI_HAPTICS_AFTER	arg	pmi_haptics_after	User space	k	hakios.pmi_haptics.c	
 PMI_HAPTICS_MS	arg	pmi_haptics_ms	User space	k	hakios.pmi_haptics.c	

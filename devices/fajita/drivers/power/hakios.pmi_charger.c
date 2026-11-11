@@ -19,6 +19,12 @@
  *                   NOT move the limit in effect here (runs 193804, 194313: still 500 mA 2 s after). 900 mA is the
  *                   most this driver asks; only those two registers are written, each read back; at the run's end
  *                   both go back to what they were found to be.
+ *                   And the battery's fast-charge current (CHGR 0x1061), which UEFI leaves at 0 -- the input
+ *                   had room at times in run 193804 and the battery took none of it (-9 mA) -- set to
+ *                   pmi_charger_fcc_ma=N (500: OnePlus's own qcom,fcc-max-ua for the 6T, fajita.dtsi; its driver
+ *                   allows up to 1950 mA at room temperature, less cool or warm; 500 is the most this driver asks),
+ *                   only while the charger's own temperature flags (CHGR 0x1007 [3:0], JEITA) are all clear, and
+ *                   put back as found the moment one is not, and at the run's end.
  *                   (Run 192230, at 500 mA: the charger "full-on" but input-limited, the battery giving 291 to
  *                   511 mA besides -- a run takes more than a computer's port gives.)
  *
@@ -66,6 +72,12 @@ extern void loader_log_putc(char c);
 static uint32_t level = 2, after_s = 25, every_s = 30;
 static uint8_t found_opt, found_cfg;            /* USBIN_ICL_OPTIONS and USBIN_ICL_CFG as found (pmi_charger=2) */
 static volatile bool raised;                    /* written, to be put back at the run's end */
+static uint8_t found_fcc;                       /* CHGR_FCC as found */
+static volatile bool fcc_set;                   /* CHGR_FCC written, to be put back */
+static uint32_t fcc_ma = 500;
+#define FCC_MAX_MA      500                     /* OnePlus's qcom,fcc-max-ua for the 6T: the most this driver asks */
+
+static void fcc_follow(uint8_t s2);
 
 
 #define RAISED_MA       900                     /* USB 3.0's 900 mA: the most this driver asks of a computer's port */
@@ -146,6 +158,9 @@ look(void)
 	    in, adapter(apsd), apsd, il & 1, (cmd_apsd >> 1) & 1, opt, icl * 25u, icl_sts * 25u, aicl, (aicl & 1) ? " done" : "",
 	    (aicl & 2) ? " FAILED" : "", path, (path & 0x40) ? " USB SUSPENDED" : "", (path & 1) ? " valid input" : " NO VALID INPUT",
 	    wd, wd2, (wd & 1) && (wd2 & 0x80) ? " (ON: a bite stops charging)" : (wd & 1) ? " (on)" : " (off)", wdog);
+	if (level >= 2 && raised) {
+		fcc_follow(s2);
+	}
 }
 
 static bool
@@ -166,13 +181,47 @@ wr_checked(uint8_t reg, uint8_t value, const char *what)
 	return true;
 }
 
+/* the fast-charge current: set while the temperature flags are clear, put back the moment one is not */
+static void
+fcc_follow(uint8_t s2)
+{
+	uint8_t value, back = 0;
+	const char *problem;
+	bool clear = (s2 & 0x0f) == 0;
+
+	if (clear == fcc_set) {
+		return;
+	}
+	value = clear ? (uint8_t)(fcc_ma / 25) : found_fcc;
+	problem = hakios_spmi_write(CHGR_ID, CHGR_FCC, &value, 1);
+	if (problem == NULL) {
+		problem = hakios_spmi_read(CHGR_ID, CHGR_FCC, &back, 1);
+	}
+	if (problem != NULL || back != value) {
+		say("pmi_charger: CHGR+0x61 <- 0x%02x: %s (reads 0x%02x)\n", value, problem != NULL ? problem : "NOT what was written",
+		    back);
+		if (clear) {
+			fcc_set = true;         /* (whatever is there now goes back at the end) */
+		}
+		return;
+	}
+	fcc_set = clear;
+	if (clear) {
+		say("pmi_charger: THE BATTERY'S FAST-CHARGE CURRENT IS %u mA (it was %u), the temperature flags clear\n", fcc_ma,
+		    found_fcc * 25u);
+	} else {
+		say("pmi_charger: a temperature flag (status 2 0x%02x): the fast-charge current back to %u mA\n", s2, found_fcc * 25u);
+	}
+}
+
 /* pmi_charger=2: a computer's port's 900 mA (see the top) */
 static void
 raise_limit(void)
 {
 	uint8_t apsd = 0, icl_sts = 0;
 
-	if (!rd(USBIN_ID, USBIN_APSD, &apsd) || !rd(USBIN_ID, USBIN_ICL_OPT, &found_opt) || !rd(USBIN_ID, USBIN_ICL_CFG, &found_cfg)) {
+	if (!rd(USBIN_ID, USBIN_APSD, &apsd) || !rd(USBIN_ID, USBIN_ICL_OPT, &found_opt) || !rd(USBIN_ID, USBIN_ICL_CFG, &found_cfg) ||
+	    !rd(CHGR_ID, CHGR_FCC, &found_fcc)) {
 		return;
 	}
 	if ((apsd & 0x7f) != 0x01) {
@@ -234,6 +283,10 @@ hakios_pmi_charger_init(void)
 	}
 	(void)PE_parse_boot_argn("pmi_charger_after", &after_s, sizeof(after_s));
 	(void)PE_parse_boot_argn("pmi_charger_every", &every_s, sizeof(every_s));
+	(void)PE_parse_boot_argn("pmi_charger_fcc_ma", &fcc_ma, sizeof(fcc_ma));
+	if (fcc_ma > FCC_MAX_MA) {
+		fcc_ma = FCC_MAX_MA;
+	}
 	if (every_s < 5) {
 		every_s = 5;
 	}
@@ -252,6 +305,12 @@ hakios_pmi_charger_quiesce(void)
 		return;
 	}
 	raised = false;         /* (once, whatever happens below) */
+	if (fcc_set) {
+		fcc_set = false;
+		problem = hakios_spmi_write(CHGR_ID, CHGR_FCC, &found_fcc, 1);
+		say("pmi_charger: at the run's end: the fast-charge current back to %u mA%s%s\n", found_fcc * 25u,
+		    problem != NULL ? ": " : "", problem != NULL ? problem : "");
+	}
 	problem = hakios_spmi_write(USBIN_ID, USBIN_ICL_CFG, &found_cfg, 1);
 	if (problem == NULL) {
 		problem = hakios_spmi_write(USBIN_ID, USBIN_ICL_OPT, &found_opt, 1);
