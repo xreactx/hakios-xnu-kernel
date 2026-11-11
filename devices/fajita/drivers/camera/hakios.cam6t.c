@@ -33,7 +33,8 @@
  *             camera NoC, IFE-lite, CSID-lite); then off. No sensor is asked unless cam6t_sensor= says one.
  *   cam6t=4   ... and instead of the look, a frame of the CSID's test pattern (colour bars, RAW10, 640x480) through
  *             IFE-lite into memory, through an SMMU context of ours; the loader hands it to the host (xl camera).
- *   cam6t=5   ... and instead, a frame of a sensor's own (cam6t_sensor=2 the front IMX371 by default, 1 the IMX376K;
+ *   cam6t=5   ... and instead, a frame of a sensor's own (cam6t_sensor=2 the front IMX371 by default, 1 the IMX376K,
+ *             0 the IMX519 over its three C-PHY trios; cam6t_settle=N the PHY's settle count instead of the computed;
  *             cam6t_mode=N its mode), through its CSIPHY, with its tables from the small image's fw/camera-*.tab.
  *   cam6t_after=S   when (seconds after the driver starts; 50): away from the modem's and the audio DSP's starts.
  *
@@ -1386,13 +1387,17 @@ ife_config(void)
 	return true;
 }
 
-/* phy < 0: the CSID's own generator; else that CSIPHY's four D-PHY lanes, in lane_assign's order */
+/*
+ * phy < 0: the CSID's own generator; else that CSIPHY's lanes (four D-PHY lanes, or with cphy three C-PHY trios:
+ * cam_ife_csid_core.c's rx cfg0, the lane type in bit 24), in lane_assign's order
+ */
 static bool
-csid_config(int phy, uint32_t lane_assign)
+csid_config(int phy, uint32_t lane_assign, bool cphy)
 {
 	uint32_t vc = 0, cfg0 = vc << 22 | RAW10_DT << 16 | 0xfu << 12 | 1u << 2 | 3u;
 
-	wr(csid_base + CSID_CSI2_RX_CFG0, 3u | (phy < 0 ? 0x3210u : lane_assign) << 4 | (uint32_t)(phy < 0 ? 0 : phy & 3) << 20);
+	wr(csid_base + CSID_CSI2_RX_CFG0, (cphy ? 2u : 3u) | (phy < 0 ? 0x3210u : lane_assign) << 4 |
+	    (uint32_t)(phy < 0 ? 0 : phy & 3) << 20 | (uint32_t)cphy << 24);
 	wr(csid_base + CSID_CSI2_RX_CFG1, 1u << 6 | 1u);
 	if (phy >= 0) {
 		goto rdi;
@@ -1469,7 +1474,7 @@ capture_tpg(void)
 	if (!frames_alloc(0, "CSID TPG", 0) || !blocks_on(true)) {
 		return;
 	}
-	if (!smmu_up() || !csid_reset() || !ife_config() || !csid_config(-1, 0)) {
+	if (!smmu_up() || !csid_reset() || !ife_config() || !csid_config(-1, 0, false)) {
 		smmu_down();
 		blocks_off();
 		return;
@@ -1596,11 +1601,11 @@ ask(const struct sensor *s)
  * test pattern went; then "stream on". The clocks at Android's rates for this path: cphy_rx and the CSID 384 MHz
  * (PLL3), IFE-lite 320 MHz (PLL2's even output / 1.5), the PHY's timer 240 MHz (PLL2 / 2); the PHY's two supplies
  * (vdda-phy: the PM8998's LDO1 at 0.88 V, vdda-pll: LDO26 at 1.2 V), as Android had them with the front camera on.
- * Only the D-PHY sensors: the IMX519's three C-PHY trios are not done here.
+ * The IMX519's three C-PHY trios: the downstream driver's tables (phy_config_cphy()).
  */
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
-static uint32_t cam_mode = ~0u, cam_exposure = ~0u, cam_gain = 768;
+static uint32_t cam_mode = ~0u, cam_exposure = ~0u, cam_gain = 768, cam_settle = ~0u;
 
 
 struct ctab_head {
@@ -1923,6 +1928,48 @@ phy_config(uint32_t settle)
 	say("cam6t: csiphy%u (version %#010x) set for four D-PHY lanes, settle count %u\n", phy_n, version, settle);
 }
 
+/*
+ * Three C-PHY trios (the IMX519's): the downstream driver's way (cam_csiphy_core.c's cam_csiphy_config_dev() with
+ * cam_csiphy_1_0_hwreg.h, OnePlus's kernel): the common registers with the trios' enable mask (bits 1, 3, 5), a
+ * reset, then each trio's 19 registers, the settle count where the table has it; the interrupts masked as
+ * cam_csiphy_cphy_irq_config() leaves them.
+ */
+static const uint16_t cphy_trio[19][2] = {
+	{ 0x15c, 0x63 }, { 0x168, 0xac }, { 0x16c, 0xa5 }, { 0x104, 0x06 }, { 0x10c, 0xffff }, { 0x108, 0xfffe }, { 0x114, 0x20 },
+	{ 0x150, 0x00 }, { 0x118, 0x3e }, { 0x11c, 0x41 }, { 0x120, 0x41 }, { 0x124, 0x7f }, { 0x128, 0x00 }, { 0x12c, 0x00 },
+	{ 0x144, 0x12 }, { 0x160, 0x02 }, { 0x1cc, 0x41 }, { 0x164, 0x00 }, { 0x1dc, 0x51 },
+};
+static const uint8_t cphy_irq[11] = { 0xff, 0xff, 0xfb, 0xff, 0x7f, 0xff, 0xff, 0xef, 0xff, 0xff, 0xff };     /* 0x82c on */
+
+static void
+phy_config_cphy(uint32_t settle)
+{
+	uint32_t version;
+
+	wr(csiphy_base + CSIPHY_COMMON(6), 2);
+	version = rd(csiphy_base + CSIPHY_STATUS(12)) | rd(csiphy_base + CSIPHY_STATUS(13)) << 8 |
+	    rd(csiphy_base + CSIPHY_STATUS(14)) << 16 | rd(csiphy_base + CSIPHY_STATUS(15)) << 24;
+	wr(csiphy_base + 0x814, 0x2a);                          /* trios 0-2 */
+	wr(csiphy_base + 0x818, 0x01);
+	wr(csiphy_base + 0x81c, 0x02);
+	wr(csiphy_base + 0x800, 0x01);
+	spin_us(1000);
+	wr(csiphy_base + 0x800, 0x00);
+	for (unsigned t = 0; t < 3; t++) {
+		for (unsigned i = 0; i < 19; i++) {
+			uint32_t v = cphy_trio[i][1] == 0xffff ? (settle & 0xff) : cphy_trio[i][1] == 0xfffe ? (settle >> 8 & 0xff) :
+			    cphy_trio[i][1];
+
+			wr(csiphy_base + cphy_trio[i][0] + 0x200 * t, v);
+		}
+	}
+	for (unsigned i = 0; i < 11; i++) {
+		wr(csiphy_base + 0x82c + 4 * i, cphy_irq[i]);
+	}
+	phy_on = true;
+	say("cam6t: csiphy%u (version %#010x) set for three C-PHY trios, settle count %u\n", phy_n, version, settle);
+}
+
 static void
 phy_off(void)
 {
@@ -1963,30 +2010,27 @@ capture_sensor(unsigned i)
 	uint64_t lane_bps;
 	uint16_t id = 0;
 
-	if (i == 0) {
-		say("cam6t: the IMX519's three C-PHY trios are not done here: cam6t_sensor=1 or 2\n");
-		return;
-	}
 	if (!ctab_load(i)) {
 		return;
 	}
 	if (cam_mode == ~0u) {
-		cam_mode = i == 2 ? 1 : 0;
+		cam_mode = i == 2 ? 1 : i == 0 ? 10 : 0;        /* the IMX519's 10: 2328x1746, 60 frames/s */
 	}
 	if (cam_mode >= ctab->modes) {
 		say("cam6t: the %s has no mode %u\n", s->name, cam_mode);
 		return;
 	}
 	m = &((const struct ctab_mode *)(ctab + 1))[cam_mode];
-	if (m->cphy || m->lanes != 4 || m->data_type != RAW10_DT) {
-		say("cam6t: mode %u is not four D-PHY lanes of RAW10\n", cam_mode);
+	if (m->data_type != RAW10_DT || (m->cphy ? m->lanes != 3 : m->lanes != 4)) {
+		say("cam6t: mode %u is not four D-PHY lanes or three C-PHY trios of RAW10\n", cam_mode);
 		return;
 	}
 	cap_width = m->width;
 	cap_height = m->height;
 	lane_bps = (uint64_t)m->pixel_clock * 10 / m->lanes;
-	say("cam6t: the %s, mode %u: %ux%u, %u.%03u frames/s, %llu Mbit/s a lane\n", s->name, cam_mode, m->width, m->height,
-	    m->fps_milli / 1000, m->fps_milli % 1000, lane_bps / 1000000);
+	say("cam6t: the %s, mode %u: %ux%u, %u.%03u frames/s, %s, %llu Mbit/s of pixels a %s\n", s->name, cam_mode, m->width,
+	    m->height, m->fps_milli / 1000, m->fps_milli % 1000, m->cphy ? "C-PHY" : "D-PHY", lane_bps / 1000000,
+	    m->cphy ? "trio" : "lane");
 	if (csid_base == 0) {
 		csid_base = ml_io_map(CSID_LITE_PHYS, 0x1000);
 		ife_base = ml_io_map(VFE_LITE_PHYS, 0x4000);
@@ -2022,10 +2066,15 @@ capture_sensor(unsigned i)
 		return;
 	}
 	if (!rates_up() || !phy_rails_on() || !phy_clocks_on(sensor_csiphy[i]) || !smmu_up() || !csid_reset() || !ife_config() ||
-	    !csid_config((int)sensor_csiphy[i], ctab->lane_assign)) {
+	    !csid_config((int)sensor_csiphy[i], ctab->lane_assign, m->cphy != 0)) {
 		goto out;
 	}
-	phy_config(settle_count(lane_bps));
+	if (m->cphy) {
+		/* the module file's settle count is for Android's 269.33 MHz timer: scaled to this one's 240 */
+		phy_config_cphy(cam_settle != ~0u ? cam_settle : m->settle * 240 / 269);
+	} else {
+		phy_config(cam_settle != ~0u ? cam_settle : settle_count(lane_bps));
+	}
 	streaming = true;
 	show_paths("configured");
 	if (!write_table(s, "on")) {
@@ -2132,6 +2181,7 @@ hakios_cam6t_init(void)
 	(void)PE_parse_boot_argn("cam6t_mode", &cam_mode, sizeof(cam_mode));
 	(void)PE_parse_boot_argn("cam6t_exposure", &cam_exposure, sizeof(cam_exposure));
 	(void)PE_parse_boot_argn("cam6t_gain", &cam_gain, sizeof(cam_gain));
+	(void)PE_parse_boot_argn("cam6t_settle", &cam_settle, sizeof(cam_settle));
 	if (level >= 5) {
 		/* a sensor's frames are megabytes: taken now, in one piece, as redwood's driver takes its own at boot */
 		if (kmem_alloc_contig(kernel_map, &frames, FRAMES_KEPT_BYTES, PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,

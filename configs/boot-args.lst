@@ -90,6 +90,7 @@ cam6t_exposure	k
 cam6t_gain	k
 cam6t_mode	k
 cam6t_sensor	k
+cam6t_settle	k
 cam6t_xo	k
 cam_after	k
 cam_fake	k

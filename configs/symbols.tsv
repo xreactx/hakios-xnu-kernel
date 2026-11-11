@@ -84,6 +84,7 @@ CAM6T_EXPOSURE	arg	cam6t_exposure	User space	k	hakios.cam6t.c
 CAM6T_GAIN	arg	cam6t_gain	User space	k	hakios.cam6t.c	
 CAM6T_MODE	arg	cam6t_mode	User space	k	hakios.cam6t.c	
 CAM6T_SENSOR	arg	cam6t_sensor	User space	k	hakios.cam6t.c	
+CAM6T_SETTLE	arg	cam6t_settle	User space	k	hakios.cam6t.c	
 CAM6T_XO	arg	cam6t_xo	User space	k	hakios.cam6t.c	
 CAM_AFTER	arg	cam_after	Cameras	k	hakios.camera.c	
 CAM_FAKE	arg	cam_fake	Cameras	k	hakios.camera.c	
