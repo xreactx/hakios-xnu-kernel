@@ -980,7 +980,8 @@ static const struct {
 #define TPG_HEIGHT              480
 
 static uint32_t cap_width = TPG_WIDTH, cap_height = TPG_HEIGHT;
-#define TPG_STRIDE              (cap_width * 10 / 8)
+/* the write master puts each line on a 16-byte boundary: 2328 pixels of RAW10 (2910 bytes) take 2912 in memory */
+#define TPG_STRIDE              (((cap_width * 10 / 8) + 15) & ~15u)
 #define TPG_HEIGHT_NOW          cap_height
 
 struct cam_header {                     /* redwood's (tools/camraw.py) */
