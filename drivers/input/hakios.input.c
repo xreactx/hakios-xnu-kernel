@@ -289,6 +289,7 @@ hakios_input_init(void)
 	hakios_synaptics_init();
 	hakios_buttons_init();
 	hakios_pmi_haptics_init();
+	hakios_pmi_charger_init();
 	hakios_slider_init();
 	hakios_tfa9894_init();
 	hakios_battery_init();

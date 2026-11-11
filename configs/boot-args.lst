@@ -62,6 +62,7 @@ battmgr	k
 bootcpu	kl
 bt	k
 bt6t	k
+bt6t_at	k
 bt6t_baud	k
 bt6t_bdaddr	k
 bt6t_cts	k
@@ -254,6 +255,9 @@ modem_wait	k
 modem_wda_off	k
 net_names	k
 net_trace	k
+pmi_charger	k
+pmi_charger_after	k
+pmi_charger_every	k
 pmi_haptics	k
 pmi_haptics_after	k
 pmi_haptics_ms	k

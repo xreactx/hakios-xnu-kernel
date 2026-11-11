@@ -2,7 +2,7 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **417 arguments**: 346 read by the kernel, 14 by the loader, 68 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **421 arguments**: 350 read by the kernel, 14 by the loader, 68 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
@@ -437,13 +437,14 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ufs` | L | `loader.c` | `CONFIG_UFS` |  |
 | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
 
-## User space (58)
+## User space (62)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
 | `autounlock` | U | `inject_sb.c` | `CONFIG_AUTOUNLOCK` |  |
 | `bt` | K | `hakios.bt.c` | `CONFIG_BT` |  |
 | `bt6t` | K | `hakios.bt6t.c` | `CONFIG_BT6T` |  |
+| `bt6t_at` | K | `hakios.bt6t.c` | `CONFIG_BT6T_AT` |  |
 | `bt6t_baud` | K | `hakios.bt6t.c` | `CONFIG_BT6T_BAUD` |  |
 | `bt6t_bdaddr` | K | `hakios.bt6t.c` | `CONFIG_BT6T_BDADDR` |  |
 | `bt6t_cts` | K | `hakios.bt6t.c` | `CONFIG_BT6T_CTS` |  |
@@ -476,6 +477,9 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `metal_skip` | U | `HakiosMetalCA.m` | `CONFIG_METAL_SKIP` |  |
 | `metal_trace` | U | `HakiosMetalCA.m` | `CONFIG_METAL_TRACE` |  |
 | `metal_watch` | U | `inject.c` | `CONFIG_METAL_WATCH` |  |
+| `pmi_charger` | K | `hakios.pmi_charger.c` | `CONFIG_PMI_CHARGER` |  |
+| `pmi_charger_after` | K | `hakios.pmi_charger.c` | `CONFIG_PMI_CHARGER_AFTER` |  |
+| `pmi_charger_every` | K | `hakios.pmi_charger.c` | `CONFIG_PMI_CHARGER_EVERY` |  |
 | `pmi_haptics` | K | `hakios.pmi_haptics.c` | `CONFIG_PMI_HAPTICS` |  |
 | `pmi_haptics_after` | K | `hakios.pmi_haptics.c` | `CONFIG_PMI_HAPTICS_AFTER` |  |
 | `pmi_haptics_ms` | K | `hakios.pmi_haptics.c` | `CONFIG_PMI_HAPTICS_MS` |  |

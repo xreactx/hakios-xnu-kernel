@@ -57,6 +57,7 @@ BATTERY	arg	battery	Audio and battery	kl	hakios.adsp.c,hakios.battery.c,loader.c
 BATTMGR	arg	battmgr	Audio and battery	k	hakios.adsp.c	every property once, for the log (which number is which on this phone's firmware)
 BT	arg	bt	User space	k	hakios.bt.c	
 BT6T	arg	bt6t	User space	k	hakios.bt6t.c	the clocks voted on (the engine's at 7.3728 MHz) and the pins set, then the same look at the engine
+BT6T_AT	arg	bt6t_at	User space	k	hakios.bt6t.c	the hands-free profile's AT commands written down, both ways -- they are ASCII inside RFCOMM frames on an
 BT6T_BAUD	arg	bt6t_baud	User space	k	hakios.bt6t.c	
 BT6T_BDADDR	arg	bt6t_bdaddr	User space	k	hakios.bt6t.c	the phone's own address (xl adds it from fw-bt/bdaddr)
 BT6T_CTS	arg	bt6t_cts	User space	k	hakios.bt6t.c	
@@ -234,6 +235,9 @@ MODEM_STEP	arg	modem_step	Cellular	k	hakios.mpss.c	the steps once the root is th
 MODEM_STOP	arg	modem_stop	Cellular	k	hakios.mpss.c	
 MODEM_WAIT	arg	modem_wait	Cellular	k	hakios.mpss.c	
 MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c	
+PMI_CHARGER	arg	pmi_charger	User space	k	hakios.pmi_charger.c	
+PMI_CHARGER_AFTER	arg	pmi_charger_after	User space	k	hakios.pmi_charger.c	
+PMI_CHARGER_EVERY	arg	pmi_charger_every	User space	k	hakios.pmi_charger.c	
 PMI_HAPTICS	arg	pmi_haptics	User space	k	hakios.pmi_haptics.c	a look, reading only: which channel of the arbiter is the block's and which system may write through it, what the block says it is, and its registers
 PMI_HAPTICS_AFTER	arg	pmi_haptics_after	User space	k	hakios.pmi_haptics.c	
 PMI_HAPTICS_MS	arg	pmi_haptics_ms	User space	k	hakios.pmi_haptics.c	
