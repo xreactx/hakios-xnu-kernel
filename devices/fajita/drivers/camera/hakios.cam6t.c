@@ -28,6 +28,9 @@
  *             again. MCLK is camcc's PLL2 at 960 MHz (L 0x32), its even output 480 MHz, the RCG's /10 and M/N 1/2:
  *             24 MHz, as Android has it (cam6t_xo=1 takes the crystal's 19.2 MHz instead, with no PLL). All
  *             three with cam6t_sensor=3, one after the other.
+ *   cam6t=3   ... and the camera subsystem's own blocks reached: the bus clocks and the lite path's (IFE-lite,
+ *             CSID-lite, cphy_rx) on, from the crystal, and the blocks' hardware versions read (titan's CPAS, the
+ *             camera NoC, IFE-lite, CSID-lite); then off. No sensor is asked unless cam6t_sensor= says one.
  *   cam6t_after=S   when (seconds after the driver starts; 50): away from the modem's and the audio DSP's starts.
  *
  * At the run's end (hakios_cam6t_quiesce) whatever is still up goes down: reset low, MCLK off, the enables low, the
@@ -51,6 +54,7 @@ extern kern_return_t thread_terminate(thread_t thread);
 extern lck_mtx_t hakios_rsc_lock;               /* hakios.wifi.c: one RPMh request at a time */
 
 static uint32_t level, which, after_s = 50, use_xo;
+static bool which_given;
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -785,6 +789,126 @@ lvs1_on(void)
 	return true;
 }
 
+/* ---- cam6t=3: the camera subsystem's own blocks reached (camss.c's csid_res_845 / vfe_res_845, the lite path) ------- */
+
+/*
+ * Before anything streams, the blocks are only read: their hardware version, with their clocks on, all of them
+ * from the crystal (19.2 MHz: enough to reach the registers; Android's rates come with streaming). The bus clocks
+ * first (soc_ahb; slow_ahb_src for cpas_ahb; camnoc_axi riding GCC's camera_axi), then the lite path: ife_lite,
+ * ife_lite_csid, ife_lite_cphy_rx (and its source cphy_rx_src). A block is read only when every branch it needs
+ * says it runs: an access to a block without its clocks hangs the bus.
+ */
+#define CAMCC_SLOW_AHB_RCG      0x6054
+#define CAMCC_CPHY_RX_RCG       0x9060
+#define CAMCC_IFE_LITE_RCG      0xb004
+#define CAMCC_IFE_LITE_CSID_RCG 0xb024
+#define CAMCC_SOC_AHB_CBCR      0xb13c
+#define CAMCC_CPAS_AHB_CBCR     0xb11c
+#define CAMCC_CAMNOC_AXI_CBCR   0xb124
+#define CAMCC_IFE_LITE_CBCR     0xb01c
+#define CAMCC_IFE_LITE_CSID_CBCR 0xb03c
+#define CAMCC_IFE_LITE_CPHY_CBCR 0xb044
+#define CPAS_PHYS               0x0ac40000UL    /* cam_cpas_top: titan's version at 0 */
+#define CAMNOC_PHYS             0x0ac42000UL
+#define VFE_LITE_PHYS           0x0acc4000UL
+#define CSID_LITE_PHYS          0x0acc8000UL
+
+static const struct {
+	uint32_t cbcr;
+	const char *name;
+} blocks_branches[] = {
+	{ CAMCC_SOC_AHB_CBCR, "soc_ahb" }, { CAMCC_CPAS_AHB_CBCR, "cpas_ahb" }, { CAMCC_CAMNOC_AXI_CBCR, "camnoc_axi" },
+	{ CAMCC_IFE_LITE_CBCR, "ife_lite" }, { CAMCC_IFE_LITE_CSID_CBCR, "ife_lite_csid" },
+	{ CAMCC_IFE_LITE_CPHY_CBCR, "ife_lite_cphy_rx" },
+};
+#define BLOCKS_BRANCHES         (sizeof(blocks_branches) / sizeof(blocks_branches[0]))
+static bool branch_ours[BLOCKS_BRANCHES], camera_axi_ours;
+
+/* an RCG with no M/N to the crystal, /1 */
+static bool
+rcg_xo(uint32_t rcg, const char *name)
+{
+	wr(camcc + rcg + RCG_CFG, 0);
+	wr(camcc + rcg + RCG_CMD, rd(camcc + rcg + RCG_CMD) | 1);
+	for (int i = 0; rd(camcc + rcg + RCG_CMD) & 1; i++) {
+		if (i > 1000) {
+			say("cam6t: %s: the RCG does not take the crystal (cmd %#010x)\n", name, rd(camcc + rcg + RCG_CMD));
+			return false;
+		}
+		spin_us(1);
+	}
+	return true;
+}
+
+static bool
+branch_on(unsigned k)
+{
+	vm_offset_t b = camcc + blocks_branches[k].cbcr;
+
+	if (!(rd(b) & CBCR_ENABLE)) {
+		branch_ours[k] = true;
+		wr(b, rd(b) | CBCR_ENABLE);
+	}
+	for (int i = 0; rd(b) & CBCR_OFF; i++) {
+		if (i > 1000) {
+			say("cam6t: %s stays off (%#010x)\n", blocks_branches[k].name, rd(b));
+			return false;
+		}
+		spin_us(1);
+	}
+	return true;
+}
+
+static void
+blocks_off(void)
+{
+	for (unsigned k = BLOCKS_BRANCHES; k-- > 0;) {
+		if (branch_ours[k]) {
+			wr(camcc + blocks_branches[k].cbcr, rd(camcc + blocks_branches[k].cbcr) & ~CBCR_ENABLE);
+			branch_ours[k] = false;
+		}
+	}
+	if (camera_axi_ours) {
+		wr(gcc + (GCC_CAMERA_AXI_CBCR & 0xfff), rd(gcc + (GCC_CAMERA_AXI_CBCR & 0xfff)) & ~CBCR_ENABLE);
+		camera_axi_ours = false;
+	}
+}
+
+static void
+blocks_look(void)
+{
+	vm_offset_t axi = gcc + (GCC_CAMERA_AXI_CBCR & 0xfff);
+	bool all = true;
+
+	if (!(rd(axi) & CBCR_ENABLE)) {
+		camera_axi_ours = true;
+		wr(axi, rd(axi) | CBCR_ENABLE);
+		spin_us(10);
+	}
+	say("cam6t: GCC camera_axi %#010x\n", rd(axi));
+	if (!rcg_xo(CAMCC_SLOW_AHB_RCG, "slow_ahb_src") || !rcg_xo(CAMCC_CPHY_RX_RCG, "cphy_rx_src") ||
+	    !rcg_xo(CAMCC_IFE_LITE_RCG, "ife_lite_src") || !rcg_xo(CAMCC_IFE_LITE_CSID_RCG, "ife_lite_csid_src")) {
+		blocks_off();
+		return;
+	}
+	for (unsigned k = 0; k < BLOCKS_BRANCHES; k++) {
+		bool on = branch_on(k);
+
+		say("cam6t: %s %s (%#010x)\n", blocks_branches[k].name, on ? "runs" : "DOES NOT RUN", rd(camcc + blocks_branches[k].cbcr));
+		all = all && on;
+	}
+	if (!all) {
+		say("cam6t: not every clock runs: the blocks are not read\n");
+	} else {
+		vm_offset_t cpas = ml_io_map(CPAS_PHYS, 0x1000), camnoc = ml_io_map(CAMNOC_PHYS, 0x1000);
+		vm_offset_t vfe = ml_io_map(VFE_LITE_PHYS, 0x1000), csid = ml_io_map(CSID_LITE_PHYS, 0x1000);
+
+		say("cam6t: THE CAMERA'S BLOCKS: titan (cpas top) version %#010x, camnoc %#010x, IFE-lite %#010x, CSID-lite %#010x\n",
+		    rd(cpas), rd(camnoc), rd(vfe), rd(csid));
+	}
+	blocks_off();
+}
+
 /* ---- power up, ask, power down ---------------------------------------------------------------------------------- */
 
 static const struct sensor *up;         /* the sensor powered up now, if one is */
@@ -888,10 +1012,13 @@ cam6t_thread(__unused void *arg, __unused wait_result_t wr_)
 	if (!bob_on() || !gdsc_on() || (!use_xo && !pll2_up())) {
 		say("cam6t: the camera's supplies or clocks did not come up: no sensor is powered\n");
 	} else {
-		for (unsigned i = 0; i < SENSORS; i++) {
+		for (unsigned i = 0; i < SENSORS && (level == 2 || which_given); i++) {
 			if (which >= SENSORS || which == i) {
 				ask(&sensors[i]);
 			}
+		}
+		if (level >= 3) {
+			blocks_look();
 		}
 	}
 	pll2_down();
@@ -909,7 +1036,7 @@ hakios_cam6t_init(void)
 	if (!PE_parse_boot_argn("cam6t", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	(void)PE_parse_boot_argn("cam6t_sensor", &which, sizeof(which));
+	which_given = PE_parse_boot_argn("cam6t_sensor", &which, sizeof(which));
 	(void)PE_parse_boot_argn("cam6t_after", &after_s, sizeof(after_s));
 	(void)PE_parse_boot_argn("cam6t_xo", &use_xo, sizeof(use_xo));
 	if (kernel_thread_start(cam6t_thread, NULL, &thread) == KERN_SUCCESS) {
@@ -931,6 +1058,7 @@ hakios_cam6t_quiesce(void)
 		for (unsigned n = 0; n < 3; n++) {
 			mclk_off(n);
 		}
+		blocks_off();
 		pll2_down();
 		gdsc_off();
 	}
