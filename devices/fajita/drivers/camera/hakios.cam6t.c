@@ -33,6 +33,8 @@
  *             camera NoC, IFE-lite, CSID-lite); then off. No sensor is asked unless cam6t_sensor= says one.
  *   cam6t=4   ... and instead of the look, a frame of the CSID's test pattern (colour bars, RAW10, 640x480) through
  *             IFE-lite into memory, through an SMMU context of ours; the loader hands it to the host (xl camera).
+ *   cam6t=5   ... and instead, a frame of a sensor's own (cam6t_sensor=2 the front IMX371 by default, 1 the IMX376K;
+ *             cam6t_mode=N its mode), through its CSIPHY, with its tables from the small image's fw/camera-*.tab.
  *   cam6t_after=S   when (seconds after the driver starts; 50): away from the modem's and the audio DSP's starts.
  *
  * At the run's end (hakios_cam6t_quiesce) whatever is still up goes down: reset low, MCLK off, the enables low, the
@@ -975,7 +977,10 @@ static const struct {
 #define CAM_FRAMES              2
 #define TPG_WIDTH               640
 #define TPG_HEIGHT              480
-#define TPG_STRIDE              (TPG_WIDTH * 10 / 8)
+
+static uint32_t cap_width = TPG_WIDTH, cap_height = TPG_HEIGHT;
+#define TPG_STRIDE              (cap_width * 10 / 8)
+#define TPG_HEIGHT_NOW          cap_height
 
 struct cam_header {                     /* redwood's (tools/camraw.py) */
 	char            magic[8];       /* "RWCAM001" */
@@ -994,18 +999,26 @@ extern uint64_t kvtophys(vm_offset_t va);
 extern lck_mtx_t hakios_smmu_lock;
 
 static vm_offset_t smmu, smmu_second, smmu_context, frames, page_tables;
-static uint64_t frames_bytes;
+static uint64_t frames_bytes, frames_kept;         /* frames_kept: what cam6t=5 took at boot, while the memory is in one piece */
+#define FRAMES_KEPT_BYTES       (16ull << 20)
 static uint32_t smmu_ctx, smmu_match[IFE_STREAMS], smmu_old_smr[IFE_STREAMS], smmu_old_s2cr[IFE_STREAMS];
 static unsigned smmu_matches;
 static bool smmu_on;
 
 static bool
-frames_alloc(void)
+frames_alloc(uint32_t source, const char *name, uint32_t bayer)
 {
 	struct cam_header *h;
-	uint32_t frame_bytes = TPG_STRIDE * TPG_HEIGHT;
+	uint32_t frame_bytes = TPG_STRIDE * TPG_HEIGHT_NOW;
 
 	frames_bytes = round_page(CAM_HEADER_BYTES + (uint64_t)CAM_FRAMES * frame_bytes);
+	if (frames != 0 && frames_bytes > (frames_kept ? frames_kept : frames_bytes)) {
+		say("cam6t: %u frames want %llu KB, more than the %llu KB taken at boot\n", CAM_FRAMES, frames_bytes >> 10, frames_kept >> 10);
+		return false;
+	}
+	if (frames != 0) {
+		bzero((void *)frames, CAM_HEADER_BYTES);
+	}
 	if (frames == 0 && kmem_alloc_contig(kernel_map, &frames, frames_bytes, PAGE_MASK, 0, 0,
 	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		frames = 0;
@@ -1014,14 +1027,14 @@ frames_alloc(void)
 	}
 	h = (struct cam_header *)frames;
 	memcpy(h->magic, "RWCAM001", 8);
-	h->width = TPG_WIDTH;
-	h->height = TPG_HEIGHT;
+	h->width = cap_width;
+	h->height = cap_height;
 	h->stride = TPG_STRIDE;
 	h->format = 1;
-	h->bayer = 0;
+	h->bayer = bayer;
 	h->frame_bytes = frame_bytes;
-	h->source = 0;
-	strlcpy(h->sensor, "CSID TPG", sizeof(h->sensor));
+	h->source = source;
+	strlcpy(h->sensor, name, sizeof(h->sensor));
 	for (vm_offset_t line = frames; line < frames + frames_bytes; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
 	}
@@ -1334,7 +1347,7 @@ csid_reset(void)
 static bool
 ife_config(void)
 {
-	uint32_t frame_bytes = TPG_STRIDE * TPG_HEIGHT;
+	uint32_t frame_bytes = TPG_STRIDE * TPG_HEIGHT_NOW;
 
 	wr(ife_base + IFE_IRQ_MASK0, 1u << 31);
 	wr(ife_base + IFE_GLOBAL_RESET, 0x3f9f);
@@ -1373,22 +1386,27 @@ ife_config(void)
 	return true;
 }
 
+/* phy < 0: the CSID's own generator; else that CSIPHY's four D-PHY lanes, in lane_assign's order */
 static bool
-csid_config(void)
+csid_config(int phy, uint32_t lane_assign)
 {
 	uint32_t vc = 0, cfg0 = vc << 22 | RAW10_DT << 16 | 0xfu << 12 | 1u << 2 | 3u;
 
-	wr(csid_base + CSID_CSI2_RX_CFG0, 3u | 0x3210u << 4);          /* four lanes, phy 0: the generator's */
+	wr(csid_base + CSID_CSI2_RX_CFG0, 3u | (phy < 0 ? 0x3210u : lane_assign) << 4 | (uint32_t)(phy < 0 ? 0 : phy & 3) << 20);
 	wr(csid_base + CSID_CSI2_RX_CFG1, 1u << 6 | 1u);
+	if (phy >= 0) {
+		goto rdi;
+	}
 	/* camss-csid-gen2.c's __csid_configure_testgen(): one data type, frames without end, colour bars */
 	wr(csid_base + CSID_TPG_VC_CFG0, vc | 1u << 10);
 	wr(csid_base + CSID_TPG_VC_CFG1, 0x740u | 0x3ffu << 12);
 	wr(csid_base + CSID_TPG_LFSR_SEED, 0x12345678);
-	wr(csid_base + CSID_TPG_DT0_CFG0, TPG_HEIGHT | (uint32_t)TPG_WIDTH << 16);
+	wr(csid_base + CSID_TPG_DT0_CFG0, cap_height | cap_width << 16);
 	wr(csid_base + CSID_TPG_DT0_CFG1, RAW10_DT);
 	wr(csid_base + CSID_TPG_DT0_CFG2, 8u | 0xbeu << 4 | 2u << 16);   /* colour bars, RAW10 */
 	wr(csid_base + CSID_TPG_COLOR_BARS_CFG, 0);
 	wr(csid_base + CSID_TPG_COLOR_BOX_CFG, 0);
+rdi:
 	/* __csid_configure_rdi_stream() */
 	wr(csid_base + CSID_RDI0_CFG0, cfg0);
 	wr(csid_base + CSID_RDI0_CFG1, 2);
@@ -1446,10 +1464,12 @@ capture_tpg(void)
 		csid_base = ml_io_map(CSID_LITE_PHYS, 0x1000);
 		ife_base = ml_io_map(VFE_LITE_PHYS, 0x4000);
 	}
-	if (!frames_alloc() || !blocks_on(true)) {
+	cap_width = TPG_WIDTH;
+	cap_height = TPG_HEIGHT;
+	if (!frames_alloc(0, "CSID TPG", 0) || !blocks_on(true)) {
 		return;
 	}
-	if (!smmu_up() || !csid_reset() || !ife_config() || !csid_config()) {
+	if (!smmu_up() || !csid_reset() || !ife_config() || !csid_config(-1, 0)) {
 		smmu_down();
 		blocks_off();
 		return;
@@ -1482,11 +1502,11 @@ capture_tpg(void)
 	const uint8_t *p = (const uint8_t *)(frames + CAM_HEADER_BYTES);
 	uint32_t nonzero = 0;
 
-	for (uint32_t i = 0; i < TPG_STRIDE * TPG_HEIGHT; i++) {
+	for (uint32_t i = 0; i < TPG_STRIDE * TPG_HEIGHT_NOW; i++) {
 		nonzero += p[i] != 0;
 	}
 	say("cam6t: the frame's first bytes %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x; %u of %u bytes not 0 (xl camera fetches it)\n",
-	    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], nonzero, (unsigned)(TPG_STRIDE * TPG_HEIGHT));
+	    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], nonzero, (unsigned)(TPG_STRIDE * TPG_HEIGHT_NOW));
 	for (vm_offset_t line = frames; line < frames + CAM_HEADER_BYTES; line += 64) {
 		__asm__ volatile ("dc cvac, %0" : : "r" (line));
 	}
@@ -1566,6 +1586,489 @@ ask(const struct sensor *s)
 	say("cam6t: the %s powered down\n", s->name);
 }
 
+/* ---- cam6t=5: a sensor's own frames (the front IMX371 by default) ---------------------------------------------- */
+
+/*
+ * The sensor powered as for its chip ID and left up; its tables (fw/camera-<sensor>.tab in the small image, which
+ * tools/camsensor.py makes of the module file: userland/build.sh) written over the CCI pins: the initialisation,
+ * then a mode's (cam6t_mode=N; 1 for the IMX371, 2304x1728). Its CSIPHY's four D-PHY lanes (camss-csiphy-3ph-1-0.c's
+ * SDM845 table, the settle count from the lane rate the mode gives) into CSID-lite, RDI 0, IFE-lite, memory, as the
+ * test pattern went; then "stream on". The clocks at Android's rates for this path: cphy_rx and the CSID 384 MHz
+ * (PLL3), IFE-lite 320 MHz (PLL2's even output / 1.5), the PHY's timer 240 MHz (PLL2 / 2); the PHY's two supplies
+ * (vdda-phy: the PM8998's LDO1 at 0.88 V, vdda-pll: LDO26 at 1.2 V), as Android had them with the front camera on.
+ * Only the D-PHY sensors: the IMX519's three C-PHY trios are not done here.
+ */
+extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+
+static uint32_t cam_mode = ~0u, cam_exposure = ~0u, cam_gain = 768;
+
+
+struct ctab_head {
+	char            magic[8];       /* "RWCTAB02" */
+	uint32_t        slave, address_bytes, data_bytes, id_address, id, id_mask, lane_assign, modes;
+};
+struct ctab_mode {
+	uint32_t        width, height, x, y, lanes, cphy, settle, pixel_clock, line_length, frame_length, fps_milli, data_type;
+};
+struct ctab_entry {
+	uint16_t        address, data;
+	uint8_t         address_bytes, data_bytes, operation, zero;
+	uint32_t        delay;
+};
+
+static const struct ctab_head *ctab;
+static uint64_t ctab_size;
+
+static const char *const tab_names[SENSORS] = { "camera-imx519.tab", "camera-imx376k.tab", "camera-imx371.tab" };
+static const uint32_t sensor_csiphy[SENSORS] = { 0, 1, 2 };
+static const uint32_t sensor_bayer[SENSORS] = { 0, 0, 0 };     /* RGGB: the module files' colour filter order */
+
+/* a table by its name: its entries and how many; NULL when there is none */
+static const struct ctab_entry *
+ctab_find(const char *name, uint32_t *count)
+{
+	const uint8_t *end = (const uint8_t *)ctab + ctab_size;
+	const uint8_t *at = (const uint8_t *)ctab + sizeof(*ctab) + ctab->modes * sizeof(struct ctab_mode);
+	uint32_t tables;
+
+	for (int p = 0; p < 2; p++) {           /* (the power sequences, which the driver does by hand) */
+		if (at + 12 > end) {
+			return NULL;
+		}
+		at += 12 + *(const uint32_t *)(at + 8) * sizeof(struct ctab_entry);
+	}
+	if (at + 4 > end) {
+		return NULL;
+	}
+	tables = *(const uint32_t *)at;
+	at += 4;
+	for (uint32_t t = 0; t < tables && at + 12 <= end; t++) {
+		uint32_t n = *(const uint32_t *)(at + 8);
+
+		if (at + 12 + n * sizeof(struct ctab_entry) > end) {
+			return NULL;
+		}
+		if (strncmp((const char *)at, name, 8) == 0) {
+			*count = n;
+			return (const struct ctab_entry *)(at + 12);
+		}
+		at += 12 + n * sizeof(struct ctab_entry);
+	}
+	return NULL;
+}
+
+static bool
+ctab_load(unsigned i)
+{
+	ctab = (const struct ctab_head *)hakios_image_file("fw", tab_names[i], &ctab_size, NULL);
+	if (ctab == NULL || ctab_size < sizeof(*ctab) || memcmp(ctab->magic, "RWCTAB02", 8) != 0 || ctab->modes == 0 ||
+	    ctab->modes > 16 || sizeof(*ctab) + ctab->modes * sizeof(struct ctab_mode) > ctab_size) {
+		say("cam6t: no %s (RWCTAB02) in fw/ of the small image (userland/build.sh makes it from fw-camera/)\n", tab_names[i]);
+		ctab = NULL;
+		return false;
+	}
+	say("cam6t: %s: slave %#x, chip ID %#x, lanes %#x, %u modes\n", tab_names[i], ctab->slave, ctab->id, ctab->lane_assign,
+	    ctab->modes);
+	return true;
+}
+
+/* one register write: a 16-bit address, 8 or 16 bits of data */
+static bool
+write_reg(const struct sensor *s, const struct ctab_entry *e)
+{
+	bool answered;
+
+	bus_sda = s->sda;
+	bus_scl = s->scl;
+	i2c_start();
+	answered = i2c_write(s->address) && i2c_write((uint8_t)(e->address >> 8)) && i2c_write((uint8_t)e->address);
+	if (answered && e->data_bytes == 2) {
+		answered = i2c_write((uint8_t)(e->data >> 8));
+	}
+	answered = answered && i2c_write((uint8_t)e->data);
+	i2c_stop();
+	bus_give_back();
+	if (e->delay != 0) {
+		spin_us(e->delay);
+	}
+	return answered;
+}
+
+static bool
+write_table(const struct sensor *s, const char *name)
+{
+	uint32_t count = 0, failed = 0;
+	const struct ctab_entry *e = ctab_find(name, &count);
+
+	if (e == NULL) {
+		say("cam6t: the %s has no table \"%s\"\n", s->name, name);
+		return false;
+	}
+	for (uint32_t k = 0; k < count; k++) {
+		if (e[k].operation != 0) {
+			continue;               /* (only writes are in these tables) */
+		}
+		if (!write_reg(s, &e[k]) && failed++ < 3) {
+			say("cam6t: the %s did not take %#06x <- %#x\n", s->name, e[k].address, e[k].data);
+		}
+	}
+	say("cam6t: the %s's \"%s\": %u writes%s\n", s->name, name, count, failed ? ", SOME NOT TAKEN" : "");
+	return failed == 0;
+}
+
+/*
+ * Exposure and gain: the tables leave the sensor's power-on ones (Android's auto exposure sets them later), far too
+ * little light. Sony's registers, as the module file names them: the coarse integration time in lines at 0x0202 (16
+ * bits), the analog gain code at 0x0204 (gain = 1024 / (1024 - code)). cam6t_exposure=N lines (frame length less 20
+ * by default), cam6t_gain=code (768: 4x).
+ */
+static bool
+write16(const struct sensor *s, uint16_t reg, uint16_t value)
+{
+	struct ctab_entry e = { reg, value, 2, 2, 0, 0, 0 };
+
+	return write_reg(s, &e);
+}
+
+/* camcc's PLL3 (Fabia, 384 MHz: L 0x14, as camcc-sdm845.c configures it), its even output /1 */
+#define PLL3                    0x3000
+static bool pll3_ours;
+
+static bool
+pll3_up(void)
+{
+	vm_offset_t p = camcc + PLL3;
+
+	if ((rd(p + PLL_OPMODE) & 1) && (rd(p + PLL_MODE) & PLL_OUTCTRL)) {
+		return (rd(p + PLL_L) & 0xffff) == 0x14;
+	}
+	wr(p + PLL_L, 0x14);
+	wr(p + PLL_FRAC, 0);
+	wr(p + PLL_USER_CTL, rd(p + PLL_USER_CTL) & ~PLL_POST_DIV_EVEN);
+	wr(p + PLL_MODE, rd(p + PLL_MODE) | PLL_UPDATE_BYPASS);
+	wr(p + PLL_MODE, rd(p + PLL_MODE) & ~PLL_OUTCTRL);
+	wr(p + PLL_OPMODE, 0);
+	wr(p + PLL_MODE, rd(p + PLL_MODE) | PLL_RESET_N);
+	wr(p + PLL_OPMODE, 1);
+	for (int i = 0; !(rd(p + PLL_MODE) & PLL_LOCK_DET); i++) {
+		if (i > 1000) {
+			say("cam6t: PLL3 DOES NOT LOCK (mode %#010x)\n", rd(p + PLL_MODE));
+			wr(p + PLL_OPMODE, 0);
+			return false;
+		}
+		spin_us(10);
+	}
+	wr(p + PLL_USER_CTL, rd(p + PLL_USER_CTL) | PLL_OUT_MASK);
+	wr(p + PLL_MODE, rd(p + PLL_MODE) | PLL_OUTCTRL);
+	pll3_ours = true;
+	say("cam6t: PLL3 locked at 384 MHz\n");
+	return true;
+}
+
+static void
+pll3_down(void)
+{
+	vm_offset_t p = camcc + PLL3;
+
+	if (pll3_ours) {
+		/* (what PLL3 feeds back on the crystal first, as clk_rcg2_shared_ops park them) */
+		(void)rcg_xo(CAMCC_CPHY_RX_RCG, "cphy_rx_src");
+		(void)rcg_xo(CAMCC_IFE_LITE_CSID_RCG, "ife_lite_csid_src");
+		wr(p + PLL_MODE, rd(p + PLL_MODE) & ~PLL_OUTCTRL);
+		wr(p + PLL_USER_CTL, rd(p + PLL_USER_CTL) & ~PLL_OUT_MASK);
+		wr(p + PLL_OPMODE, 0);
+		pll3_ours = false;
+	}
+}
+
+/* an RCG with no M/N to a source and a divider (cfg as clk-rcg2.c writes it: [4:0] 2d-1, [10:8] source) */
+static bool
+rcg_set(uint32_t rcg, uint32_t cfg, const char *name)
+{
+	wr(camcc + rcg + RCG_CFG, cfg);
+	wr(camcc + rcg + RCG_CMD, rd(camcc + rcg + RCG_CMD) | 1);
+	for (int i = 0; rd(camcc + rcg + RCG_CMD) & 1; i++) {
+		if (i > 1000) {
+			say("cam6t: %s: the RCG does not take %#x (cmd %#010x)\n", name, cfg, rd(camcc + rcg + RCG_CMD));
+			return false;
+		}
+		spin_us(1);
+	}
+	return true;
+}
+
+#define CAMCC_CSI_PHYTIMER_RCG(n)  (0x5004 + 0x24 * (n))       /* csi0phytimer 0x5004, 1 0x5028, 2 0x504c */
+#define CAMCC_CSI_PHYTIMER_CBCR(n) (0x501c + 0x24 * (n))       /* 0x501c, 0x5040, 0x5064 */
+#define CAMCC_CSIPHY_CBCR(n)       (0x5020 + 0x24 * (n))       /* csiphy0 0x5020, 1 0x5044, 2 0x5068 */
+#define CSIPHY_PHYS(n)             (0x0ac65000UL + 0x1000UL * (n))
+#define CSIPHY_TIMER_HZ            240000000u
+#define CSIPHY_COMMON(n)           (0x800 + 4 * (n))
+#define CSIPHY_STATUS(n)           (0x8b0 + 4 * (n))
+
+static vm_offset_t csiphy_base;
+static uint32_t phy_n = ~0u;
+static bool phy_clocks_ours, phy_on;
+
+static bool
+phy_clocks_on(uint32_t n)
+{
+	vm_offset_t t = camcc + CAMCC_CSI_PHYTIMER_CBCR(n), c = camcc + CAMCC_CSIPHY_CBCR(n);
+
+	if (!rcg_set(CAMCC_CSI_PHYTIMER_RCG(n), 3u | 1u << 8, "csiphytimer")) {   /* PLL2 even / 2: 240 MHz */
+		return false;
+	}
+	phy_clocks_ours = true;
+	phy_n = n;
+	wr(t, rd(t) | CBCR_ENABLE);
+	wr(c, rd(c) | CBCR_ENABLE);
+	for (int i = 0; (rd(t) & CBCR_OFF) || (rd(c) & CBCR_OFF); i++) {
+		if (i > 1000) {
+			say("cam6t: csiphy%u's clocks stay off (timer %#010x, phy %#010x)\n", n, rd(t), rd(c));
+			return false;
+		}
+		spin_us(1);
+	}
+	return true;
+}
+
+static void
+phy_clocks_off(void)
+{
+	if (phy_clocks_ours) {
+		wr(camcc + CAMCC_CSIPHY_CBCR(phy_n), rd(camcc + CAMCC_CSIPHY_CBCR(phy_n)) & ~CBCR_ENABLE);
+		wr(camcc + CAMCC_CSI_PHYTIMER_CBCR(phy_n), rd(camcc + CAMCC_CSI_PHYTIMER_CBCR(phy_n)) & ~CBCR_ENABLE);
+		phy_clocks_ours = false;
+	}
+}
+
+/* the PHY's two LDOs through RPMh (VRM: voltage, enable, mode 7 = high power) */
+static bool
+phy_rails_on(void)
+{
+	static const struct {
+		const char *name;
+		uint32_t mv;
+	} ldo[2] = { { "ldoa1", 880 }, { "ldoa26", 1200 } };
+
+	for (unsigned k = 0; k < 2; k++) {
+		uint32_t base = rpmh_address(ldo[k].name), address[3], data[3] = { ldo[k].mv, 1, 7 };
+
+		if (base == 0 || (base >> 16 & 0xf) != 4) {
+			say("cam6t: RPMh: no regulator \"%s\"\n", ldo[k].name);
+			return false;
+		}
+		address[0] = base + VRM_VOLTAGE;
+		address[1] = base + VRM_ENABLE;
+		address[2] = base + VRM_MODE;
+		if (!rpmh_write(address, data, 3)) {
+			return false;
+		}
+	}
+	say("cam6t: the CSIPHYs' supplies voted on (LDO1 0.88 V, LDO26 1.2 V)\n");
+	return true;
+}
+
+/* mainline's csiphy_settle_cnt_calc(): the lane's rate in bits a second */
+static uint32_t
+settle_count(uint64_t lane_bps)
+{
+	uint64_t ui_ps = 1000000000000ull / lane_bps;           /* one bit */
+	uint64_t settle_ps = 85000 + 6 * ui_ps, timer_ps = 1000000000000ull / CSIPHY_TIMER_HZ;
+
+	return (uint32_t)(settle_ps / timer_ps - 6);
+}
+
+static const uint16_t phy_regs[5][14][2] = {          /* camss-csiphy-3ph-1-0.c: lane_regs_sdm845; 0xffff the settle count */
+	{ { 0x0004, 0x0c }, { 0x002c, 0x01 }, { 0x0034, 0x0f }, { 0x001c, 0x0a }, { 0x0014, 0x60 }, { 0, 0 }, { 0x003c, 0xb8 },
+	  { 0x0000, 0x91 }, { 0x0008, 0xffff }, { 0, 0 }, { 0x0010, 0x52 }, { 0x0038, 0xfe }, { 0x0060, 0x00 }, { 0x0064, 0x7f } },
+	{ { 0x0704, 0x0c }, { 0x072c, 0x01 }, { 0x0734, 0x0f }, { 0x071c, 0x0a }, { 0x0714, 0x60 }, { 0x0728, 0x04 },
+	  { 0x073c, 0xb8 }, { 0x0700, 0x80 }, { 0x0708, 0xffff }, { 0x070c, 0xa5 }, { 0x0710, 0x52 }, { 0x0738, 0x1f },
+	  { 0x0760, 0x00 }, { 0x0764, 0x7f } },
+	{ { 0x0204, 0x0c }, { 0x022c, 0x01 }, { 0x0234, 0x0f }, { 0x021c, 0x0a }, { 0x0214, 0x60 }, { 0, 0 }, { 0x023c, 0xb8 },
+	  { 0x0200, 0x91 }, { 0x0208, 0xffff }, { 0, 0 }, { 0x0210, 0x52 }, { 0x0238, 0xfe }, { 0x0260, 0x00 }, { 0x0264, 0x7f } },
+	{ { 0x0404, 0x0c }, { 0x042c, 0x01 }, { 0x0434, 0x0f }, { 0x041c, 0x0a }, { 0x0414, 0x60 }, { 0, 0 }, { 0x043c, 0xb8 },
+	  { 0x0400, 0x91 }, { 0x0408, 0xffff }, { 0, 0 }, { 0x0410, 0x52 }, { 0x0438, 0xfe }, { 0x0460, 0x00 }, { 0x0464, 0x7f } },
+	{ { 0x0604, 0x0c }, { 0x062c, 0x01 }, { 0x0634, 0x0f }, { 0x061c, 0x0a }, { 0x0614, 0x60 }, { 0, 0 }, { 0x063c, 0xb8 },
+	  { 0x0600, 0x91 }, { 0x0608, 0xffff }, { 0, 0 }, { 0x0610, 0x52 }, { 0x0638, 0xfe }, { 0x0660, 0x00 }, { 0x0664, 0x7f } },
+};
+
+/* csiphy_reset() and csiphy_lanes_enable() for four data lanes and the clock lane */
+static void
+phy_config(uint32_t settle)
+{
+	uint32_t version;
+
+	wr(csiphy_base + CSIPHY_COMMON(6), 2);                  /* show the revision */
+	version = rd(csiphy_base + CSIPHY_STATUS(12)) | rd(csiphy_base + CSIPHY_STATUS(13)) << 8 |
+	    rd(csiphy_base + CSIPHY_STATUS(14)) << 16 | rd(csiphy_base + CSIPHY_STATUS(15)) << 24;
+	wr(csiphy_base + CSIPHY_COMMON(0), 1);
+	spin_us(5000);
+	wr(csiphy_base + CSIPHY_COMMON(0), 0);
+	wr(csiphy_base + CSIPHY_COMMON(5), 0x80u | 1u | 1u << 2 | 1u << 4 | 1u << 6);   /* the clock and lanes 0-3 */
+	wr(csiphy_base + CSIPHY_COMMON(6), 1);                  /* common power-down off */
+	wr(csiphy_base + CSIPHY_COMMON(7), 2);
+	wr(csiphy_base + CSIPHY_COMMON(0), 0);
+	for (unsigned l = 0; l < 5; l++) {
+		for (unsigned i = 0; i < 14; i++) {
+			if (phy_regs[l][i][0] == 0 && phy_regs[l][i][1] == 0 && !(l == 0 && i == 7)) {
+				continue;
+			}
+			wr(csiphy_base + phy_regs[l][i][0], phy_regs[l][i][1] == 0xffff ? (settle & 0xff) : phy_regs[l][i][1]);
+		}
+	}
+	for (unsigned i = 11; i < 22; i++) {
+		wr(csiphy_base + CSIPHY_COMMON(i), 0);
+	}
+	phy_on = true;
+	say("cam6t: csiphy%u (version %#010x) set for four D-PHY lanes, settle count %u\n", phy_n, version, settle);
+}
+
+static void
+phy_off(void)
+{
+	if (phy_on) {
+		wr(csiphy_base + CSIPHY_COMMON(5), 0);
+		wr(csiphy_base + CSIPHY_COMMON(6), 0);
+		phy_on = false;
+	}
+}
+
+static void
+show_phy(void)
+{
+	say("cam6t: csiphy%u status: %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n", phy_n, rd(csiphy_base + CSIPHY_STATUS(0)),
+	    rd(csiphy_base + CSIPHY_STATUS(1)), rd(csiphy_base + CSIPHY_STATUS(2)), rd(csiphy_base + CSIPHY_STATUS(3)),
+	    rd(csiphy_base + CSIPHY_STATUS(4)), rd(csiphy_base + CSIPHY_STATUS(5)), rd(csiphy_base + CSIPHY_STATUS(6)),
+	    rd(csiphy_base + CSIPHY_STATUS(7)), rd(csiphy_base + CSIPHY_STATUS(8)), rd(csiphy_base + CSIPHY_STATUS(9)),
+	    rd(csiphy_base + CSIPHY_STATUS(10)));
+}
+
+/* the receive path at its rates: cphy_rx and the CSID 384 MHz (PLL3, source 5), IFE-lite 320 MHz (PLL2 even / 1.5) */
+static bool
+rates_up(void)
+{
+	return pll3_up() && rcg_set(CAMCC_CPHY_RX_RCG, 1u | 5u << 8, "cphy_rx_src") &&
+	    rcg_set(CAMCC_IFE_LITE_CSID_RCG, 1u | 5u << 8, "ife_lite_csid_src") && rcg_set(CAMCC_IFE_LITE_RCG, 2u | 1u << 8, "ife_lite_src") &&
+	    rcg_set(CAMCC_SLOW_AHB_RCG, 11u | 1u << 8, "slow_ahb_src");         /* 80 MHz: PLL2 even / 6 */
+}
+
+static void
+capture_sensor(unsigned i)
+{
+	const struct sensor *s = &sensors[i];
+	const struct ctab_mode *m;
+	struct cam_header *h;
+	char res[8];
+	unsigned ms;
+	uint64_t lane_bps;
+	uint16_t id = 0;
+
+	if (i == 0) {
+		say("cam6t: the IMX519's three C-PHY trios are not done here: cam6t_sensor=1 or 2\n");
+		return;
+	}
+	if (!ctab_load(i)) {
+		return;
+	}
+	if (cam_mode == ~0u) {
+		cam_mode = i == 2 ? 1 : 0;
+	}
+	if (cam_mode >= ctab->modes) {
+		say("cam6t: the %s has no mode %u\n", s->name, cam_mode);
+		return;
+	}
+	m = &((const struct ctab_mode *)(ctab + 1))[cam_mode];
+	if (m->cphy || m->lanes != 4 || m->data_type != RAW10_DT) {
+		say("cam6t: mode %u is not four D-PHY lanes of RAW10\n", cam_mode);
+		return;
+	}
+	cap_width = m->width;
+	cap_height = m->height;
+	lane_bps = (uint64_t)m->pixel_clock * 10 / m->lanes;
+	say("cam6t: the %s, mode %u: %ux%u, %u.%03u frames/s, %llu Mbit/s a lane\n", s->name, cam_mode, m->width, m->height,
+	    m->fps_milli / 1000, m->fps_milli % 1000, lane_bps / 1000000);
+	if (csid_base == 0) {
+		csid_base = ml_io_map(CSID_LITE_PHYS, 0x1000);
+		ife_base = ml_io_map(VFE_LITE_PHYS, 0x4000);
+	}
+	csiphy_base = ml_io_map(CSIPHY_PHYS(sensor_csiphy[i]), 0x1000);
+	if (!frames_alloc(1, s->name, sensor_bayer[i]) || !power_up(s)) {
+		power_down();
+		return;
+	}
+	for (unsigned go = 0; go < 20 && !read16(s, ID_REGISTER, &id); go++) {
+		wait_ms(2);
+	}
+	say("cam6t: the %s's chip ID %#06x\n", s->name, id);
+	snprintf(res, sizeof(res), "res%u", cam_mode);
+	if (id != s->id || !write_table(s, "init") || !write_table(s, res)) {
+		power_down();
+		return;
+	}
+	{
+		uint16_t exposure = 0, gain = 0;
+		uint32_t want = cam_exposure != ~0u ? cam_exposure : m->frame_length > 20 ? m->frame_length - 20 : m->frame_length;
+
+		(void)read16(s, 0x0202, &exposure);
+		(void)read16(s, 0x0204, &gain);
+		if (!write16(s, 0x0202, (uint16_t)want) || !write16(s, 0x0204, (uint16_t)cam_gain)) {
+			say("cam6t: the %s did not take its exposure or gain\n", s->name);
+		}
+		say("cam6t: exposure %u lines, gain code %u (were %u and %u; frame %u lines)\n", want, cam_gain, exposure, gain,
+		    m->frame_length);
+	}
+	if (!blocks_on(true)) {
+		power_down();
+		return;
+	}
+	if (!rates_up() || !phy_rails_on() || !phy_clocks_on(sensor_csiphy[i]) || !smmu_up() || !csid_reset() || !ife_config() ||
+	    !csid_config((int)sensor_csiphy[i], ctab->lane_assign)) {
+		goto out;
+	}
+	phy_config(settle_count(lane_bps));
+	streaming = true;
+	show_paths("configured");
+	if (!write_table(s, "on")) {
+		goto out;
+	}
+	h = (struct cam_header *)frames;
+	for (ms = 0; ms < 3000; ms += 50) {
+		wait_ms(50);
+		if (rd(ife_base + BUS_IRQ_STATUS1) & 1) {
+			h->frames = 1;
+			break;
+		}
+	}
+	say("cam6t: %s\n", h->frames ? "WRITE MASTER 0 SAYS A FRAME OF THE SENSOR IS IN MEMORY" : "no frame done in 3 s");
+	show_phy();
+	show_paths("after");
+	(void)write_table(s, "off");
+out:
+	stream_stop();
+	phy_off();
+	smmu_faults();
+	smmu_down();
+	phy_clocks_off();
+	blocks_off();
+	pll3_down();
+	power_down();
+	for (vm_offset_t line = frames; line < frames + frames_bytes; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	const uint8_t *p = (const uint8_t *)(frames + CAM_HEADER_BYTES);
+	uint32_t nonzero = 0, bytes = TPG_STRIDE * TPG_HEIGHT_NOW;
+
+	for (uint32_t k = 0; k < bytes; k++) {
+		nonzero += p[k] != 0;
+	}
+	say("cam6t: the frame's first bytes %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x; %u of %u bytes not 0 (xl camera fetches it)\n",
+	    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], nonzero, bytes);
+	for (vm_offset_t line = frames; line < frames + CAM_HEADER_BYTES; line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line));
+	}
+}
+
 static void
 cam6t_thread(__unused void *arg, __unused wait_result_t wr_)
 {
@@ -1595,15 +2098,17 @@ cam6t_thread(__unused void *arg, __unused wait_result_t wr_)
 	if (!bob_on() || !gdsc_on() || (!use_xo && !pll2_up())) {
 		say("cam6t: the camera's supplies or clocks did not come up: no sensor is powered\n");
 	} else {
-		for (unsigned i = 0; i < SENSORS && (level == 2 || which_given); i++) {
+		for (unsigned i = 0; i < SENSORS && (level == 2 || (which_given && level < 5)); i++) {
 			if (which >= SENSORS || which == i) {
 				ask(&sensors[i]);
 			}
 		}
 		if (level == 3) {
 			blocks_look();
-		} else if (level >= 4) {
+		} else if (level == 4) {
 			capture_tpg();
+		} else if (level >= 5) {
+			capture_sensor(which_given && which < SENSORS ? which : 2);
 		}
 	}
 	pll2_down();
@@ -1624,6 +2129,18 @@ hakios_cam6t_init(void)
 	which_given = PE_parse_boot_argn("cam6t_sensor", &which, sizeof(which));
 	(void)PE_parse_boot_argn("cam6t_after", &after_s, sizeof(after_s));
 	(void)PE_parse_boot_argn("cam6t_xo", &use_xo, sizeof(use_xo));
+	(void)PE_parse_boot_argn("cam6t_mode", &cam_mode, sizeof(cam_mode));
+	(void)PE_parse_boot_argn("cam6t_exposure", &cam_exposure, sizeof(cam_exposure));
+	(void)PE_parse_boot_argn("cam6t_gain", &cam_gain, sizeof(cam_gain));
+	if (level >= 5) {
+		/* a sensor's frames are megabytes: taken now, in one piece, as redwood's driver takes its own at boot */
+		if (kmem_alloc_contig(kernel_map, &frames, FRAMES_KEPT_BYTES, PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+		    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+			frames_kept = FRAMES_KEPT_BYTES;
+		} else {
+			frames = 0;
+		}
+	}
 	if (kernel_thread_start(cam6t_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
@@ -1646,8 +2163,11 @@ hakios_cam6t_quiesce(void)
 		if (csid_base != 0) {
 			stream_stop();
 		}
+		phy_off();
 		smmu_down();
+		phy_clocks_off();
 		blocks_off();
+		pll3_down();
 		pll2_down();
 		gdsc_off();
 	}

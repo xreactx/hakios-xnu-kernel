@@ -2,7 +2,7 @@
 """Make pictures of the frames the kernel's camera driver left in memory (boot-arg cam=3 and up;
 drivers/camera/hakios.camera.c), as the loader hands them over ("xl camera").
 
-usage: camraw.py CAMERA.raw PREFIX [--bayer N]
+usage: camraw.py CAMERA.raw PREFIX [--bayer N] [--black N]
 
 CAMERA.raw is a header { "RWCAM001", width, height, stride, format, bayer, frames, frame_bytes,
 source, sensor[16], last } in its first 4096 bytes (last: which place holds the last frame written), then the frames, frame_bytes each. Format 1 is MIPI
@@ -18,6 +18,8 @@ sensor's module file gives (tools/camsensor.py lists it): the OV02B10's and the 
 BGGR, the S5KHM2SD's and the S5K4H7's GRBG. The OV02B10's own colour bars (cam_pattern=1) are taken
 for GBRG, and the header says so for them. (Frames taken before the kernel had this right say
 RGGB for BGGR and GBRG for GRBG: --bayer 3 and --bayer 1 for them.)
+--black N takes N (of 1023) off every raw value before the colour: the sensor's black level (the 6T's Sony sensors
+sit at 64); 0 by default, as before.
 """
 import struct
 import sys
@@ -57,6 +59,7 @@ def main():
     last = struct.unpack_from('<I', data, 56)[0]
     if '--bayer' in sys.argv:
         bayer = int(sys.argv[sys.argv.index('--bayer') + 1])
+    black = int(sys.argv[sys.argv.index('--black') + 1]) if '--black' in sys.argv else 0
     if magic != b'RWCAM001':
         sys.exit('camraw.py: not frames of the camera driver')
     print(f'camraw.py: {sensor}: {width}x{height}, stride {stride}, format {fmt}, bayer {bayer}, {frames} frame(s) written whole, '
@@ -98,9 +101,9 @@ def main():
         for y in range(0, height - 1, 2):
             row = []
             for x in range(0, width - 1, 2):
-                r = lines[y + ry][x + rx]
-                g = (lines[y + g1y][x + g1x] + lines[y + g2y][x + g2x]) / 2
-                b = lines[y + by][x + bx]
+                r = max(lines[y + ry][x + rx] - black, 0)
+                g = max((lines[y + g1y][x + g1x] + lines[y + g2y][x + g2x]) / 2 - black, 0)
+                b = max(lines[y + by][x + bx] - black, 0)
                 row.append((r, g, b))
                 sums[0] += r
                 sums[1] += g
