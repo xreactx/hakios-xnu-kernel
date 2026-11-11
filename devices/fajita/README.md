@@ -275,6 +275,18 @@ three registers alone. Run 195651: the battery charges during the run, -172 to -
 the power path and the charger's watchdog (off); `pmi_charger=1` only looks, `=0` leaves the charger alone. On a
 wall charger (DCP) nothing is written yet: the fast-charge current there is untested.
 
+*The charge Darwin shows* (`bq27541=1`, the driver's default; `hakios.bq27541.c`, 10 November 2026). UEFI's
+gauge above is the PMI8998's own, which OnePlus marks `oem,use_external_fg` and leaves uncalibrated: it said 23 %
+while Android said 10 %, and the phone ran flat at what it called 1 %. Android reads a TI fuel gauge at I2C `0x55`
+on QUP SE10 (GPIO 55 data, 56 clock, the north tile; `fajita.dtsi`'s `bq27541-battery@55`). The driver reads it by
+hand (the pins given back after each transfer and at the run's end), tells a bq27541 from a bq27411 by the
+CONTROL register's DEVICE_TYPE request as OnePlus's `bq27541_fuelgauger.c` does -- this phone's is a **bq27411**
+(`0x0421`) -- and every 10 s hands the charge, voltage, current, temperature and capacities to
+`hakios_battery_report()`: Darwin's power source and `kern.hakios.battery_soc`, which SpringBoard shows. Once it
+reports, UEFI's gauge no longer writes over those values. Run 200707: 11 %, 3760 mV, 36-38 C, 302 of 2960 mAh, where
+Android had just said 11 %, 3794 mV, 36.6 C; iOS showed its low-battery warning. The request is the only thing
+written to the gauge.
+
 **8. Vibration.**
 
 Done on 30 October 2026. The motor is a linear resonant actuator on the PMI8998's haptics block (slave 3, peripheral
