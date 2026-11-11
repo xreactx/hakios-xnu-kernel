@@ -1606,7 +1606,7 @@ ask(const struct sensor *s)
  */
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
-static uint32_t cam_mode = ~0u, cam_exposure = ~0u, cam_gain = 768, cam_settle = ~0u;
+static uint32_t cam_mode = ~0u, cam_exposure = ~0u, cam_gain = ~0u, cam_settle = ~0u;
 
 
 struct ctab_head {
@@ -1725,8 +1725,9 @@ write_table(const struct sensor *s, const char *name)
 /*
  * Exposure and gain: the tables leave the sensor's power-on ones (Android's auto exposure sets them later), far too
  * little light. Sony's registers, as the module file names them: the coarse integration time in lines at 0x0202 (16
- * bits), the analog gain code at 0x0204 (gain = 1024 / (1024 - code)). cam6t_exposure=N lines (frame length less 20
- * by default), cam6t_gain=code (768: 4x).
+ * bits), the analog gain code at 0x0204: gain = 1024 / (1024 - code) on the IMX519 and the IMX371, 512 / (512 - code)
+ * on the IMX376K (whose codes stop at 480: 768 left it black, run 182907). cam6t_exposure=N lines (frame length less
+ * 20 by default), cam6t_gain=code (4x by default: 768, or 384 on the IMX376K).
  */
 static bool
 write16(const struct sensor *s, uint16_t reg, uint16_t value)
@@ -2053,13 +2054,14 @@ capture_sensor(unsigned i)
 	{
 		uint16_t exposure = 0, gain = 0;
 		uint32_t want = cam_exposure != ~0u ? cam_exposure : m->frame_length > 20 ? m->frame_length - 20 : m->frame_length;
+		uint32_t gain_code = cam_gain != ~0u ? cam_gain : i == 1 ? 384 : 768;
 
 		(void)read16(s, 0x0202, &exposure);
 		(void)read16(s, 0x0204, &gain);
-		if (!write16(s, 0x0202, (uint16_t)want) || !write16(s, 0x0204, (uint16_t)cam_gain)) {
+		if (!write16(s, 0x0202, (uint16_t)want) || !write16(s, 0x0204, (uint16_t)gain_code)) {
 			say("cam6t: the %s did not take its exposure or gain\n", s->name);
 		}
-		say("cam6t: exposure %u lines, gain code %u (were %u and %u; frame %u lines)\n", want, cam_gain, exposure, gain,
+		say("cam6t: exposure %u lines, gain code %u (were %u and %u; frame %u lines)\n", want, gain_code, exposure, gain,
 		    m->frame_length);
 	}
 	if (!blocks_on(true)) {
