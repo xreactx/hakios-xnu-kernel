@@ -156,6 +156,7 @@ static const struct {
 	{ 23, TILE_SOUTH, "IMX376K reset" }, { 27, TILE_EAST, "IMX519 VANA enable" }, { 28, TILE_EAST, "IMX519 reset" },
 	{ 78, TILE_EAST, "IMX376K VANA enable" }, { 79, TILE_NORTH, "IMX376K VDIG enable" },
 	{ 104, TILE_NORTH, "IMX371 VANA enable" }, { 117, TILE_NORTH, "IMX371 VDIG enable" },
+	{ 31, TILE_NORTH, "IMX519 lens motor 2.8V" }, { 77, TILE_EAST, "IMX376K lens motor 2.8V" },
 };
 #define PINS                    (sizeof(pin_list) / sizeof(pin_list[0]))
 
@@ -1606,7 +1607,22 @@ ask(const struct sensor *s)
  */
 extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
 
-static uint32_t cam_mode = ~0u, cam_exposure = ~0u, cam_gain = ~0u, cam_settle = ~0u;
+static uint32_t cam_mode = ~0u, cam_exposure = ~0u, cam_gain = ~0u, cam_settle = ~0u, cam_focus = ~0u;
+
+/*
+ * The rear cameras' lens motors (the module files' actuator data; fajita.dtsi's actuator_rear_0/1 on the sensors'
+ * CCI masters, their 2.8 V fixed regulators fed by BOB and switched by GPIO 31 and 77). Two makers' chips are fitted
+ * to 6Ts, the files say: an LC898217XC (IMX519 at 0xe4, IMX376K at 0xe8: ready when 0xb3 reads 0, the position a
+ * 16-bit word at 0x84) or an SA3103 (0x18 and 0x1a: 0x81 <- 1 to start, the position's high byte at 0x82, the low
+ * at 0x83). cam6t_focus=N puts the lens at N before the frame (the module files' range: 0 to 4095); 500 by default,
+ * where the 6T's IMX519 (an LC898217XC) sees a room sharp (run 184639; 200 and 800 less so), and 0 leaves the motor off.
+ */
+static const struct {
+	uint8_t lc, sa;
+	unsigned pin;
+} motors[2] = { { 0xe4, 0x18, 31 }, { 0xe8, 0x1a, 77 } };
+static bool motor_on;
+static unsigned motor_pin;
 
 
 struct ctab_head {
@@ -1735,6 +1751,79 @@ write16(const struct sensor *s, uint16_t reg, uint16_t value)
 	struct ctab_entry e = { reg, value, 2, 2, 0, 0, 0 };
 
 	return write_reg(s, &e);
+}
+
+/* a register of 8-bit address on another chip of the sensor's bus: count bytes read or written (most first) */
+static bool
+bus_xfer(const struct sensor *s, uint8_t address, uint8_t reg, uint8_t *data, unsigned count, bool reading)
+{
+	bool answered;
+
+	bus_sda = s->sda;
+	bus_scl = s->scl;
+	i2c_start();
+	answered = i2c_write(address) && i2c_write(reg);
+	if (answered && reading) {
+		i2c_start();
+		answered = i2c_write(address | 1);
+		for (unsigned k = 0; answered && k < count; k++) {
+			data[k] = i2c_read(k + 1 < count);
+		}
+	} else {
+		for (unsigned k = 0; answered && k < count; k++) {
+			answered = i2c_write(data[k]);
+		}
+	}
+	i2c_stop();
+	bus_give_back();
+	return answered;
+}
+
+static void
+focus(unsigned i, const struct sensor *s)
+{
+	uint8_t b[2] = { 0, 0 };
+	unsigned go;
+
+	if (cam_focus == ~0u) {
+		cam_focus = 500;
+	}
+	if (i > 1 || cam_focus == 0) {
+		return;
+	}
+	motor_pin = motors[i].pin;
+	drive(motor_pin, true);
+	motor_on = true;
+	wait_ms(10);
+	if (bus_xfer(s, motors[i].lc, 0xb3, b, 1, true)) {
+		for (go = 0; go < 50 && b[0] != 0; go++) {
+			wait_ms(1);
+			(void)bus_xfer(s, motors[i].lc, 0xb3, b, 1, true);
+		}
+		b[0] = (uint8_t)(cam_focus >> 8);
+		b[1] = (uint8_t)cam_focus;
+		say("cam6t: the lens motor is an LC898217XC (%#x; ready %s): position %u %s\n", motors[i].lc, go < 50 ? "at once" : "NOT",
+		    cam_focus, bus_xfer(s, motors[i].lc, 0x84, b, 2, false) ? "set" : "NOT TAKEN");
+	} else if (b[0] = 1, bus_xfer(s, motors[i].sa, 0x81, b, 1, false)) {
+		wait_ms(1);
+		b[0] = (uint8_t)(cam_focus >> 8);
+		b[1] = (uint8_t)cam_focus;
+		say("cam6t: the lens motor is an SA3103 (%#x): position %u %s\n", motors[i].sa, cam_focus,
+		    bus_xfer(s, motors[i].sa, 0x82, b, 2, false) ? "set" : "NOT TAKEN");
+	} else {
+		say("cam6t: no lens motor answers (%#x, %#x) with gpio%u on\n", motors[i].lc, motors[i].sa, motor_pin);
+		return;
+	}
+	wait_ms(30);                    /* (the lens settles) */
+}
+
+static void
+focus_off(void)
+{
+	if (motor_on) {
+		drive(motor_pin, false);
+		motor_on = false;
+	}
 }
 
 /* camcc's PLL3 (Fabia, 384 MHz: L 0x14, as camcc-sdm845.c configures it), its even output /1 */
@@ -2064,7 +2153,9 @@ capture_sensor(unsigned i)
 		say("cam6t: exposure %u lines, gain code %u (were %u and %u; frame %u lines)\n", want, gain_code, exposure, gain,
 		    m->frame_length);
 	}
+	focus(i, s);
 	if (!blocks_on(true)) {
+		focus_off();
 		power_down();
 		return;
 	}
@@ -2103,6 +2194,7 @@ out:
 	phy_clocks_off();
 	blocks_off();
 	pll3_down();
+	focus_off();
 	power_down();
 	for (vm_offset_t line = frames; line < frames + frames_bytes; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
@@ -2185,6 +2277,7 @@ hakios_cam6t_init(void)
 	(void)PE_parse_boot_argn("cam6t_exposure", &cam_exposure, sizeof(cam_exposure));
 	(void)PE_parse_boot_argn("cam6t_gain", &cam_gain, sizeof(cam_gain));
 	(void)PE_parse_boot_argn("cam6t_settle", &cam_settle, sizeof(cam_settle));
+	(void)PE_parse_boot_argn("cam6t_focus", &cam_focus, sizeof(cam_focus));
 	if (level >= 5) {
 		/* a sensor's frames are megabytes: taken now, in one piece, as redwood's driver takes its own at boot */
 		if (kmem_alloc_contig(kernel_map, &frames, FRAMES_KEPT_BYTES, PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
@@ -2206,6 +2299,7 @@ hakios_cam6t_quiesce(void)
 	if (!pins_mapped) {
 		return;
 	}
+	focus_off();
 	if (up != NULL) {
 		power_down();
 	}

@@ -81,6 +81,7 @@ CAENV	arg	caenv	User space	u	inject.c,inject_sb.c	CoreAnimation's switches here 
 CAM6T	arg	cam6t	User space	k	hakios.cam6t.c	
 CAM6T_AFTER	arg	cam6t_after	User space	k	hakios.cam6t.c	when (seconds after the driver starts; 50): away from the modem's and the audio DSP's starts
 CAM6T_EXPOSURE	arg	cam6t_exposure	User space	k	hakios.cam6t.c	
+CAM6T_FOCUS	arg	cam6t_focus	User space	k	hakios.cam6t.c	
 CAM6T_GAIN	arg	cam6t_gain	User space	k	hakios.cam6t.c	
 CAM6T_MODE	arg	cam6t_mode	User space	k	hakios.cam6t.c	
 CAM6T_SENSOR	arg	cam6t_sensor	User space	k	hakios.cam6t.c	
