@@ -84,6 +84,10 @@ ca_prof	u
 ca_vbl	u
 caenv	u
 cam	kl
+cam6t	k
+cam6t_after	k
+cam6t_sensor	k
+cam6t_xo	k
 cam_after	k
 cam_fake	k
 cam_fake_fps	k

@@ -59,6 +59,7 @@ extern void hakios_thermal_quiesce(void);
 extern void hakios_pmi_haptics_quiesce(void);
 extern void hakios_pmi_charger_quiesce(void);
 extern void hakios_bq27541_quiesce(void);
+extern void hakios_cam6t_quiesce(void);
 extern void hakios_slider_quiesce(void);
 extern void hakios_tfa9894_quiesce(void);
 extern void hakios_haptic_quiesce(void);
@@ -391,6 +392,7 @@ loader_return(void)
 	hakios_pmi_haptics_quiesce();  /* (the 6T's: stopped, and its registers as they were found) */
 	hakios_pmi_charger_quiesce();  /* (the 6T's charger: its input limit as it was found, pmi_charger=2) */
 	hakios_bq27541_quiesce();      /* (the 6T's fuel gauge: its I2C pins as they were found) */
+	hakios_cam6t_quiesce();        /* (the 6T's cameras: a sensor still up powered down) */
 	hakios_slider_quiesce();       /* the alert slider's pins' pulls as they were found */
 	hakios_tfa9894_quiesce();      /* the 6T's speaker amplifier powered down, its reset pin as found */
 	hakios_synaptics_quiesce();    /* the touch chip's power and reset pins as they were found */

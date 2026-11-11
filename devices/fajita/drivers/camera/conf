@@ -1,0 +1,6 @@
+# devices/fajita/drivers/camera/conf: the OnePlus 6T's cameras (docs/drivers-config.md has every word).
+
+driver CAM6T
+	file    bsd/dev/hakios.cam6t.c
+	help    the cameras' first steps (cam6t=N): the IMX519, IMX376K and IMX371 powered as Android powers them and
+	help    asked their chip ID over the CCI pins done by hand

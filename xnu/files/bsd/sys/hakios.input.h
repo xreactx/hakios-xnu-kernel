@@ -67,6 +67,8 @@ void hakios_pmi_charger_init(void);    /* boot-arg pmi_charger=N: the OnePlus 6T
 void hakios_pmi_charger_quiesce(void);  /* at a run's end: the charger's input limit as it was found */
 void hakios_bq27541_init(void);        /* boot-arg bq27541=N: the OnePlus 6T's fuel gauge, read for Darwin's battery */
 void hakios_bq27541_quiesce(void);    /* at a run's end: its I2C pins as they were found */
+void hakios_cam6t_init(void);          /* boot-arg cam6t=N: the OnePlus 6T's cameras, powered and asked their chip ID */
+void hakios_cam6t_quiesce(void);       /* at a run's end: a sensor still up powered down, its clocks off, the pins back */
 void hakios_slider_init(void);         /* boot-arg slider=N: the OnePlus 6T's alert slider */
 void hakios_slider_quiesce(void);      /* at a run's end: its pins' pulls as they were found */
 /*

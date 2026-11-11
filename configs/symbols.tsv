@@ -78,6 +78,10 @@ CA_METALLIB	arg	ca_metallib	User space	u	inject.c
 CA_PROF	arg	ca_prof	User space	u	HakiosMetalCA.m	
 CA_VBL	arg	ca_vbl	User space	u	inject.c	CoreAnimation's frame clock from the display driver's refresh notifications
 CAENV	arg	caenv	User space	u	inject.c,inject_sb.c	CoreAnimation's switches here as in the window server (inject.c), set before QuartzCore reads them
+CAM6T	arg	cam6t	User space	k	hakios.cam6t.c	
+CAM6T_AFTER	arg	cam6t_after	User space	k	hakios.cam6t.c	when (seconds after the driver starts; 50): away from the modem's and the audio DSP's starts
+CAM6T_SENSOR	arg	cam6t_sensor	User space	k	hakios.cam6t.c	
+CAM6T_XO	arg	cam6t_xo	User space	k	hakios.cam6t.c	
 CAM_AFTER	arg	cam_after	Cameras	k	hakios.camera.c	
 CAM_FAKE	arg	cam_fake	Cameras	k	hakios.camera.c	
 CAM_FAKE_FPS	arg	cam_fake_fps	Cameras	k	hakios.camera.c	
