@@ -70,6 +70,7 @@ extern void loader_log_putc(char c);
 #define MISC_WD_CFG2    0x53            /* [7] a bite stops charging; timeouts */
 
 static uint32_t level = 2, after_s = 25, every_s = 30;
+static volatile int32_t seen_input = -1, seen_usb_type;        /* from the latest look: a valid input, the adapter (-1: not yet) */
 static uint8_t found_opt, found_cfg;            /* USBIN_ICL_OPTIONS and USBIN_ICL_CFG as found (pmi_charger=2) */
 static volatile bool raised;                    /* written, to be put back at the run's end */
 static uint8_t found_fcc;                       /* CHGR_FCC as found */
@@ -161,6 +162,24 @@ look(void)
 	if (level >= 2 && raised) {
 		fcc_follow(s2);
 	}
+	/* (Linux's POWER_SUPPLY_USB_TYPE_*: 1 SDP, 2 DCP, 3 CDP; 0 none or another) */
+	seen_usb_type = (apsd & 0x01) ? 1 : (apsd & 0x08) ? 2 : (apsd & 0x04) ? 3 : 0;
+	seen_input = (path & 1) ? 1 : 0;
+}
+
+/*
+ * For the fuel gauge's reports (hakios.bq27541.c): whether the charger has a valid input, and what kind, as the
+ * latest look found them; false before the first look.
+ */
+bool
+hakios_pmi_charger_input(int32_t *external, int32_t *usb_type)
+{
+	if (seen_input < 0) {
+		return false;
+	}
+	*external = seen_input;
+	*usb_type = seen_usb_type;
+	return true;
 }
 
 static bool

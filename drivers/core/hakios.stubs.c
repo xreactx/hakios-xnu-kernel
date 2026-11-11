@@ -164,6 +164,11 @@ void hakios_pmi_haptics_init(void) {}
 void hakios_pmi_haptics_quiesce(void) {}
 #endif
 
+#ifndef HAKIOS_BQ27541
+void hakios_bq27541_init(void) {}
+void hakios_bq27541_quiesce(void) {}
+#endif
+
 #ifndef HAKIOS_PMI_CHARGER
 void hakios_pmi_charger_init(void) {}
 void hakios_pmi_charger_quiesce(void) {}

@@ -60,6 +60,8 @@ battery_stop	k
 battery_stop_poll	k
 battmgr	k
 bootcpu	kl
+bq27541	k
+bq27541_every	k
 bt	k
 bt6t	k
 bt6t_at	k

@@ -1,5 +1,11 @@
 # devices/fajita/drivers/power/conf: the OnePlus 6T's battery charger.
 
+driver BQ27541
+	file    bsd/dev/hakios.bq27541.c
+	requires PMI_CHARGER
+	help    the fuel gauge Android reads (TI bq27541/bq27411 at I2C 0x55, GPIO 55/56): the battery's charge, voltage,
+	help    current and temperature handed to Darwin's battery every 10 s (bq27541=1, the default; reading only)
+
 driver PMI_CHARGER
 	file    bsd/dev/hakios.pmi_charger.c
 	help    the PMI8998's SMB2 charger through the PMIC arbiter: its state, input limit and watchdog logged, and on a

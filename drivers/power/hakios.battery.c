@@ -99,6 +99,8 @@ battery_snapshot(struct loader_battery *out)
 	return false;
 }
 
+static int battery_source_dsp;          /* (defined with its sysctl below) */
+
 static void
 battery_poll(void)
 {
@@ -108,6 +110,15 @@ battery_poll(void)
 	    sample.version != LOADER_BATTERY_VERSION || sample.size < sizeof(sample) ||
 	    !(sample.flags & LOADER_BATTERY_VALID) || sample.soc_percent < 0 || sample.soc_percent > 100) {
 		battery_failures++;
+		return;
+	}
+	/*
+	 * Once a better source reports (hakios_battery_report(): redwood's audio DSP, the 6T's bq27541), its values stay:
+	 * what UEFI's gauge says is not written over them -- on the 6T it is the PMI8998's own gauge, which Android leaves
+	 * unused and uncalibrated (23 % against the bq27541's 10 %), and SpringBoard shows kern.hakios.battery_soc.
+	 */
+	if (battery_source_dsp) {
+		battery_updates++;
 		return;
 	}
 	battery_soc_percent = sample.soc_percent;
@@ -136,7 +147,7 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_design_uah, CTLFLAG_RD | CTLFLAG_LOCK
 SYSCTL_INT(_kern_hakios, OID_AUTO, battery_cycles, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_cycles, 0, "the battery's charge cycles (0 if unknown)");
 SYSCTL_INT(_kern_hakios, OID_AUTO, battery_from_dsp, CTLFLAG_RD | CTLFLAG_LOCKED,
-    &battery_source_dsp, 0, "1 when the values come from the audio DSP's battery manager");
+    &battery_source_dsp, 0, "1 when the values come from a reporting source (redwood's audio DSP, the 6T's bq27541), not UEFI's gauge");
 
 extern void HakiosBatteryReport(const void *state, unsigned size);     /* drivers/power/hakios.battery.cpp */
 

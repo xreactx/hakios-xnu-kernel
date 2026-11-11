@@ -55,6 +55,8 @@ APPLOG_NAME	arg	applog_name	CPU, memory and boot	k	(patch)
 AUTOUNLOCK	arg	autounlock	User space	u	inject_sb.c	
 BATTERY	arg	battery	Audio and battery	kl	hakios.adsp.c,hakios.battery.c,loader.c	
 BATTMGR	arg	battmgr	Audio and battery	k	hakios.adsp.c	every property once, for the log (which number is which on this phone's firmware)
+BQ27541	arg	bq27541	User space	k	hakios.bq27541.c	leaves it alone.
+BQ27541_EVERY	arg	bq27541_every	User space	k	hakios.bq27541.c	
 BT	arg	bt	User space	k	hakios.bt.c	
 BT6T	arg	bt6t	User space	k	hakios.bt6t.c	the clocks voted on (the engine's at 7.3728 MHz) and the pins set, then the same look at the engine
 BT6T_AT	arg	bt6t_at	User space	k	hakios.bt6t.c	the hands-free profile's AT commands written down, both ways -- they are ASCII inside RFCOMM frames on an
