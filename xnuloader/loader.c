@@ -259,6 +259,59 @@ clean_dcache(uint64_t start, uint64_t end)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Crumbs: what this core is doing while the kernel runs, for a crash dump  */
+/*
+ * The 6T's crashes (8 November 2026: NOC errors on cores 0, 4 and 5, then TrustZone's watchdog barking on core 0 --
+ * this core, which runs UEFI's code for the whole run) end in Qualcomm's crash dump, which holds the memory but no word
+ * of what this core was doing. So: what it is in now (a code and the counter when it went in), and a ring of the last
+ * CRUMBS things it did that were work (a USB event or command, a storage request, a charger poll, a watchdog pet, the
+ * log flushed), each written back to memory at once -- a reset keeps no dirty cache lines. Found in a dump by its magic
+ * "XLCRUMB1" (tools/crumbs.py). Times are CNTVCT (19.2 MHz); `started` is the counter when the kernel's core was started.
+ */
+#define CRUMBS 256
+enum {
+	CRUMB_IDLE = 0, CRUMB_USB_EVENT = 1, CRUMB_USB_COMMAND = 2, CRUMB_BLOCK = 3, CRUMB_CHARGER = 4, CRUMB_WDT = 5,
+	CRUMB_NOTE = 6, CRUMB_HUNG = 7, CRUMB_USB_POLL = 8, CRUMB_DONE = 9,
+};
+static struct {
+	char magic[8];
+	uint64_t started;
+	volatile uint64_t now_code, now_since, now_arg;
+	volatile uint32_t next, pad;
+	struct { uint64_t at; uint32_t code, arg; } ring[CRUMBS];
+} __attribute__((aligned(64))) crumbs = { { 'X', 'L', 'C', 'R', 'U', 'M', 'B', '1' }, 0, 0, 0, 0, 0, 0, { { 0, 0, 0 } } };
+
+static void
+crumb_in(uint32_t code, uint32_t arg)
+{
+	crumbs.now_code = code;
+	crumbs.now_since = READ_SYSREG(CNTVCT_EL0);
+	crumbs.now_arg = arg;
+	__asm__ volatile ("dc cvac, %0\ndsb sy" : : "r" ((uint64_t)(uintptr_t)&crumbs.now_code));
+}
+
+static void
+crumb_ring(uint32_t code, uint32_t arg)
+{
+	uint32_t i = crumbs.next % CRUMBS;
+
+	crumbs.ring[i].at = READ_SYSREG(CNTVCT_EL0);
+	crumbs.ring[i].code = code;
+	crumbs.ring[i].arg = arg;
+	crumbs.next = crumbs.next + 1;
+	__asm__ volatile ("dc cvac, %0\ndsb sy" : : "r" ((uint64_t)(uintptr_t)&crumbs.ring[i]));
+	__asm__ volatile ("dc cvac, %0\ndsb sy" : : "r" ((uint64_t)(uintptr_t)&crumbs.next));
+}
+
+/* work begun: what this core is in now, and a line of the ring */
+static void
+crumb(uint32_t code, uint32_t arg)
+{
+	crumb_ring(code, arg);
+	crumb_in(code, arg);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Log persistence: raw write to a GPT partition (phone only)               */
 
 static efi_block_io *find_partition(const char *name);
@@ -2376,6 +2429,7 @@ block_poll(void)
 	lba = block_shared.ask.lba;
 	count = block_shared.ask.count;
 	op = block_shared.ask.op;
+	crumb(CRUMB_BLOCK, part << 16 | (op & 0xffff));
 	started = READ_SYSREG(CNTVCT_EL0);
 	bytes = 0;
 	if (part < block_shared.parts && count != 0 && count <= BLOCK_BUFFER_SIZE / block_shared.part[part].block_size &&
@@ -2682,7 +2736,11 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 	status = psci_call(PSCI_CPU_ON, mpidr, (uint64_t)(uintptr_t)&other_cpu_entry, (uint64_t)(uintptr_t)&other_cpu_start);
 
 	started = last_pet = last_battery = last_beat_at = READ_SYSREG(CNTVCT_EL0);
-	print("core %x: the firmware answers %d to the request to start it\n", mpidr, (uint64_t)status);
+	crumbs.started = started;
+	crumbs.next = 0;
+	crumb(CRUMB_IDLE, 0);
+	print("core %x: the firmware answers %d to the request to start it; crumbs at %x\n", mpidr, (uint64_t)status,
+	    (uint64_t)(uintptr_t)&crumbs);
 	if (PLAT->log_other_cpu) {
 		flush_log();
 	}
@@ -2696,12 +2754,14 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		if (!watching_only && seconds_since(started) >= noted + 2) {
 			noted = seconds_since(started);
 			if (PLAT->log_other_cpu) {
+				crumb(CRUMB_NOTE, (uint32_t)noted);
 				if (!arrived) {
 					print("%d s: the core has not arrived\n", noted);
 				} else {
 					note_kernel_progress(live, slide, noted);
 				}
 				flush_log();
+				crumb_in(CRUMB_IDLE, 0);
 			}
 		}
 		/*
@@ -2735,13 +2795,17 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		 * After that a kernel that neither returns nor hangs visibly meets the watchdog.
 		 */
 		if (wdt_armed && seconds_since(last_pet) >= 5 && seconds_since(started) < budget + 60) {
+			crumb(CRUMB_WDT, 0);
 			wdt_pet();
+			crumb_in(CRUMB_IDLE, 0);
 			last_pet = READ_SYSREG(CNTVCT_EL0);
 		}
 		/* Qualcomm's UEFI charger stack owns the PMIC/GLINK side; keep XNU's cache live. */
 		if (charger_enabled && seconds_since(last_battery) >= 5 && hc_list_is_uefis()) {
 			/* (not while the kernel's own transfer list is in: Qualcomm's DXEs are not to touch the storage) */
+			crumb(CRUMB_CHARGER, 0);
 			charger_poll();
+			crumb_in(CRUMB_IDLE, 0);
 			last_battery = READ_SYSREG(CNTVCT_EL0);
 		}
 		if (arrived && live != NULL) {
@@ -2749,14 +2813,19 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 				last_beat = live->heartbeat;
 				last_beat_at = READ_SYSREG(CNTVCT_EL0);
 			} else if (seconds_since(last_beat_at) >= SILENCE_SECONDS) {
+				crumb(CRUMB_HUNG, 0);
 				log_of_hung_kernel(live, slide);
 				status = OTHER_CPU_HUNG;
 			}
 		}
 		if (block_enabled) {
 			block_poll();
+			if (crumbs.now_code == CRUMB_BLOCK) {
+				crumb_in(CRUMB_IDLE, 0);
+			}
 		}
 		usb_poll_command();
+		crumb_in(CRUMB_IDLE, 0);
 		if (block_enabled) {
 			/*
 			 * The pause is spent looking at the kernel's mailbox: with one look a pass, a
@@ -2765,6 +2834,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			 */
 			for (int k = 0; k < 64; k++) {
 				block_poll();
+				if (crumbs.now_code == CRUMB_BLOCK) {
+					crumb_in(CRUMB_IDLE, 0);
+				}
 				for (volatile int i = 0; i < 300; i++) {
 				}
 			}
@@ -2772,6 +2844,20 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 			for (volatile int i = 0; i < 20000; i++) {
 			}
 		}
+	}
+	crumb(CRUMB_DONE, (uint32_t)status);
+	{
+		/* (what tools/crumbs.py would read from a crash dump, told here for a run that ends: the record checked) */
+		uint32_t counts[10] = { 0 }, total = crumbs.next, kept = total < CRUMBS ? total : CRUMBS;
+
+		for (uint32_t i = 0; i < kept; i++) {
+			if (crumbs.ring[i].code < 10) {
+				counts[crumbs.ring[i].code]++;
+			}
+		}
+		print("crumbs: %d things done (the last %d kept: %d USB events, %d USB commands, %d storage requests, "
+		    "%d charger polls, %d watchdog pets, %d notes)\n", (uint64_t)total, (uint64_t)kept, (uint64_t)counts[1],
+		    (uint64_t)counts[2], (uint64_t)counts[3], (uint64_t)counts[4], (uint64_t)counts[5], (uint64_t)counts[6]);
 	}
 	running_live = NULL;
 	run_active = 0;
@@ -4706,10 +4792,14 @@ usb_poll_command(void)
 	if (USB == NULL) {
 		return;         /* this run was not started over USB */
 	}
+	crumb_in(CRUMB_USB_POLL, 0);
 	if (!usb_rx_queued && usb_connected && !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
 		usb_rx_queued = 1;
 	}
 	USB->handle_event(&msg, &size, &data);
+	if (msg != UsbDeviceEventNoEvent) {
+		crumb(CRUMB_USB_EVENT, msg);
+	}
 	if (msg == UsbDeviceEventDeviceStateChange) {
 		if (PLAT->usb_old_driver && data.device_state == UsbDeviceStateConnected && usb_connected) {
 			return;                 /* connected again, as it was (usb_wait): the queued receive stays */
@@ -4728,6 +4818,8 @@ usb_poll_command(void)
 	n = data.transfer.bytes_completed < sizeof(cmd) - 1 ? data.transfer.bytes_completed : sizeof(cmd) - 1;
 	memcpy(cmd, usb_rx_buf, (size_t)n);
 	cmd[n] = 0;
+	crumb(CRUMB_USB_COMMAND, (uint32_t)(uint8_t)cmd[0] | (uint32_t)(uint8_t)(n > 1 ? cmd[1] : 0) << 8 |
+	    (uint32_t)(uint8_t)(n > 2 ? cmd[2] : 0) << 16 | (uint32_t)(uint8_t)(n > 3 ? cmd[3] : 0) << 24);
 	fb_command(cmd);
 }
 
