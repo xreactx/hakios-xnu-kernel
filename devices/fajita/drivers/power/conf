@@ -2,5 +2,5 @@
 
 driver PMI_CHARGER
 	file    bsd/dev/hakios.pmi_charger.c
-	help    the PMI8998's SMB2 charger through the PMIC arbiter: its state, input limit and watchdog read and logged
-	help    (pmi_charger=1, the default on the 6T; reading only)
+	help    the PMI8998's SMB2 charger through the PMIC arbiter: its state, input limit and watchdog logged, and on a
+	help    computer's port its input limit raised to 900 mA for the run (pmi_charger=2, the default; =1 only looks)

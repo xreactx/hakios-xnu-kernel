@@ -166,6 +166,7 @@ void hakios_pmi_haptics_quiesce(void) {}
 
 #ifndef HAKIOS_PMI_CHARGER
 void hakios_pmi_charger_init(void) {}
+void hakios_pmi_charger_quiesce(void) {}
 #endif
 
 #ifndef HAKIOS_TFA9894

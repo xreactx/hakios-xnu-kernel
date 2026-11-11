@@ -8,10 +8,19 @@
  * same port. Whether the charger is off, suspended, held at a small input limit or stopped by its own
  * watchdog (UEFI's QcomChargerDxe arms it; nobody pets it once the kernel runs) is what this looks at first.
  *
- *   pmi_charger=1   READING ONLY (the default on the 6T): which blocks answer and what they say they are,
+ *   pmi_charger=1   reading only: which blocks answer and what they say they are,
  *                   then every pmi_charger_every=S seconds (30) one line: the charger's state, its input
  *                   (the adapter detected, USB suspended or not, the input current limit asked and in effect,
  *                   AICL), and its watchdog. Nothing is written.
+ *   pmi_charger=2   (the default on the 6T) ... and on a computer's port (the adapter SDP) the input current limit raised from USB 2.0's
+ *                   500 mA to USB 3.0's 900 mA: USBIN_CURRENT_LIMIT_CFG (0x1370) at 900 mA, then USBIN_ICL_OPTIONS
+ *                   (0x1366) [2:0] = high-current mode, the mode UEFI leaves it in (found 0x03, 0x1370 at 500 mA).
+ *                   Linux's way for a computer's port, set_sdp_current() (USB3 | USB51, high-current mode off), did
+ *                   NOT move the limit in effect here (runs 193804, 194313: still 500 mA 2 s after). 900 mA is the
+ *                   most this driver asks; only those two registers are written, each read back; at the run's end
+ *                   both go back to what they were found to be.
+ *                   (Run 192230, at 500 mA: the charger "full-on" but input-limited, the battery giving 291 to
+ *                   511 mA besides -- a run takes more than a computer's port gives.)
  *
  * Like every user of the PMIC bus here it waits until the run's first 25 s are over (the loader's core then
  * runs UEFI's PMIC drivers; hakios.buttons.c's buttons_after): pmi_charger_after=S, 25.
@@ -27,8 +36,6 @@
 
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
-extern int hakios_spmi_channel(uint16_t id, uint32_t *owner);
-extern const char *hakios_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count);
 
 #define CHGR_ID         0x210           /* slave 2, peripheral 0x10: the charger proper */
 #define USBIN_ID        0x213           /* the USB input */
@@ -56,7 +63,12 @@ extern const char *hakios_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, ui
 #define MISC_WD_CFG     0x51            /* [0] watchdog on, [1] on at plug-in */
 #define MISC_WD_CFG2    0x53            /* [7] a bite stops charging; timeouts */
 
-static uint32_t level = 1, after_s = 25, every_s = 30;
+static uint32_t level = 2, after_s = 25, every_s = 30;
+static uint8_t found_opt, found_cfg;            /* USBIN_ICL_OPTIONS and USBIN_ICL_CFG as found (pmi_charger=2) */
+static volatile bool raised;                    /* written, to be put back at the run's end */
+
+
+#define RAISED_MA       900                     /* USB 3.0's 900 mA: the most this driver asks of a computer's port */
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -136,6 +148,49 @@ look(void)
 	    wd, wd2, (wd & 1) && (wd2 & 0x80) ? " (ON: a bite stops charging)" : (wd & 1) ? " (on)" : " (off)", wdog);
 }
 
+static bool
+wr_checked(uint8_t reg, uint8_t value, const char *what)
+{
+	uint8_t back = 0;
+	const char *problem = hakios_spmi_write(USBIN_ID, reg, &value, 1);
+
+	if (problem == NULL) {
+		problem = hakios_spmi_read(USBIN_ID, reg, &back, 1);
+	}
+	if (problem != NULL || back != value) {
+		say("pmi_charger: USBIN+0x%02x <- 0x%02x (%s): %s (reads 0x%02x)\n", reg, value, what,
+		    problem != NULL ? problem : "NOT what was written", back);
+		return false;
+	}
+	say("pmi_charger: USBIN+0x%02x <- 0x%02x (%s), read back\n", reg, value, what);
+	return true;
+}
+
+/* pmi_charger=2: a computer's port's 900 mA (see the top) */
+static void
+raise_limit(void)
+{
+	uint8_t apsd = 0, icl_sts = 0;
+
+	if (!rd(USBIN_ID, USBIN_APSD, &apsd) || !rd(USBIN_ID, USBIN_ICL_OPT, &found_opt) || !rd(USBIN_ID, USBIN_ICL_CFG, &found_cfg)) {
+		return;
+	}
+	if ((apsd & 0x7f) != 0x01) {
+		say("pmi_charger: the adapter is %s (0x%02x), not a computer's port: its limit left as it is\n", adapter(apsd), apsd);
+		return;
+	}
+	raised = true;          /* (from the first write on: put back at the end whatever happens) */
+	if (!wr_checked(USBIN_ICL_CFG, RAISED_MA / 25, "the input current limit, 900 mA") ||
+	    !wr_checked(USBIN_ICL_OPT, (uint8_t)((found_opt & ~0x07) | 0x01), "high-current mode")) {
+		return;
+	}
+	delay_for_interval(2000, NSEC_PER_MSEC);
+	if (rd(MISC_ID, MISC_ICL_STS, &icl_sts)) {
+		say("pmi_charger: the input limit in effect: %u mA%s\n", icl_sts * 25u, icl_sts * 25u >= RAISED_MA ? " (RAISED)" :
+		    " (NOT RAISED)");
+	}
+}
+
 static void
 pmi_charger_thread(__unused void *arg, __unused wait_result_t wr)
 {
@@ -157,6 +212,10 @@ pmi_charger_thread(__unused void *arg, __unused wait_result_t wr)
 			thread_terminate(current_thread());
 			return;
 		}
+	}
+	look();
+	if (level >= 2) {
+		raise_limit();
 	}
 	for (;;) {
 		look();
@@ -181,4 +240,22 @@ hakios_pmi_charger_init(void)
 	if (kernel_thread_start(pmi_charger_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
+}
+
+/* At the run's end (a panic's too), with interrupts off: the input limit's two registers as they were found. */
+void
+hakios_pmi_charger_quiesce(void)
+{
+	const char *problem;
+
+	if (!raised) {
+		return;
+	}
+	raised = false;         /* (once, whatever happens below) */
+	problem = hakios_spmi_write(USBIN_ID, USBIN_ICL_CFG, &found_cfg, 1);
+	if (problem == NULL) {
+		problem = hakios_spmi_write(USBIN_ID, USBIN_ICL_OPT, &found_opt, 1);
+	}
+	say("pmi_charger: at the run's end: the input limit's registers as they were found (0x%02x, 0x%02x)%s%s\n", found_opt,
+	    found_cfg, problem != NULL ? ": " : "", problem != NULL ? problem : "");
 }

@@ -395,6 +395,7 @@ hakios_spmi_read(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count)
 
 static const uint16_t spmi_writable[] = {
 	0x3c0,          /* the PMI8998's haptics block (hakios.pmi_haptics.c) */
+	0x213,          /* the PMI8998 charger's USB input: its input current limit alone (hakios.pmi_charger.c, pmi_charger=2) */
 };
 
 const char *

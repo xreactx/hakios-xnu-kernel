@@ -64,6 +64,7 @@ const char *hakios_spmi_write(uint16_t id, uint8_t reg, const uint8_t *bytes, ui
 void hakios_pmi_haptics_quiesce(void);  /* at a run's end: the haptics block stopped and as it was found */
 void hakios_pmi_haptics_init(void);    /* boot-arg pmi_haptics=N: the OnePlus 6T's vibration motor (PMI8998) */
 void hakios_pmi_charger_init(void);    /* boot-arg pmi_charger=N: the OnePlus 6T's battery charger (PMI8998 SMB2) */
+void hakios_pmi_charger_quiesce(void);  /* at a run's end: the charger's input limit as it was found */
 void hakios_slider_init(void);         /* boot-arg slider=N: the OnePlus 6T's alert slider */
 void hakios_slider_quiesce(void);      /* at a run's end: its pins' pulls as they were found */
 /*

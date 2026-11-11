@@ -235,7 +235,7 @@ MODEM_STEP	arg	modem_step	Cellular	k	hakios.mpss.c	the steps once the root is th
 MODEM_STOP	arg	modem_stop	Cellular	k	hakios.mpss.c	
 MODEM_WAIT	arg	modem_wait	Cellular	k	hakios.mpss.c	
 MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c	
-PMI_CHARGER	arg	pmi_charger	User space	k	hakios.pmi_charger.c	
+PMI_CHARGER	arg	pmi_charger	User space	k	hakios.pmi_charger.c	reading only: which blocks answer and what they say they are, then every pmi_charger_every=S seconds (30) one line: the charger's state, its input
 PMI_CHARGER_AFTER	arg	pmi_charger_after	User space	k	hakios.pmi_charger.c	
 PMI_CHARGER_EVERY	arg	pmi_charger_every	User space	k	hakios.pmi_charger.c	
 PMI_HAPTICS	arg	pmi_haptics	User space	k	hakios.pmi_haptics.c	a look, reading only: which channel of the arbiter is the block's and which system may write through it, what the block says it is, and its registers
