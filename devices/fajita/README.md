@@ -264,16 +264,20 @@ phone at work: plugged in, it drew 716-735 mA from the battery while booting at 
 PMI8998's SMB2 charger (its first SPMI ID, slave 2: CHGR `0x1000`, USBIN `0x1300`, MISC `0x1600`; registers from
 downstream Linux's `smb-reg.h`) is on and charging out of UEFI, but on a computer's port (the adapter detected as
 SDP) its input is held at USB 2.0's 500 mA, and UEFI leaves the battery's fast-charge current at **0**: the
-battery gave 291-511 mA to a run while plugged in (run 192230). For the run the driver raises the input limit to
-900 mA (USBIN `0x70` = `0x24`, then `0x66` = high-current mode; Linux's own way for SDP, the USB3 | USB51 options,
+battery gave 291-511 mA to a run while plugged in (run 192230). For the run the driver sets the input limit for the
+adapter there (on a computer's port 900 mA: USBIN `0x70` = `0x24`, then `0x66` = high-current mode; Linux's own way for SDP, the USB3 | USB51 options,
 does not move the limit in effect here) and sets the fast-charge current to 500 mA (CHGR `0x61`; OnePlus's
 `qcom,fcc-max-ua` for the 6T, the most it asks) while the charger's JEITA temperature flags are clear, back as found
 the moment one is not. At the run's end all three registers go back as they were found. Each write is read back;
 the arbiter's write list (`hakios.buttons.c`'s `spmi_writable`) holds the two blocks, and the driver writes those
 three registers alone. Run 195651: the battery charges during the run, -172 to -187 mA. Every 30 s
 (`pmi_charger_every`) a line says the charger's state, the adapter, the input limit asked and in effect, AICL,
-the power path and the charger's watchdog (off); `pmi_charger=1` only looks, `=0` leaves the charger alone. On a
-wall charger (DCP) nothing is written yet: the fast-charge current there is untested.
+the power path and the charger's watchdog (off); `pmi_charger=1` only looks, `=0` leaves the charger alone. On an
+adapter's change (a cable moved from the computer to a wall charger and back in one run: run 202014) the limit is
+set again for the new one: 900 mA on a computer's port, on an OCP (OnePlus's own Dash charger is detected as one:
+run 201417, the battery charging +138 to +299 mA on it) or a floating one; 1500 mA on a standard wall charger (DCP,
+QC) or a charging port (CDP), Linux's DCP_CURRENT_UA -- that path is not yet seen on the phone (no such charger at
+hand); the charger's own AICL lowers a limit an adapter cannot give.
 
 *The charge Darwin shows* (`bq27541=1`, the driver's default; `hakios.bq27541.c`, 10 November 2026). UEFI's
 gauge above is the PMI8998's own, which OnePlus marks `oem,use_external_fg` and leaves uncalibrated: it said 23 %

@@ -12,13 +12,16 @@
  *                   then every pmi_charger_every=S seconds (30) one line: the charger's state, its input
  *                   (the adapter detected, USB suspended or not, the input current limit asked and in effect,
  *                   AICL), and its watchdog. Nothing is written.
- *   pmi_charger=2   (the default on the 6T) ... and on a computer's port (the adapter SDP) the input current limit raised from USB 2.0's
- *                   500 mA to USB 3.0's 900 mA: USBIN_CURRENT_LIMIT_CFG (0x1370) at 900 mA, then USBIN_ICL_OPTIONS
+ *   pmi_charger=2   (the default on the 6T) ... and the input current limit set for the adapter there, again whenever it
+ *                   changes: 900 mA on a computer's port (SDP; UEFI holds it at USB 2.0's 500), on an OCP (OnePlus's
+ *                   own Dash charger is one: run 201417) or a floating one; 1500 mA on a wall charger (DCP, QC) or a
+ *                   charging port (CDP), Linux's DCP_CURRENT_UA. Each: USBIN_CURRENT_LIMIT_CFG (0x1370), then USBIN_ICL_OPTIONS
  *                   (0x1366) [2:0] = high-current mode, the mode UEFI leaves it in (found 0x03, 0x1370 at 500 mA).
  *                   Linux's way for a computer's port, set_sdp_current() (USB3 | USB51, high-current mode off), did
- *                   NOT move the limit in effect here (runs 193804, 194313: still 500 mA 2 s after). 900 mA is the
- *                   most this driver asks; only those two registers are written, each read back; at the run's end
- *                   both go back to what they were found to be.
+ *                   NOT move the limit in effect here (runs 193804, 194313: still 500 mA 2 s after). 1500 mA is the
+ *                   most this driver asks (the charger's own AICL lowers it for an adapter that cannot give it); only
+ *                   those two registers are written, each read back; at the run's end both go back to what they were
+ *                   found to be.
  *                   And the battery's fast-charge current (CHGR 0x1061), which UEFI leaves at 0 -- the input
  *                   had room at times in run 193804 and the battery took none of it (-9 mA) -- set to
  *                   pmi_charger_fcc_ma=N (500: OnePlus's own qcom,fcc-max-ua for the 6T, fajita.dtsi; its driver
@@ -73,6 +76,8 @@ static uint32_t level = 2, after_s = 25, every_s = 30;
 static volatile int32_t seen_input = -1, seen_usb_type;        /* from the latest look: a valid input, the adapter (-1: not yet) */
 static uint8_t found_opt, found_cfg;            /* USBIN_ICL_OPTIONS and USBIN_ICL_CFG as found (pmi_charger=2) */
 static volatile bool raised;                    /* written, to be put back at the run's end */
+static bool found_read;                         /* found_opt, found_cfg and found_fcc read */
+static uint8_t applied_kind = 0xff;             /* the adapter (APSD's result) the limit was last set for */
 static uint8_t found_fcc;                       /* CHGR_FCC as found */
 static volatile bool fcc_set;                   /* CHGR_FCC written, to be put back */
 static uint32_t fcc_ma = 500;
@@ -81,7 +86,9 @@ static uint32_t fcc_ma = 500;
 static void fcc_follow(uint8_t s2);
 
 
-#define RAISED_MA       900                     /* USB 3.0's 900 mA: the most this driver asks of a computer's port */
+#define RAISED_MA       900                     /* USB 3.0's 900 mA: what this driver asks of a computer's port */
+static uint32_t limit_for(uint8_t apsd);
+static void apply_limit(uint8_t apsd);
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -159,6 +166,9 @@ look(void)
 	    in, adapter(apsd), apsd, il & 1, (cmd_apsd >> 1) & 1, opt, icl * 25u, icl_sts * 25u, aicl, (aicl & 1) ? " done" : "",
 	    (aicl & 2) ? " FAILED" : "", path, (path & 0x40) ? " USB SUSPENDED" : "", (path & 1) ? " valid input" : " NO VALID INPUT",
 	    wd, wd2, (wd & 1) && (wd2 & 0x80) ? " (ON: a bite stops charging)" : (wd & 1) ? " (on)" : " (off)", wdog);
+	if (level >= 2) {
+		apply_limit(apsd);
+	}
 	if (level >= 2 && raised) {
 		fcc_follow(s2);
 	}
@@ -233,29 +243,53 @@ fcc_follow(uint8_t s2)
 	}
 }
 
-/* pmi_charger=2: a computer's port's 900 mA (see the top) */
-static void
-raise_limit(void)
+/* the input limit for an adapter (APSD's result); 0: none there, left alone */
+static uint32_t
+limit_for(uint8_t apsd)
 {
-	uint8_t apsd = 0, icl_sts = 0;
+	if (apsd & 0x68) {              /* DCP, or QC 2/3 (a wall charger that speaks more): Linux's DCP_CURRENT_UA */
+		return 1500;
+	}
+	if (apsd & 0x04) {              /* CDP, a computer's port that charges: Linux's 1.5 A */
+		return 1500;
+	}
+	if (apsd & 0x13) {              /* SDP, OCP (OnePlus's Dash charger here: run 201417), floating: USB 3.0's 900 mA */
+		return RAISED_MA;
+	}
+	return 0;
+}
 
-	if (!rd(USBIN_ID, USBIN_APSD, &apsd) || !rd(USBIN_ID, USBIN_ICL_OPT, &found_opt) || !rd(USBIN_ID, USBIN_ICL_CFG, &found_cfg) ||
-	    !rd(CHGR_ID, CHGR_FCC, &found_fcc)) {
+/*
+ * pmi_charger=2 (see the top): the input limit for the adapter there, set when the adapter is not the one it was last
+ * set for (a cable taken from a computer to a wall charger and back in one run: run 201417).
+ */
+static void
+apply_limit(uint8_t apsd)
+{
+	uint8_t icl_sts = 0, kind = apsd & 0x7f;
+	uint32_t ma = limit_for(kind);
+
+	if (!found_read) {
+		if (!rd(USBIN_ID, USBIN_ICL_OPT, &found_opt) || !rd(USBIN_ID, USBIN_ICL_CFG, &found_cfg) ||
+		    !rd(CHGR_ID, CHGR_FCC, &found_fcc)) {
+			return;
+		}
+		found_read = true;
+	}
+	if (ma == 0 || kind == applied_kind) {
 		return;
 	}
-	if ((apsd & 0x7f) != 0x01) {
-		say("pmi_charger: the adapter is %s (0x%02x), not a computer's port: its limit left as it is\n", adapter(apsd), apsd);
-		return;
-	}
+	say("pmi_charger: the adapter is %s (0x%02x): its input limit %u mA\n", adapter(apsd), apsd, ma);
 	raised = true;          /* (from the first write on: put back at the end whatever happens) */
-	if (!wr_checked(USBIN_ICL_CFG, RAISED_MA / 25, "the input current limit, 900 mA") ||
+	if (!wr_checked(USBIN_ICL_CFG, (uint8_t)(ma / 25), "the input current limit") ||
 	    !wr_checked(USBIN_ICL_OPT, (uint8_t)((found_opt & ~0x07) | 0x01), "high-current mode")) {
 		return;
 	}
+	applied_kind = kind;
 	delay_for_interval(2000, NSEC_PER_MSEC);
 	if (rd(MISC_ID, MISC_ICL_STS, &icl_sts)) {
-		say("pmi_charger: the input limit in effect: %u mA%s\n", icl_sts * 25u, icl_sts * 25u >= RAISED_MA ? " (RAISED)" :
-		    " (NOT RAISED)");
+		say("pmi_charger: the input limit in effect: %u mA%s\n", icl_sts * 25u, icl_sts * 25u >= ma ? " (RAISED)" :
+		    " (not all of it: the adapter or AICL holds it lower)");
 	}
 }
 
@@ -280,10 +314,6 @@ pmi_charger_thread(__unused void *arg, __unused wait_result_t wr)
 			thread_terminate(current_thread());
 			return;
 		}
-	}
-	look();
-	if (level >= 2) {
-		raise_limit();
 	}
 	for (;;) {
 		look();
