@@ -135,6 +135,12 @@ Every driver the kernel can be built with. `CONFIG_HAKIOS_<NAME>=y` in a defconf
 |---|---|---|---|---|---|---|
 | **`HAKIOS_TFA9894`**<br>the NXP TFA9894 on bit-banged I2C, set up by replaying what Android's driver did (tfa9894=N; sound=3 and up on the 6T's MI2S port switch it on and off). Needs fw/tfa9894-coldboot.replay in the small image | `hakios.tfa9894.c` | `HAKIOS_SOUND` | `tfa9894=` | built | built | built | |
 
+## camera (devices/fajita)
+
+| Driver | Files | Requires | Boot arguments | fajita | qemu | redwood | |
+|---|---|---|---|---|---|---|
+| **`HAKIOS_CAM6T`**<br>the cameras' first steps (cam6t=N): the IMX519, IMX376K and IMX371 powered as Android powers them and asked their chip ID over the CCI pins done by hand | `hakios.cam6t.c` |  | `cam6t=`, `cam6t_after=`, `cam6t_sensor=`, `cam6t_xo=` | built | built | built | |
+
 ## haptic (devices/fajita)
 
 | Driver | Files | Requires | Boot arguments | fajita | qemu | redwood | |

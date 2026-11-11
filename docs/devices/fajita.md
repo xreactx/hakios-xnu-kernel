@@ -29,6 +29,6 @@
 | wifi | works | WCN3990: the modem starts its Wi-Fi domain; Linux's ath10k (ATH=ath10k) scans, joins a WPA2 network and carries Darwin's traffic (wifi6t=1 wifi_join=1, in the configuration) |
 | cellular | partly | the modem boots and registers on LTE with a SIM (modem=1, in the configuration); the data session comes up and packets go out, none come back (the test SIM had no data under Android either) |
 | bluetooth | works | WCN3990 over UART (bt6t=5): iOS's own bluetoothd; pairing, A2DP, and a headset's call audio both ways through the second SLIMbus (btslim=6) |
-| camera | no |  |
+| camera | partly | the three sensors (IMX519 rear main, IMX376K rear second, IMX371 front) powered as Android powers them and answering with their chip IDs over the CCI pins done by hand (cam6t=2); no frames yet |
 
 The state is what has been seen on this device, written down in `devices/fajita/device.conf`; a part the table does not name has not been looked at.
