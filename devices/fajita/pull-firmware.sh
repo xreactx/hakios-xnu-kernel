@@ -5,7 +5,7 @@
 #
 # The SDM845's names differ from the POCO X5 Pro's: the GPU is an Adreno 630 (a630_*), Wi-Fi is the
 # WCN3990, whose firmware (wlanmdsp.mbn) the modem loads, so there is no wpss; the vibration motor is
-# the PMI8998's own haptics block and needs no firmware; the cameras are not ported yet. Each set is
+# the PMI8998's own haptics block and needs no firmware. Each set is
 # listed on the phone (adb shell ls) rather than counted here, because the number of .bNN segments
 # differs between firmware versions.
 #
@@ -15,6 +15,11 @@
 #   ./xl flash-read modem_b 0 7800000 modem_b.img && 7z x -omodem_b modem_b.img
 # then adsp.* to fw-audio/, wlanmdsp.mbn to fw-wifi/, mba.mbn and modem.* to fw-modem/ and image/ whole to
 # fw-modem/image/. The speaker amplifier's container is readable as it is: /vendor/etc/firmware/tfa98xx.cnt.
+#
+# The cameras' module and tuning files (tools/camsensor.py, tools/camtuning.py: userland/build.sh makes
+# camera-<sensor>.tab of them) are in /vendor/lib/camera here, not lib64, and SELinux hides them from adb's
+# shell even to list (vendor_file): they are copied through su (Magisk; fastboot boot the patched image
+# for a rooted Android of that run only), or not at all.
 set -e
 cd "$(dirname "$0")/../.."
 pull() { # DIR PATTERN...  (patterns are expanded on the phone; nothing found is told, not fatal)
@@ -33,4 +38,11 @@ pull fw-wifi $img/wlanmdsp.mbn '/vendor/firmware/wlan/qca_cld/*' '/vendor/etc/wi
 pull fw-audio "$img/adsp.mdt" "$img/adsp.b*"
 pull fw-modem "$img/mba.mbn" "$img/modem.mdt" "$img/modem.b*"
 mkdir -p fw-modem/image && adb pull $img fw-modem/ >/dev/null 2>&1 && echo "pull-firmware.sh: fw-modem/image: the modem's own files (TFTP)"
+if adb shell 'su -c true' >/dev/null 2>&1; then
+	mkdir -p fw-camera
+	adb exec-out "su -c 'cd /vendor/lib/camera && tar cf - com.qti.sensormodule.*.bin com.qti.tuned.*.bin'" | tar xf - -C fw-camera
+	echo "pull-firmware.sh: fw-camera: $(ls -1 fw-camera | wc -l | tr -d ' ') files"
+else
+	echo "pull-firmware.sh: fw-camera: not pulled (needs root: /vendor/lib/camera is hidden from adb's shell)"
+fi
 echo "pull-firmware.sh: done; Wi-Fi also wants fw-wifi/mac (the radio's address) and fw-wifi/network (the network's name and passphrase)"

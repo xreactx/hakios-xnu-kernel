@@ -546,11 +546,15 @@ if [ -f ../fw-haptic/aw8697_haptic.bin ]; then
 fi
 # ... and the cameras' register tables (drivers/camera/hakios.camera.c, cam=2 and up), made by tools/camsensor.py out of
 # the sensors' module files of Android's camera stack, the phone's /vendor/lib64/camera/com.qti.sensormodule.
-# hakios_<maker>_<sensor>_<camera>.bin, in ../fw-camera (the vendor's: neither they nor the tables are in the
-# repository): camera-<sensor>.tab
-for module in ../fw-camera/com.qti.sensormodule.hakios_*.bin; do
+# hakios_<maker>_<sensor>_<camera>.bin (redwood's) or <maker>_<sensor>[_<actuator>].bin (the 6T's, from its
+# /vendor/lib/camera; one table per sensor, the actuators' variants have the same), in ../fw-camera (the vendor's:
+# neither they nor the tables are in the repository): camera-<sensor>.tab
+for module in ../fw-camera/com.qti.sensormodule.*.bin; do
 	[ -f "$module" ] || continue
-	sensor=$(basename "$module" .bin | sed 's/^com\.qti\.sensormodule\.hakios_[a-z]*_\([a-z0-9]*\)_.*/\1/')
+	case $(basename "$module") in
+	com.qti.sensormodule.hakios_*) sensor=$(basename "$module" .bin | sed 's/^com\.qti\.sensormodule\.hakios_[a-z]*_\([a-z0-9]*\)_.*/\1/') ;;
+	*) sensor=$(basename "$module" .bin | sed 's/^com\.qti\.sensormodule\.[a-z0-9]*_\([a-z0-9]*\).*/\1/') ;;
+	esac
 	mkdir -p root/fw
 	../tools/camsensor.py "$module" "root/fw/camera-$sensor.tab" >/dev/null
 done

@@ -36,18 +36,29 @@ import struct
 import sys
 
 
-def symbols(data):
-    count = struct.unpack_from('<I', data, 0xa4)[0]
-    entries = [struct.unpack_from('<3I', data, 0xa8 + 12 * i) for i in range(count)]
+# The two versions of the format met so far: V3.0.1 (redwood's, Android 11 CamX) and V1.1.0 (the 6T's,
+# OxygenOS 11 on the SDM845's older CamX). V1.1.0's symbols are 64 bytes, its sensor driver structure has
+# two words fewer before the slave address, and its resolution element is 112 bytes, not 196.
+FORMATS = {
+    b'Parameter Parser V3.0.1': dict(entries=0xa4, symbol=0x38, driver=7, power=14, element=196, fps=40, lanes=14,
+                                     settle=17, cphy=18, writes=24),
+    b'ParameterParser V1.1.0': dict(entries=0x9c, symbol=0x40, driver=5, power=12, element=112, fps=40, lanes=12,
+                                    settle=14, cphy=15, writes=19),
+}
+
+
+def symbols(data, f):
+    count = struct.unpack_from('<I', data, f['entries'])[0]
+    entries = [struct.unpack_from('<3I', data, f['entries'] + 4 + 12 * i) for i in range(count)]
     table, pool = entries[0][1], entries[1][1]
     syms, order, at = {}, [], table
-    while at + 0x38 <= pool:
+    while at + f['symbol'] <= pool:
         sid = struct.unpack_from('<I', data, at)[0]
         name = data[at + 4:at + 0x24].split(b'\0')[0].decode('latin1')
-        _, _, _, ref, size = struct.unpack_from('<5i', data, at + 0x24)
+        ref, size = struct.unpack_from('<2i', data, at + f['symbol'] - 8)
         syms[sid] = (name, ref, size)
         order.append(sid)
-        at += 0x38
+        at += f['symbol']
     return syms, order, pool
 
 
@@ -55,9 +66,10 @@ def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     data = open(sys.argv[1], 'rb').read()
-    if not data.startswith(b'QTI Chromatix Header') or b'Parameter Parser V3.0.1' not in data[:0x60]:
+    f = next((f for tag, f in FORMATS.items() if tag in data[:0x60]), None)
+    if not data.startswith(b'QTI Chromatix Header') or f is None:
         sys.exit('camsensor.py: not a module file of the kind known here')
-    syms, order, pool = symbols(data)
+    syms, order, pool = symbols(data, f)
 
     def value(sid):
         _, ref, size = syms[sid]
@@ -68,23 +80,29 @@ def main():
         return struct.unpack('<%dI' % (len(v) // 4), v)
 
     # the sensor driver's structure: slave address, address/data bytes of the id read, id address, id, mask, power sequences
-    driver = struct.unpack_from('<20I', data, pool)
-    slave, address_bytes, data_bytes, id_address, chip_id, id_mask = driver[7], driver[8], driver[9], driver[10], driver[11], \
-        driver[12]
+    driver_sid = next((s for s in order if syms[s][0] == 'sensorDriverData'), None)
+    driver = struct.unpack_from('<20I', data, pool + (syms[driver_sid][1] if driver_sid is not None else 0))
+    slave, address_bytes, data_bytes, id_address, chip_id, id_mask = driver[f['driver']:f['driver'] + 6]
+    # V1.1.0's files (the 6T's) give the id read 1 data byte for 16-bit ids (0x519, 0x376, 0x371 with the mask
+    # 0xf0ff); the read is made as wide as the id, or no answer could ever match it
+    while data_bytes < 4 and chip_id >> 8 * data_bytes:
+        data_bytes += 1
     power = {}
-    for name, (count, sid) in (('pwrup', driver[14:16]), ('pwrdn', driver[16:18])):
+    p = f['power']
+    for name, (count, sid) in (('pwrup', driver[p:p + 2]), ('pwrdn', driver[p + 2:p + 4])):
         w = words(sid)
         power[name] = [w[i:i + 3] for i in range(0, min(len(w), 3 * count), 3)]
-    # the resolutions: a 196-byte element each
+    # the resolutions: an element of f['element'] bytes each
     res_sid = next(s for s in order if syms[s][0] == 'resolutionData')
     raw = value(res_sid)
+    size = f['element']
     modes, mode_tables, cfa = [], [], []
-    for k in range(len(raw) // 196):
-        w = struct.unpack_from('<49I', raw, 196 * k)
-        fps = struct.unpack_from('<d', raw, 196 * k + 40)[0]
+    for k in range(len(raw) // size):
+        w = struct.unpack_from('<%dI' % (size // 4), raw, size * k)
+        fps = struct.unpack_from('<d', raw, size * k + f['fps'])[0]
         stream = struct.unpack_from('<8I', value(w[2]))
         data_type, x, y, width, height = stream[1:6]
-        lanes, settle, cphy, writes_sid = w[14], w[17], w[18], w[24]
+        lanes, settle, cphy, writes_sid = w[f['lanes']], w[f['settle']], w[f['cphy']], w[f['writes']]
         modes.append((width, height, x, y, lanes, cphy, settle, w[7], w[3], w[4], int(fps * 1000), data_type))
         cfa.append(CFA.get(w[0], str(w[0])))
         mode_tables.append(('res%d' % k, regsetting(data, pool, syms, value, writes_sid)))
@@ -93,7 +111,7 @@ def main():
 
     roles = {'regToRealGain': ['on', 'off', 'holdon', 'holdoff'], 'initSettings': ['init'], 'testPatternData': ['tpgoff', 'tpgon']}
     tables, after, used = [], '', {}
-    mode_sids = {struct.unpack_from('<49I', raw, 196 * k)[24] for k in range(len(raw) // 196)}
+    mode_sids = {struct.unpack_from('<%dI' % (size // 4), raw, size * k)[f['writes']] for k in range(len(raw) // size)}
     for sid in order:
         name = syms[sid][0]
         if name != 'regSetting':
