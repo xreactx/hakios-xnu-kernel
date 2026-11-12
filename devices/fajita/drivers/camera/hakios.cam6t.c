@@ -2896,7 +2896,12 @@ darwin_select(unsigned index, uint32_t mode_n)
 		return false;
 	}
 	if (mode_n >= ctab->modes) {
-		mode_n = index == 0 ? 10 : index == 2 ? 1 : 0;  /* IMX519 2328x1746, IMX371 2304x1728, IMX376K 2592x1940 */
+		/*
+		 * the sensors' biggest 4:3 at 30 frames a second, as redwood's: the ISP's preview (1504x1128) and the
+		 * photograph take a cell (2x2 pixels) a pixel from them; from the half-size modes (2328x1746, 2304x1728) it had
+		 * to blend four cells for each pixel, 120 ms a frame, and the preview kept up with one frame in four
+		 */
+		mode_n = index == 0 ? 9 : 0;    /* IMX519 4352x3264, IMX371 4608x3456, IMX376K 2592x1940 */
 	}
 	darwin_index = index;
 	darwin_mode_n = mode_n;

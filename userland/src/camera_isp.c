@@ -73,10 +73,17 @@ isp_sharpness(const struct hakios_camera_frame *f, const uint8_t *raw, float x0,
 	uint32_t blocks_w, rows = 0, n = 0;
 	int r, b;
 
+	/*
+	 * A frame of over 2100 cells across (the 6T's 4352x3264: redwood's 2000 are left as they were): blocks twice as
+	 * wide each way, every other cell of them read -- 16 cells a block still, at a quarter of the reading (the 6T's
+	 * back camera spent 32 ms a frame here).
+	 */
+	uint32_t s = cells_w > 2100 ? 2 : 1, span = BLOCK * s;
+
 	cell_places(f->bayer, &r, &b);
 	cx1 = cx1 > cells_w ? cells_w : cx1;
 	cy1 = cy1 > cells_h ? cells_h : cy1;
-	blocks_w = cx1 > cx0 ? (cx1 - cx0) / BLOCK : 0;
+	blocks_w = cx1 > cx0 ? (cx1 - cx0) / span : 0;
 	blocks_w = blocks_w > MAX_BLOCKS ? MAX_BLOCKS : blocks_w;
 	/*
 	 * Green's mean over blocks of 4x4 cells, and the squares of the steps between neighbouring
@@ -84,14 +91,14 @@ isp_sharpness(const struct hakios_camera_frame *f, const uint8_t *raw, float x0,
 	 * not -- in the dark, at 32x and more, the steps from cell to cell were the noise's alone and the
 	 * focus went wherever it liked.
 	 */
-	for (uint32_t by = cy0; by + BLOCK <= cy1; by += BLOCK, rows++) {
+	for (uint32_t by = cy0; by + span <= cy1; by += span, rows++) {
 		for (uint32_t bx = 0; bx < blocks_w; bx++) {
 			uint32_t g = 0;
 
-			for (uint32_t cy = by; cy < by + BLOCK; cy++) {
+			for (uint32_t cy = by; cy < by + span; cy += s) {
 				const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
 
-				for (uint32_t cx = cx0 + bx * BLOCK; cx < cx0 + bx * BLOCK + BLOCK; cx++) {
+				for (uint32_t cx = cx0 + bx * span; cx < cx0 + bx * span + span; cx += s) {
 					int v[4];
 
 					cell(top, f->stride, cx, v);
@@ -132,11 +139,18 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 
 	memset(s, 0, sizeof(*s));
 	cell_places(f->bayer, &r, &b);
-	for (uint32_t cy = 0; cy < cells_h; cy += 4) {
+	/*
+	 * Every 4th cell each way (redwood's 4000x3000, 2000 cells wide, as always); in a frame of over 2100 cells across
+	 * (the 6T's 4352x3264 and 4608x3456) about 290 across, every 7th, so that its measurement costs what its
+	 * half-size frames' did (6 to 14 ms).
+	 */
+	uint32_t step = cells_w > 2100 ? cells_w / 290 : 4;
+
+	for (uint32_t cy = 0; cy < cells_h; cy += step) {
 		const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
 		float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0;
 
-		for (uint32_t cx = 0; cx < cells_w; cx += 4) {
+		for (uint32_t cx = 0; cx < cells_w; cx += step) {
 			int v[4], g = 0, top_v = 0;
 
 			cell(top, f->stride, cx, v);

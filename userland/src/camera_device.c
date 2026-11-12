@@ -405,7 +405,7 @@ struct output {
 	bool            enabled;
 	void *          handler;                /* a block: ^(CVPixelBufferRef, CMTime) */
 	bool            said_shape;
-	uint64_t        delivered, refused;
+	uint64_t        delivered, refused, timed;
 	CVPixelBufferRef held[HELD];            /* the pictures given last, kept from the pool (see deliver) */
 	unsigned        held_next;
 	bool            said_pool;
@@ -816,13 +816,60 @@ struct render_job {
 	CVPixelBufferRef pb;
 	uint32_t format, width, height, pieces;
 	bool still;                     /* the photograph: every pixel of the sensor (isp_render_still_nv12) */
+	_Atomic uint64_t busy;          /* the pieces' own times summed (with the wall time: how many ran at once) */
 };
+
+static void render_piece(void *context, size_t i);
+
+struct piece_arg {
+	struct render_job *job;
+	size_t i;
+};
+
+static void *
+piece_thread(void *context)
+{
+	struct piece_arg *a = context;
+
+	render_piece(a->job, a->i);
+	return NULL;
+}
+
+/*
+ * The pieces each on a thread of its own, not libdispatch's: mediaserverd starts while only four of the 6T's eight
+ * cores are up (the slower ones join later: hw.activecpu 4 then), and its dispatch pool stays four wide -- the
+ * preview's pieces ran four at a time. Threads of our own go to whichever cores there are by then.
+ */
+static void
+render_pieces(struct render_job *job)
+{
+	pthread_t t[16];
+	struct piece_arg a[16];
+	size_t started = 0;
+
+	for (size_t i = 1; i < job->pieces && i < 16; i++) {
+		a[i].job = job;
+		a[i].i = i;
+		if (pthread_create(&t[i], NULL, piece_thread, &a[i]) != 0) {
+			break;
+		}
+		started = i;
+	}
+	render_piece(job, 0);
+	for (size_t i = started + 1; i < job->pieces; i++) {
+		render_piece(job, i);   /* (what no thread could be had for) */
+	}
+	for (size_t i = 1; i <= started; i++) {
+		pthread_join(t[i], NULL);
+	}
+}
 
 static void
 render_piece(void *context, size_t i)
 {
 	struct render_job *j = context;
 	uint32_t rows = (j->height + j->pieces - 1) / j->pieces, first = (uint32_t)i * rows, end = first + rows;
+	uint64_t began = mach_absolute_time();
 
 	first &= ~1u;
 	end = i + 1 == j->pieces ? j->height : end & ~1u;
@@ -838,6 +885,7 @@ render_piece(void *context, size_t i)
 		    CVPixelBufferGetBaseAddressOfPlane(j->pb, 1), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end,
 		    j->format == PF_420V);
 	}
+	j->busy += mach_absolute_time() - began;
 }
 
 static CVPixelBufferRef
@@ -984,7 +1032,19 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
 	uint64_t began = mach_absolute_time();
 
-	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
+	render_pieces(&job);
+	if (!job.still && ++out->timed % 60 == 1) {
+		static mach_timebase_info_data_t tbt;
+
+		if (tbt.denom == 0) {
+			mach_timebase_info(&tbt);
+		}
+		double wall = (double)(mach_absolute_time() - began) * tbt.numer / tbt.denom / 1e6;
+		double busy = (double)job.busy * tbt.numer / tbt.denom / 1e6;
+
+		say("%s: %ux%u %c%c%c%c from %ux%u in %.1f ms (the pieces' %.1f ms: %.1f at once)", out->name, width, height, pf >> 24,
+		    pf >> 16 & 255, pf >> 8 & 255, pf & 255, f->width, f->height, wall, busy, wall > 0 ? busy / wall : 0);
+	}
 	if (job.still) {
 		static mach_timebase_info_data_t tb;
 
@@ -1353,6 +1413,8 @@ worker(void *context)
 			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
 			continue;
 		}
+		uint64_t t_read = mach_absolute_time();
+
 		n = read(device, buffer, bytes);
 		if (n != (ssize_t)bytes) {
 			if (n < 0 && errno == EIO) {
@@ -1367,6 +1429,8 @@ worker(void *context)
 		const struct hakios_camera_frame *f = (const void *)buffer;
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct hakios_camera_command c;
+
+		uint64_t t_got = mach_absolute_time();
 
 		isp_measure(&isp, f, raw, &st);
 		isp_awb(&isp, &st);
@@ -1396,7 +1460,9 @@ worker(void *context)
 		af_frame(device, &af, f, raw, s->af_window, s->af_locked);
 		s->frames++;
 
+		uint64_t t_measured = mach_absolute_time();
 		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port);
+		uint64_t t_meta = mach_absolute_time();
 
 		/*
 		 * Only once the graph has started the stream. Its PixelBufferHandler blocks hand the buffer
@@ -1439,6 +1505,38 @@ worker(void *context)
 		pthread_mutex_unlock(&s->lock);
 		if (metadata != NULL) {
 			CFRelease(metadata);
+		}
+		/*
+		 * Where a frame's time goes (the 6T's preview kept up with every other frame only): the wait and
+		 * copy of the read, the measurement (exposure, white balance, focus), the metadata, the outputs'
+		 * pictures; and how many of the kernel's frames went by unread. Every 60 frames, the means.
+		 */
+		{
+			static uint64_t sum[4], last_seq, first_time, skipped, count;
+			static mach_timebase_info_data_t tb;
+			uint64_t t_done = mach_absolute_time();
+
+			if (tb.denom == 0) {
+				mach_timebase_info(&tb);
+			}
+			if (count == 0) {
+				first_time = t_read;
+			}
+			sum[0] += t_got - t_read;
+			sum[1] += t_measured - t_got;
+			sum[2] += t_meta - t_measured;
+			sum[3] += t_done - t_meta;
+			skipped += last_seq != 0 && f->sequence > last_seq + 1 ? f->sequence - last_seq - 1 : 0;
+			last_seq = f->sequence;
+			if (++count == 60) {
+				double k = (double)tb.numer / tb.denom / 1e6, wall = (double)(t_done - first_time) * k;
+
+				say("timing: 60 frames in %.0f ms (%.1f a second, %llu of the kernel's skipped): read %.1f ms, measure %.1f, "
+				    "metadata %.1f, pictures %.1f (means)", wall, 60000.0 / wall, (unsigned long long)skipped, sum[0] * k / 60,
+				    sum[1] * k / 60, sum[2] * k / 60, sum[3] * k / 60);
+				memset(sum, 0, sizeof(sum));
+				skipped = count = 0;
+			}
 		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
 			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black; white balance R %.2f "
