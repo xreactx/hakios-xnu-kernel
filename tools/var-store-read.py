@@ -13,6 +13,9 @@ to 8 bytes), whose CRC-32 is in the header. The newest slot whose header and str
 that does not check out is never half used.
 
 Where it reads from, read only, either way:
+  --fajita       the OnePlus 6T's store instead: the end of system_a (from its block 629248 to its end, 732160 blocks:
+                 two slots of 201 MiB, as var_store.c sizes them from kern.hakios.var_first and var_end), read in
+                 Android from /dev/block/by-name/system_a
   --image FILE   a copy of darwin from byte 8589934592 (dd if=/dev/block/by-name/darwin bs=4096 skip=2097152)
   (default)      the phone in Android, over adb, as root: `su -c dd` of /dev/block/by-name/darwin, the blocks
                  needed and no others. Under Git Bash on Windows as anywhere else (adb exec-out passes bytes as
@@ -133,6 +136,12 @@ def under(path, prefix):
 
 
 def main(argv):
+    global STORE_AT, SLOT_BYTES, DEVICE
+    if len(argv) > 1 and argv[1] == "--fajita":
+        STORE_AT = 629248 * BLOCK
+        SLOT_BYTES = ((732160 - 629248) * BLOCK // 2) & ~((1 << 20) - 1)
+        DEVICE = "/dev/block/by-name/system_a"
+        argv = argv[:1] + argv[2:]
     image = None
     if len(argv) > 2 and argv[1] == "--image":
         image = argv[2]

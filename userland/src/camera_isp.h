@@ -46,7 +46,7 @@ struct isp_lsc {
  * temperature.
  */
 #define TUNE_LIGHTS     6
-#define TUNE_CCTS       6
+#define TUNE_CCTS       8               /* (the 6T's IMX371 has 7 in one light: up from 6) */
 struct isp_tune_set {
 	uint32_t        lights;
 	struct {
