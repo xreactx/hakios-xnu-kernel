@@ -1346,17 +1346,25 @@ static void
 load_tuning(struct isp *isp, uint32_t sensor)
 {
 	static const char *const names[] = { "ov02b10", "s5khm2sd", "ov16a1q", "s5k4h7" };
+	/* the OnePlus 6T's sensors in the same places (the kernel's cam6t: 1 the back, 2 the front, 3 the second back) */
+	static const char *const names_6t[] = { NULL, "imx519", "imx371", "imx376k" };
 	char path[96];
+	bool loaded;
 
 	if (sensor >= sizeof(names) / sizeof(names[0])) {
 		return;
 	}
 	snprintf(path, sizeof(path), "/redwood/fw/camera-%s.isp", names[sensor]);
-	if (isp_load_tuning(isp, path)) {
-		say("the %s's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", names[sensor], path,
+	loaded = isp_load_tuning(isp, path);
+	if (!loaded && names_6t[sensor] != NULL) {
+		snprintf(path, sizeof(path), "/redwood/fw/camera-%s.isp", names_6t[sensor]);
+		loaded = isp_load_tuning(isp, path);
+	}
+	if (loaded) {
+		say("the camera %u's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", sensor, path,
 		    isp->tuning->ccm.lights, isp->tuning->lsc.lights);
 	} else {
-		say("no colour tuning for the %s (%s): no colour matrix, no lens shading", names[sensor], path);
+		say("no colour tuning for camera %u (%s): no colour matrix, no lens shading", sensor, path);
 		isp_set_ccm(isp, (const float[9]){ 1, 0, 0, 0, 1, 0, 0, 0, 1 });
 		isp->lsc.on = false;
 	}

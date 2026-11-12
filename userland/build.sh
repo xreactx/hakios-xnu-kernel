@@ -560,9 +560,16 @@ for module in ../fw-camera/com.qti.sensormodule.*.bin; do
 done
 # ... and their colour tuning (libhakios.media's processor, src/camera_isp.c), made by tools/camtuning.py out of the
 # cameras' tuning files beside them, com.qti.tuned.hakios_<maker>_<sensor>_<camera>.bin: camera-<sensor>.isp
-for tuned in ../fw-camera/com.qti.tuned.hakios_*.bin; do
+# (the 6T's are <maker>_<sensor>.bin -- semco_imx519, oflim_imx371, semco_imx376k, the names its module files give;
+# their _fat/_fatt variants and default.bin are not taken)
+for tuned in ../fw-camera/com.qti.tuned.*.bin; do
 	[ -f "$tuned" ] || continue
-	sensor=$(basename "$tuned" .bin | sed 's/^com\.qti\.tuned\.hakios_[a-z]*_\([a-z0-9]*\)_.*/\1/')
+	case $(basename "$tuned" .bin) in
+	com.qti.tuned.hakios_*) sensor=$(basename "$tuned" .bin | sed 's/^com\.qti\.tuned\.hakios_[a-z]*_\([a-z0-9]*\)_.*/\1/') ;;
+	com.qti.tuned.[a-z0-9]*_[a-z0-9]*) sensor=$(basename "$tuned" .bin | sed -n 's/^com\.qti\.tuned\.[a-z0-9]*_\([a-z0-9]*\)$/\1/p')
+		[ -n "$sensor" ] || continue ;;
+	*) continue ;;
+	esac
 	mkdir -p root/fw
 	../tools/camtuning.py "$tuned" "root/fw/camera-$sensor.isp" >/dev/null
 done

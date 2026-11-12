@@ -39,23 +39,33 @@ import sys
 GRID = 17 * 13
 
 
-def symbols(data):
-    count = struct.unpack_from('<I', data, 0xa4)[0]
-    entries = [struct.unpack_from('<3I', data, 0xa8 + 12 * i) for i in range(count)]
+# the two versions met so far (camsensor.py's): V3.0.1, redwood's; V1.1.0, the 6T's -- 64-byte symbols, the table's
+# count at 0x9c. The 6T's colour matrices carry three more floats after the nine (offsets, 0), which module() leaves.
+FORMATS = {b'Parameter Parser V3.0.1': (0xa4, 0x38), b'ParameterParser V1.1.0': (0x9c, 0x40),
+           b'Chromatix\0': (0x9c, 0x40)}     # (the 6T's IMX371 and IMX376K files: V1.1.0's layout, only so named)
+
+
+def symbols(data, fmt):
+    at_count, symbol = fmt
+    count = struct.unpack_from('<I', data, at_count)[0]
+    entries = [struct.unpack_from('<3I', data, at_count + 4 + 12 * i) for i in range(count)]
     table, pool = entries[0][1], entries[1][1]
     syms, at = {}, table
-    while at + 0x38 <= pool:
+    while at + symbol <= pool:
         sid = struct.unpack_from('<I', data, at)[0]
         name = data[at + 4:at + 0x24].split(b'\0')[0].decode('latin1')
-        _, _, _, ref, size = struct.unpack_from('<5i', data, at + 0x24)
+        ref, size = struct.unpack_from('<2i', data, at + symbol - 8)
         syms[sid] = (name, data[pool + ref:pool + ref + size])
-        at += 0x38
+        at += symbol
     return syms
 
 
 def module(syms, name, floats):
     """[(lux from, lux to, [(cct from, cct to, values)])] of the module's first tree, without the flash"""
-    led = next(v for n, v in syms.values() if n == 'mod_%s_led_idx_data' % name)
+    # (the module is there once a use of the camera in the 6T's files, some with a single light range: the fullest)
+    def regions_of(v):
+        return next((e[1] for e in struct.iter_unpack('<3I', v) if e[0] == 0), 0) if len(v) % 12 == 0 else 0
+    led = max((v for n, v in syms.values() if n == 'mod_%s_led_idx_data' % name), key=regions_of)
     _, regions, sid = next(e for e in struct.iter_unpack('<3I', led) if e[0] == 0)
     out = []
     for i in range(regions):
@@ -90,9 +100,10 @@ def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     data = open(sys.argv[1], 'rb').read()
-    if not data.startswith(b'QTI Chromatix Header') or b'Parameter Parser V3.0.1' not in data[:0x60]:
+    fmt = next((f for tag, f in FORMATS.items() if tag in data[:0x60]), None)
+    if not data.startswith(b'QTI Chromatix Header') or fmt is None:
         sys.exit('camtuning.py: not a tuning file of the kind known here')
-    syms = symbols(data)
+    syms = symbols(data, fmt)
     ccm = module(syms, 'cc13', 9)
     lsc = module(syms, 'lsc34', 4 * GRID)
     refs = references(syms)
