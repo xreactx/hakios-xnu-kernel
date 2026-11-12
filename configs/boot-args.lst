@@ -114,6 +114,7 @@ cell_ping_to	k
 cpufreq	k
 cpufreq_osm	k
 cpufreq_osm_mhz	k
+cpufreq_osm_small_mhz	k
 cpuload	k
 cpumask	l
 cpus	l

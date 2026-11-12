@@ -107,6 +107,7 @@ CELL_PING_SIZE	arg	cell_ping_size	Cellular	k	hakios.cell.c
 CELL_PING_TO	arg	cell_ping_to	Cellular	k	hakios.cell.c	
 CPUFREQ_OSM	arg	cpufreq_osm	CPU, memory and boot	k	hakios.cpufreq.c	
 CPUFREQ_OSM_MHZ	arg	cpufreq_osm_mhz	CPU, memory and boot	k	hakios.cpufreq.c	
+CPUFREQ_OSM_SMALL_MHZ	arg	cpufreq_osm_small_mhz	CPU, memory and boot	k	hakios.cpufreq.c	
 CPULOAD	arg	cpuload	CPU, memory and boot	k	hakios.cpufreq.c	every MS milliseconds, how busy each of our cores was meanwhile, in percent, to the loader's log (tools/frames.py shows it per gesture)
 CPUMASK	arg	cpumask	Loader	l	loader.c	
 DDR	arg	ddr	CPU, memory and boot	k	hakios.cpufreq.c	the memory's bus clock managers ("BCM") in the command database the boot loader left, with what is needed to vote for bandwidth on them -- only read

@@ -783,9 +783,20 @@ hakios_cpufreq_init(void)
 		if (enabled >= 2) {
 			uint32_t most_mhz = OSM_MHZ_DEFAULT;
 
+			/*
+			 * The small cores where UEFI leaves them, 1612.8 MHz (cpufreq_osm_small_mhz=N for another cap; their
+			 * top is 1766): the 6T's UEFI has no CPR, so nothing raises their voltage with the clock, and
+			 * the loader's core 0 -- a small core, the only one of its cluster running until the others join at
+			 * 28 s -- stopped dead about 25.5 s into one run in nine (11 November 2026: crash dumps 220426 and
+			 * 224143, its crumbs), when the modem's and the audio DSP's starts load the rails most. With them held
+			 * at 1516 MHz, 20 runs in a row (12 November) had no crash at all.
+			 */
+			uint32_t small_mhz = 1620;      /* (UEFI's row: 1612.8 MHz, over 1612 by a little) */
+
 			PE_parse_boot_argn("cpufreq_osm_mhz", &most_mhz, sizeof(most_mhz));
+			PE_parse_boot_argn("cpufreq_osm_small_mhz", &small_mhz, sizeof(small_mhz));
 			before = clock_mhz();
-			osm_raise("small cores", OSM_SMALL_PHYS, most_mhz);
+			osm_raise("small cores", OSM_SMALL_PHYS, small_mhz < most_mhz ? small_mhz : most_mhz);
 			osm_raise("big cores", OSM_BIG_PHYS, most_mhz);
 			tell("cpufreq_osm: this core (%u) measured %u MHz before, %u now\n",
 			    (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff, before, clock_mhz());
