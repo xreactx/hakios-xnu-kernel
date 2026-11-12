@@ -139,7 +139,7 @@ Every driver the kernel can be built with. `CONFIG_HAKIOS_<NAME>=y` in a defconf
 
 | Driver | Files | Requires | Boot arguments | fajita | qemu | redwood | |
 |---|---|---|---|---|---|---|
-| **`HAKIOS_CAM6T`**<br>the cameras' first steps (cam6t=N): the IMX519, IMX376K and IMX371 powered as Android powers them and asked their chip ID over the CCI pins done by hand | `hakios.cam6t.c` |  | `cam6t=`, `cam6t_after=`, `cam6t_sensor=`, `cam6t_xo=` | built | built | built | |
+| **`HAKIOS_CAM6T`**<br>the cameras' first steps (cam6t=N): the IMX519, IMX376K and IMX371 powered as Android powers them and asked their chip ID over the CCI pins done by hand | `hakios.cam6t.c` |  | `cam6t_after=`, `cam6t_exposure=`, `cam6t_focus=`, `cam6t_gain=`, `cam6t_mode=`, `cam6t_sensor=`, `cam6t_settle=`, `cam6t_xo=` | built | built | built | |
 
 ## haptic (devices/fajita)
 

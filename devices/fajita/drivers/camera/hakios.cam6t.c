@@ -36,7 +36,13 @@
  *   cam6t=5   ... and instead, a frame of a sensor's own (cam6t_sensor=2 the front IMX371 by default, 1 the IMX376K,
  *             0 the IMX519 over its three C-PHY trios; cam6t_settle=N the PHY's settle count instead of the computed;
  *             cam6t_mode=N its mode), through its CSIPHY, with its tables from the small image's fw/camera-*.tab.
- *   cam6t_after=S   when (seconds after the driver starts; 50): away from the modem's and the audio DSP's starts.
+ *   cam6t=6   ... and instead, /dev/hakios-camera for Darwin's camera stack: redwood's cam=5 (sys/hakios.camera.h), the
+ *             frames streaming while it is read; camera 1 the IMX519, 2 the IMX371, 3 the IMX376K (see below).
+ *   cam6t_after=S   when (seconds after the driver starts; 10): the steps that are not Darwin's (1 to 5) were run at 50, away
+ *             from the modem's and the audio DSP's starts; Darwin's sessions start only when the device is read anyway.
+ *
+ * cam6t=6 is the default (the loader puts the iPhone's camera nodes into the device tree for it: devices/fajita;
+ * cam6t=0 leaves the cameras alone, and then the loader does not either).
  *
  * At the run's end (hakios_cam6t_quiesce) whatever is still up goes down: reset low, MCLK off, the enables low, the
  * pins as they were found. The two RPMh votes are left as they are (on): other drivers' parts may hang on BOB, and
@@ -53,13 +59,17 @@
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
+#include <sys/conf.h>
+#include <sys/uio.h>
+#include <miscfs/devfs/devfs.h>
+#include <sys/hakios.camera.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
 extern kern_return_t thread_terminate(thread_t thread);
 extern lck_mtx_t hakios_rsc_lock;               /* hakios.wifi.c: one RPMh request at a time */
 
-static uint32_t level, which, after_s = 50, use_xo;
+static uint32_t level = 6, which, after_s = 10, use_xo;    /* (cam6t=6, the cameras for Darwin, by default: run 190508) */
 static bool which_given;
 
 static int say(const char *format, ...) __printflike(1, 2);
@@ -1002,7 +1012,7 @@ extern uint64_t kvtophys(vm_offset_t va);
 extern lck_mtx_t hakios_smmu_lock;
 
 static vm_offset_t smmu, smmu_second, smmu_context, frames, page_tables;
-static uint64_t frames_bytes, frames_kept;         /* frames_kept: what cam6t=5 took at boot, while the memory is in one piece */
+static uint64_t frames_bytes, frames_kept, page_tables_bytes;         /* frames_kept: what cam6t=5 took at boot, while the memory is in one piece */
 #define FRAMES_KEPT_BYTES       (16ull << 20)
 static uint32_t smmu_ctx, smmu_match[IFE_STREAMS], smmu_old_smr[IFE_STREAMS], smmu_old_s2cr[IFE_STREAMS];
 static unsigned smmu_matches;
@@ -1130,7 +1140,15 @@ smmu_up(void)
 		lck_mtx_unlock(&hakios_smmu_lock);
 		return false;
 	}
-	if (page_tables == 0 && kmem_alloc(kernel_map, &page_tables, (2 + thirds) * 4096, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	if (page_tables != 0 && page_tables_bytes != (2 + thirds) * 4096ull) {
+		kmem_free(kernel_map, page_tables, page_tables_bytes);   /* (another size of frames: tables of their own) */
+		page_tables = 0;
+	}
+	if (page_tables != 0) {
+		bzero((void *)page_tables, page_tables_bytes);
+	}
+	page_tables_bytes = (2 + thirds) * 4096ull;
+	if (page_tables == 0 && kmem_alloc(kernel_map, &page_tables, page_tables_bytes, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		page_tables = 0;
 		smmu_matches = 0;
@@ -1347,10 +1365,10 @@ csid_reset(void)
 	return true;
 }
 
+/* the write master to address (as the IFE sees it), each next frame frame_inc on (0: every frame there, until the next update) */
 static bool
-ife_config(void)
+ife_config_at(uint64_t address, uint32_t frame_inc)
 {
-	uint32_t frame_bytes = TPG_STRIDE * TPG_HEIGHT_NOW;
 
 	wr(ife_base + IFE_IRQ_MASK0, 1u << 31);
 	wr(ife_base + IFE_GLOBAL_RESET, 0x3f9f);
@@ -1376,8 +1394,8 @@ ife_config(void)
 	wr(ife_base + WM0_IRQ_SUB_PERIOD, 0);
 	wr(ife_base + WM0_IRQ_SUB_PATTERN, 1);
 	wr(ife_base + BUS_IRQ_MASK1, 1);
-	wr(ife_base + WM0_IMAGE_ADDR, (uint32_t)(FRAME_ADDRESSES + CAM_HEADER_BYTES));
-	wr(ife_base + WM0_FRAME_INC, frame_bytes);
+	wr(ife_base + WM0_IMAGE_ADDR, (uint32_t)address);
+	wr(ife_base + WM0_FRAME_INC, frame_inc);
 	wr(ife_base + WM0_CFG, 3);                      /* on, MIPI RAW: the frames as they come, packed */
 	/* (the image address reads 0 until a register update takes it: only the configuration is read back) */
 	if (rd(ife_base + WM0_CFG) != 3) {
@@ -1387,6 +1405,12 @@ ife_config(void)
 	}
 	wr(ife_base + IFE_REG_UPDATE, 0x2);             /* RDI 0's register update */
 	return true;
+}
+
+static bool
+ife_config(void)
+{
+	return ife_config_at(FRAME_ADDRESSES + CAM_HEADER_BYTES, TPG_STRIDE * TPG_HEIGHT_NOW);
 }
 
 /*
@@ -2213,11 +2237,732 @@ out:
 	}
 }
 
+/* ---- cam6t=6: the cameras for Darwin (/dev/hakios-camera) -------------------------------------------------------- */
+
+/*
+ * redwood's cam=5 for the 6T (drivers/camera/hakios.camera.c, sys/hakios.camera.h): the device node Darwin's camera
+ * stack reads (libhakios.media.dylib in mediaserverd: src/camera_device.c, src/camera_isp.c), so that the same user
+ * space works here. Its sensors are numbered as redwood's: 1 the back (wide) camera, the IMX519; 2 the front one, the
+ * IMX371; 3 the IMX376K (redwood's ultra-wide's place); 0 (the macro) there is none of. A session, from the first
+ * read after an open to the last close, a second without a read, or a fault: the sensor powered and streaming as
+ * cam6t=5 sets it up, its frames going into three places in turn (one the IFE writes, one a read may be copying, one
+ * ready), the write master given the next place's address at each start of frame (RDI 0's SOF, bit 27 of IFE-lite's
+ * IRQ status 0, as on redwood's; polled every millisecond) and taking it at the next.
+ *
+ * The gain is told to user space as a linear number (GAIN_UNITY = 1x, up to 16x: camera_isp.c reads gain / gain_unity
+ * as the analog gain) and written as the Sony code it means: 1024 - 1024 / gain (512 - 512 / gain on the IMX376K).
+ * The exposure, gain and frame length go in the sensor's group hold (its "holdon" and "holdoff" tables), between two
+ * frames. The lens (the rear ones): position 0 to 1023 of the frames' header straight to the motor.
+ */
+#define RING                    3
+#define PLACE_SPARE             (256u << 10)
+#define IDLE_MS                 1000
+#define FRAME_TIMEOUT_MS        1500
+#define EXPOSURE_MARGIN         20
+#define GAIN_UNITY              256u
+#define GAIN_MAX                (16 * GAIN_UNITY)
+#define FRAME_LINES_MAX         0xfff0
+#define RDI0_SOF                (1u << 27)      /* IFE_IRQ_STATUS0 */
+#define WM0_DONE                1u              /* BUS_IRQ_STATUS1 */
+#define BUS_IRQ_CLEAR1          0x2054
+#define BUS_IRQ_GLOBAL_CLEAR    0x2068
+#define CSID_RDI0_BYTES_PONG    0x2e4
+
+static const int darwin_to_sensor[4] = { -1, 0, 2, 1 };       /* redwood's numbers -> sensors[] */
+static const int sensor_to_darwin[SENSORS] = { 1, 3, 2 };
+
+enum { PLACE_FREE, PLACE_WRITING, PLACE_READY, PLACE_READING };
+
+static LCK_GRP_DECLARE(darwin_lck_grp, "hakios-camera");
+static LCK_MTX_DECLARE(darwin_lock, &darwin_lck_grp);
+static struct {
+	uint8_t         state;
+	uint64_t        sequence, time;
+	uint32_t        exposure_lines, gain, frame_lines;
+} place[RING];
+static vm_offset_t ring;
+static uint64_t ring_bytes, ring_place_bytes;
+static uint32_t ring_frame_bytes, darwin_odd_frames, darwin_line_ns, darwin_mode_n;
+static unsigned darwin_index;                   /* sensors[] */
+static const struct ctab_mode *darwin_mode;
+static volatile bool darwin_open, darwin_streaming, darwin_wanted, broken;
+static uint64_t darwin_last_read, darwin_given, darwin_frames_done, darwin_writes_late;
+static unsigned darwin_readers;
+static struct { uint32_t lines, gain, frame_lines; bool pending; uint32_t focus; bool focus_pending; } darwin_ask;
+static struct { uint32_t lines, gain, frame_lines; uint64_t from; } darwin_now, darwin_next;
+static volatile unsigned darwin_switch_to;      /* 1 + redwood's number; 0: none asked for */
+static uint32_t darwin_switch_mode;
+static int motor_kind;                          /* 0 none, 1 LC898217XC, 2 SA3103 (of the sensor streaming) */
+static uint8_t motor_address;
+static uint32_t motor_position = HAKIOS_CAMERA_NO_FOCUS;
+
+static uint64_t
+darwin_ms(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / NSEC_PER_MSEC;
+}
+
+static void
+give_up(const char *why)
+{
+	if (!broken) {
+		say("cam6t: THE CAMERA GIVES UP: %s (off for the rest of the run)\n", why);
+	}
+	broken = true;
+}
+
+/* the linear gain (GAIN_UNITY = 1x) as the sensor's code */
+static uint16_t
+gain_code(uint32_t gain)
+{
+	uint32_t scale = darwin_index == 1 ? 512 : 1024, most = darwin_index == 1 ? 480 : 960;
+	uint32_t code = scale - (uint32_t)((uint64_t)scale * GAIN_UNITY / gain);
+
+	return (uint16_t)(code > most ? most : code);
+}
+
+static void
+exposure_limits(uint32_t *lines, uint32_t *gain, uint32_t *frame_lines)
+{
+	uint32_t shortest = darwin_mode->frame_length;
+
+	*gain = *gain < GAIN_UNITY ? GAIN_UNITY : *gain > GAIN_MAX ? GAIN_MAX : *gain;
+	*lines = *lines < 4 ? 4 : *lines > FRAME_LINES_MAX - EXPOSURE_MARGIN ? FRAME_LINES_MAX - EXPOSURE_MARGIN : *lines;
+	if (*frame_lines == 0) {
+		*frame_lines = *lines + EXPOSURE_MARGIN > shortest ? *lines + EXPOSURE_MARGIN : shortest;
+	}
+	*frame_lines = *frame_lines < shortest ? shortest : *frame_lines > FRAME_LINES_MAX ? FRAME_LINES_MAX : *frame_lines;
+	if (*lines > *frame_lines - EXPOSURE_MARGIN) {
+		*lines = *frame_lines - EXPOSURE_MARGIN;
+	}
+}
+
+static bool
+exposure_write(uint32_t lines, uint32_t gain, uint32_t frame_lines)
+{
+	const struct sensor *s = &sensors[darwin_index];
+	bool ok = write_table(s, "holdon") && write16(s, 0x0340, (uint16_t)frame_lines) && write16(s, 0x0202, (uint16_t)lines) &&
+	    write16(s, 0x0204, gain_code(gain)) && write_table(s, "holdoff");
+
+	if (!ok) {
+		give_up("a sensor write nobody acknowledged");
+	}
+	return ok;
+}
+
+/* the lens motor of the sensor streaming: which one, then positions 0-1023 */
+static void
+motor_up(void)
+{
+	const struct sensor *s = &sensors[darwin_index];
+	uint8_t b[2] = { 0, 0 };
+
+	motor_kind = 0;
+	motor_position = HAKIOS_CAMERA_NO_FOCUS;
+	if (darwin_index > 1) {
+		return;
+	}
+	motor_pin = motors[darwin_index].pin;
+	drive(motor_pin, true);
+	motor_on = true;
+	wait_ms(10);
+	if (bus_xfer(s, motors[darwin_index].lc, 0xb3, b, 1, true)) {
+		for (unsigned go = 0; go < 50 && b[0] != 0; go++) {
+			wait_ms(1);
+			(void)bus_xfer(s, motors[darwin_index].lc, 0xb3, b, 1, true);
+		}
+		motor_kind = 1;
+		motor_address = motors[darwin_index].lc;
+	} else if (b[0] = 1, bus_xfer(s, motors[darwin_index].sa, 0x81, b, 1, false)) {
+		motor_kind = 2;
+		motor_address = motors[darwin_index].sa;
+	} else {
+		say("cam6t: the %s's lens motor does not answer: no focus\n", s->name);
+		focus_off();
+	}
+}
+
+static void
+motor_move(uint32_t position)
+{
+	uint8_t b[2];
+
+	if (motor_kind == 0) {
+		return;
+	}
+	position = position > 1023 ? 1023 : position;
+	b[0] = (uint8_t)(position >> 8);
+	b[1] = (uint8_t)position;
+	if (bus_xfer(&sensors[darwin_index], motor_address, motor_kind == 1 ? 0x84 : 0x82, b, 2, false)) {
+		motor_position = position;
+	}
+}
+
+static void
+ring_free(void)
+{
+	if (ring != 0) {
+		kmem_free(kernel_map, ring, ring_bytes);
+		ring = 0;
+	}
+	frames = 0;
+	frames_bytes = 0;
+}
+
+static bool
+ring_alloc(uint32_t frame_bytes)
+{
+	ring_frame_bytes = frame_bytes;
+	ring_place_bytes = round_page(frame_bytes) + PLACE_SPARE;
+	ring_bytes = RING * ring_place_bytes;
+	if (kmem_alloc(kernel_map, &ring, ring_bytes, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+		say("cam6t: no memory for %u frames (%llu KB)\n", RING, ring_bytes >> 10);
+		ring = 0;
+		return false;
+	}
+	for (vm_offset_t line = ring; line < ring + ring_bytes; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	frames = ring;                  /* (what smmu_up() maps) */
+	frames_bytes = ring_bytes;
+	return true;
+}
+
+static void
+darwin_drain_readers(void)
+{
+	lck_mtx_lock(&darwin_lock);
+	while (darwin_readers != 0) {
+		(void)msleep(&darwin_readers, &darwin_lock, PZERO, "hakios-camera-drain", NULL);
+	}
+	lck_mtx_unlock(&darwin_lock);
+}
+
+static void
+darwin_stop(const char *why)
+{
+	const struct sensor *s = &sensors[darwin_index];
+
+	lck_mtx_lock(&darwin_lock);
+	darwin_streaming = false;
+	for (int i = 0; i < RING; i++) {
+		place[i].state = PLACE_FREE;
+	}
+	lck_mtx_unlock(&darwin_lock);
+	wakeup(&darwin_frames_done);
+	if (up != NULL) {
+		(void)write_table(s, "off");
+	}
+	if (csid_base != 0) {
+		show_paths("at the end");
+		stream_stop();
+	}
+	phy_off();
+	smmu_faults();
+	smmu_down();
+	phy_clocks_off();
+	blocks_off();
+	pll3_down();
+	focus_off();
+	power_down();
+	darwin_drain_readers();
+	ring_free();
+	say("cam6t: the frames for Darwin stopped (%s): %llu done, %llu given, %llu written over\n", why, darwin_frames_done,
+	    darwin_given, darwin_writes_late);
+}
+
+static bool
+darwin_start(void)
+{
+	const struct sensor *s = &sensors[darwin_index];
+	const struct ctab_mode *m = darwin_mode;
+	uint32_t lines, gain, frame_lines;
+	uint16_t id = 0;
+	char res[8];
+
+	darwin_frames_done = darwin_given = darwin_writes_late = 0;
+	darwin_odd_frames = 0;
+	cap_width = m->width;
+	cap_height = m->height;
+	if (csid_base == 0) {
+		csid_base = ml_io_map(CSID_LITE_PHYS, 0x1000);
+		ife_base = ml_io_map(VFE_LITE_PHYS, 0x4000);
+	}
+	csiphy_base = ml_io_map(CSIPHY_PHYS(sensor_csiphy[darwin_index]), 0x1000);
+	if (!ring_alloc(TPG_STRIDE * m->height) || !power_up(s)) {
+		return false;
+	}
+	for (unsigned go = 0; go < 20 && !read16(s, ID_REGISTER, &id); go++) {
+		wait_ms(2);
+	}
+	snprintf(res, sizeof(res), "res%u", darwin_mode_n);
+	if (id != s->id || !write_table(s, "init") || !write_table(s, res) || !blocks_on(true) || !rates_up() || !phy_rails_on() ||
+	    !phy_clocks_on(sensor_csiphy[darwin_index]) || !smmu_up() || !csid_reset() || !ife_config_at(FRAME_ADDRESSES, 0) ||
+	    !csid_config((int)sensor_csiphy[darwin_index], ctab->lane_assign, m->cphy != 0)) {
+		return false;
+	}
+	if (m->cphy) {
+		phy_config_cphy(cam_settle != ~0u ? cam_settle : m->settle * 240 / 269);
+	} else {
+		phy_config(cam_settle != ~0u ? cam_settle : settle_count((uint64_t)m->pixel_clock * 10 / m->lanes));
+	}
+	streaming = true;
+	motor_up();
+	lck_mtx_lock(&darwin_lock);
+	for (int i = 0; i < RING; i++) {
+		place[i].state = PLACE_FREE;
+		place[i].sequence = 0;
+	}
+	place[0].state = PLACE_WRITING;
+	lines = darwin_ask.lines;
+	gain = darwin_ask.gain;
+	frame_lines = darwin_ask.frame_lines;
+	darwin_ask.pending = false;
+	lck_mtx_unlock(&darwin_lock);
+	exposure_limits(&lines, &gain, &frame_lines);
+	if (!write_table(s, "on") || !exposure_write(lines, gain, frame_lines)) {
+		return false;
+	}
+	if (motor_kind != 0) {
+		motor_move(cam_focus != ~0u && cam_focus != 0 ? cam_focus : 500);
+	}
+	darwin_now.lines = darwin_next.lines = lines;
+	darwin_now.gain = darwin_next.gain = gain;
+	darwin_now.frame_lines = darwin_next.frame_lines = frame_lines;
+	darwin_next.from = 0;
+	say("cam6t: the frames for Darwin: the %s, mode %u, %ux%u, %u lines of %u ns a frame at the shortest; exposure %u lines, "
+	    "gain %u/%u, frame %u lines; lens %s\n", s->name, darwin_mode_n, m->width, m->height, m->frame_length, darwin_line_ns, lines,
+	    gain, GAIN_UNITY, frame_lines, motor_kind == 1 ? "LC898217XC" : motor_kind == 2 ? "SA3103" : "fixed");
+	return true;
+}
+
+static void
+darwin_session(void)
+{
+	int writing = 0, next = 0;
+	uint64_t last_frame;
+
+	if (!darwin_start()) {
+		give_up("the camera did not start");
+		darwin_stop("it did not start");
+		return;
+	}
+	last_frame = darwin_ms();
+	wr(ife_base + IFE_IRQ_CLEAR0, ~0u);
+	wr(ife_base + IFE_IRQ_GLOBAL_CLEAR, 1);
+	wr(ife_base + BUS_IRQ_CLEAR1, ~0u);
+	wr(ife_base + BUS_IRQ_GLOBAL_CLEAR, 1);
+	lck_mtx_lock(&darwin_lock);
+	darwin_streaming = true;
+	darwin_last_read = darwin_ms();
+	lck_mtx_unlock(&darwin_lock);
+	while (!broken && darwin_open && darwin_switch_to == 0) {
+		uint32_t top, bus;
+		uint64_t now;
+
+		wait_ms(1);
+		now = darwin_ms();
+		top = rd(ife_base + IFE_IRQ_STATUS0);
+		bus = rd(ife_base + BUS_IRQ_STATUS1);
+		if (!(top & RDI0_SOF) && !(bus & WM0_DONE)) {
+			if (now - last_frame > FRAME_TIMEOUT_MS) {
+				show_paths("no frame");
+				give_up("no frame for 1.5 s");
+				break;
+			}
+			if (now - darwin_last_read > IDLE_MS) {
+				break;
+			}
+			continue;
+		}
+		wr(ife_base + IFE_IRQ_CLEAR0, top & RDI0_SOF);
+		wr(ife_base + IFE_IRQ_GLOBAL_CLEAR, 1);
+		wr(ife_base + BUS_IRQ_CLEAR1, bus & WM0_DONE);
+		wr(ife_base + BUS_IRQ_GLOBAL_CLEAR, 1);
+		lck_mtx_lock(&darwin_lock);
+		if (bus & WM0_DONE) {
+			uint32_t ping = rd(csid_base + CSID_RDI0_BYTES_PING), data = darwin_mode->width * 10 / 8 * darwin_mode->height;
+
+			last_frame = now;
+			darwin_frames_done++;
+			if (ping != data && darwin_odd_frames++ < 8) {
+				say("cam6t: frame %llu: the CSID counted %u bytes (the mode's frame is %u)\n", darwin_frames_done, ping, data);
+			}
+			if (darwin_frames_done >= darwin_next.from && darwin_next.from != 0) {
+				darwin_now = darwin_next;
+				darwin_next.from = 0;
+			}
+			place[writing].state = PLACE_READY;
+			place[writing].sequence = darwin_frames_done;
+			place[writing].time = mach_absolute_time();
+			place[writing].exposure_lines = darwin_now.lines;
+			place[writing].gain = darwin_now.gain;
+			place[writing].frame_lines = darwin_now.frame_lines;
+		}
+		if (top & RDI0_SOF) {
+			if (next >= 0) {
+				writing = next;
+				next = -1;
+			} else {
+				darwin_writes_late++;
+			}
+			place[writing].state = PLACE_WRITING;
+			for (int i = 0; i < RING; i++) {
+				int c = (writing + 1 + i) % RING;
+
+				if (c != writing && place[c].state != PLACE_READING && (next < 0 || place[c].sequence < place[next].sequence)) {
+					next = c;
+				}
+			}
+			if (next >= 0) {
+				wr(ife_base + WM0_IMAGE_ADDR, (uint32_t)(FRAME_ADDRESSES + (uint64_t)next * ring_place_bytes));
+				wr(ife_base + IFE_REG_UPDATE, 0x2);
+			}
+		}
+		bool ask = (bus & WM0_DONE) && darwin_ask.pending, move = (bus & WM0_DONE) && darwin_ask.focus_pending;
+		uint32_t lines = darwin_ask.lines, gain = darwin_ask.gain, frame_lines = darwin_ask.frame_lines, position = darwin_ask.focus;
+
+		darwin_ask.pending = darwin_ask.pending && !ask;
+		darwin_ask.focus_pending = darwin_ask.focus_pending && !move;
+		lck_mtx_unlock(&darwin_lock);
+		if (move) {
+			motor_move(position);
+		}
+		if (bus & WM0_DONE) {
+			wakeup(&darwin_frames_done);
+		}
+		if (ask) {
+			exposure_limits(&lines, &gain, &frame_lines);
+			if (lines != darwin_now.lines || gain != darwin_now.gain || frame_lines != darwin_now.frame_lines) {
+				if (!exposure_write(lines, gain, frame_lines)) {
+					break;
+				}
+				darwin_next.lines = lines;
+				darwin_next.gain = gain;
+				darwin_next.frame_lines = frame_lines;
+				darwin_next.from = darwin_frames_done + 2;
+			}
+		}
+		if ((bus & WM0_DONE) && darwin_frames_done % 30 == 0) {
+			if (rd(smmu_context + SMMU_CB_FSR) & SMMU_FSR_ALL) {
+				smmu_faults();
+				give_up("the SMMU refused the IFE");
+				break;
+			}
+			if (darwin_frames_done == 30 || darwin_frames_done % 900 == 0) {
+				show_paths("streaming");
+			}
+		}
+	}
+	darwin_stop(broken ? "a fault" : !darwin_open ? "closed" : darwin_switch_to != 0 ? "another sensor asked for" : "nobody reads");
+}
+
+static int
+camdev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	if (broken) {
+		return EIO;
+	}
+	darwin_open = true;
+	return 0;
+}
+
+static int
+camdev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
+{
+	darwin_open = false;
+	darwin_wanted = false;
+	wakeup(&darwin_open);
+	return 0;
+}
+
+static int
+camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct hakios_camera_frame f;
+	uint64_t since = darwin_ms();
+	int b = -1, error = 0;
+	vm_offset_t at = 0;
+	uint32_t frame_bytes = 0;
+
+	lck_mtx_lock(&darwin_lock);
+	darwin_last_read = darwin_ms();
+	if (!darwin_streaming && !darwin_wanted) {
+		darwin_wanted = true;
+		wakeup(&darwin_open);
+	}
+	for (;;) {
+		if (broken) {
+			lck_mtx_unlock(&darwin_lock);
+			return EIO;
+		}
+		b = -1;
+		for (int i = 0; i < RING; i++) {
+			if (place[i].state == PLACE_READY && place[i].sequence > darwin_given && (b < 0 || place[i].sequence > place[b].sequence)) {
+				b = i;
+			}
+		}
+		if (b >= 0) {
+			break;
+		}
+		if (darwin_ms() - since > (darwin_streaming ? 3000u : 15000u)) {
+			lck_mtx_unlock(&darwin_lock);
+			return EAGAIN;
+		}
+		if (!darwin_streaming && !darwin_wanted) {
+			darwin_wanted = true;
+			wakeup(&darwin_open);
+		}
+		struct timespec ts = { 0, 100 * NSEC_PER_MSEC };
+		error = msleep(&darwin_frames_done, &darwin_lock, PZERO | PCATCH, "hakios-camera", &ts);
+		if (error != 0 && error != EWOULDBLOCK) {
+			lck_mtx_unlock(&darwin_lock);
+			return error;
+		}
+		darwin_last_read = darwin_ms();
+	}
+	place[b].state = PLACE_READING;
+	darwin_readers++;
+	at = ring + (uint64_t)b * ring_place_bytes;
+	frame_bytes = ring_frame_bytes;
+	darwin_given = place[b].sequence;
+	bzero(&f, sizeof(f));
+	memcpy(f.magic, HAKIOS_CAMERA_MAGIC, 8);
+	f.header_bytes = sizeof(f);
+	f.width = darwin_mode->width;
+	f.height = darwin_mode->height;
+	f.stride = ((darwin_mode->width * 10 / 8) + 15) & ~15u;
+	f.format = 1;
+	f.bayer = sensor_bayer[darwin_index];
+	f.black = 64;
+	f.sequence = place[b].sequence;
+	f.time = place[b].time;
+	f.exposure_lines = place[b].exposure_lines;
+	f.line_ns = darwin_line_ns;
+	f.gain = place[b].gain;
+	f.gain_unity = GAIN_UNITY;
+	f.gain_max = GAIN_MAX;
+	f.frame_lines = place[b].frame_lines;
+	f.frame_lines_min = darwin_mode->frame_length;
+	f.frame_lines_max = FRAME_LINES_MAX;
+	f.margin = EXPOSURE_MARGIN;
+	f.sensor = (uint32_t)sensor_to_darwin[darwin_index];
+	f.focus = motor_position;
+	lck_mtx_unlock(&darwin_lock);
+
+	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
+	if (error == 0 && uio_resid(uio) > 0) {
+		uint32_t n = (uint32_t)MIN((uint64_t)frame_bytes, (uint64_t)uio_resid(uio));
+
+		uint64_t t0 = mach_absolute_time(), t1, t2, a, c;
+
+		for (vm_offset_t line = at & ~63ul; line < at + n; line += 64) {
+			__asm__ volatile ("dc civac, %0" : : "r" (line));
+		}
+		__asm__ volatile ("dsb sy");
+		t1 = mach_absolute_time();
+		error = uiomove((caddr_t)at, (int)n, uio);
+		t2 = mach_absolute_time();
+		if (f.sequence <= 3 || f.sequence % 300 == 0) {
+			absolutetime_to_nanoseconds(t1 - t0, &a);
+			absolutetime_to_nanoseconds(t2 - t1, &c);
+			say("cam6t: frame %llu read: %u bytes; the caches' lines forgotten in %llu us, copied in %llu us (cpu %d)\n",
+			    f.sequence, n, a / 1000, c / 1000, cpu_number());
+		}
+	}
+	lck_mtx_lock(&darwin_lock);
+	if (place[b].state == PLACE_READING) {
+		place[b].state = PLACE_READY;
+	}
+	darwin_last_read = darwin_ms();
+	darwin_readers--;
+	lck_mtx_unlock(&darwin_lock);
+	wakeup(&darwin_readers);
+	return error;
+}
+
+/* HAKIOS_CAMERA_KEEP: a picture for the host (what the program made of a frame), in the piece taken at boot */
+static vm_offset_t keep;
+static uint64_t keep_bytes;
+static LCK_MTX_DECLARE(keep_lock, &darwin_lck_grp);
+
+static int
+keep_picture(const struct hakios_camera_command *c, struct uio *uio)
+{
+	struct cam_header *h;
+	uint64_t want = round_page(CAM_HEADER_BYTES + (uint64_t)c->bytes);
+	int error;
+
+	if (c->bytes == 0 || c->d < 1 || c->d > 3 || (uint64_t)c->c * c->b > (uint64_t)c->bytes * 2) {
+		return EINVAL;
+	}
+	if (keep == 0 || keep_bytes < want) {
+		return ENOSPC;
+	}
+	lck_mtx_lock(&keep_lock);
+	h = (struct cam_header *)keep;
+	bzero(h, CAM_HEADER_BYTES);
+	memcpy(h->magic, "RWCAM001", 8);
+	h->width = c->a;
+	h->height = c->b;
+	h->stride = c->c;
+	h->format = c->d;
+	h->bayer = c->d == 1 ? sensor_bayer[darwin_index] : 0;
+	h->frame_bytes = c->bytes;
+	h->source = 2;
+	strlcpy(h->sensor, "Darwin", sizeof(h->sensor));
+	error = uiomove((caddr_t)(keep + CAM_HEADER_BYTES), (int)MIN((uint64_t)c->bytes, (uint64_t)uio_resid(uio)), uio);
+	h->frames = error == 0 ? 1 : 0;
+	for (vm_offset_t line = keep; line < keep + want; line += 64) {
+		__asm__ volatile ("dc cvac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy");
+	loader_recording[0] = kvtophys(keep);
+	loader_recording[1] = want;
+	loader_recording[2] = (uint64_t)keep;
+	lck_mtx_unlock(&keep_lock);
+	say("cam6t: a picture from Darwin for the host: %ux%u, format %u, %u bytes\n", c->a, c->b, c->d, c->bytes);
+	return error;
+}
+
+static int
+camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+{
+	struct hakios_camera_command c;
+	int error;
+
+	if (uio_resid(uio) < (user_ssize_t)sizeof(c) || (error = uiomove((caddr_t)&c, sizeof(c), uio)) != 0) {
+		return EINVAL;
+	}
+	if (c.command == HAKIOS_CAMERA_EXPOSURE) {
+		lck_mtx_lock(&darwin_lock);
+		darwin_ask.lines = c.a;
+		darwin_ask.gain = c.b;
+		darwin_ask.frame_lines = c.c;
+		darwin_ask.pending = true;
+		lck_mtx_unlock(&darwin_lock);
+		return 0;
+	}
+	if (c.command == HAKIOS_CAMERA_FOCUS) {
+		lck_mtx_lock(&darwin_lock);
+		darwin_ask.focus = c.a;
+		darwin_ask.focus_pending = true;
+		lck_mtx_unlock(&darwin_lock);
+		return 0;
+	}
+	if (c.command == HAKIOS_CAMERA_SENSOR) {
+		if (c.a >= 4 || darwin_to_sensor[c.a] < 0) {
+			return EINVAL;
+		}
+		lck_mtx_lock(&darwin_lock);
+		darwin_switch_mode = c.b;
+		darwin_switch_to = c.a + 1;
+		lck_mtx_unlock(&darwin_lock);
+		wakeup(&darwin_open);
+		return 0;
+	}
+	if (c.command == HAKIOS_CAMERA_KEEP) {
+		return keep_picture(&c, uio);
+	}
+	return EINVAL;
+}
+
+static const struct cdevsw camdev_cdevsw = {
+	.d_open = camdev_open, .d_close = camdev_close, .d_read = camdev_read, .d_write = camdev_write,
+	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
+	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
+};
+
+static bool camdev_made;
+
+static void
+camdev_make(void)
+{
+	int major = cdevsw_add(-1, &camdev_cdevsw);
+
+	camdev_made = major >= 0 && devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-camera") != NULL;
+	say("cam6t: /dev/hakios-camera %s\n", camdev_made ? "made" : "CANNOT BE MADE");
+}
+
+/* the sensor (sensors[] index) and its mode for the sessions: its tables; the mode asked for, else the 6T's usual */
+static bool
+darwin_select(unsigned index, uint32_t mode_n)
+{
+	if (!ctab_load(index)) {
+		return false;
+	}
+	if (mode_n >= ctab->modes) {
+		mode_n = index == 0 ? 10 : index == 2 ? 1 : 0;  /* IMX519 2328x1746, IMX371 2304x1728, IMX376K 2592x1940 */
+	}
+	darwin_index = index;
+	darwin_mode_n = mode_n;
+	darwin_mode = &((const struct ctab_mode *)(ctab + 1))[mode_n];
+	if (darwin_mode->data_type != RAW10_DT || (darwin_mode->cphy ? darwin_mode->lanes != 3 : darwin_mode->lanes != 4) ||
+	    darwin_mode->width % 4 != 0 || darwin_mode->fps_milli == 0 || darwin_mode->frame_length <= EXPOSURE_MARGIN ||
+	    darwin_mode->frame_length > FRAME_LINES_MAX || darwin_mode->width > 8192 || darwin_mode->height > 8192) {
+		say("cam6t: the %s's mode %u is not what this is written for\n", sensors[index].name, mode_n);
+		return false;
+	}
+	darwin_line_ns = (uint32_t)(1000000000000ull / ((uint64_t)darwin_mode->fps_milli * darwin_mode->frame_length));
+	darwin_ask.lines = darwin_mode->frame_length - EXPOSURE_MARGIN;
+	darwin_ask.gain = 4 * GAIN_UNITY;
+	darwin_ask.frame_lines = 0;
+	say("cam6t: /dev/hakios-camera: the %s (camera %d), mode %u: %ux%u, %u.%03u frames/s at the most, whenever it is read\n",
+	    sensors[index].name, sensor_to_darwin[index], mode_n, darwin_mode->width, darwin_mode->height, darwin_mode->fps_milli / 1000,
+	    darwin_mode->fps_milli % 1000);
+	return true;
+}
+
+static void
+serve_darwin(void)
+{
+	uint32_t mode_n = cam_mode;
+
+	if (!camdev_made) {
+		return;
+	}
+	if (!darwin_select(which_given && which < SENSORS ? which : 0, mode_n)) {
+		return;
+	}
+	while (!broken) {
+		lck_mtx_lock(&darwin_lock);
+		while (!broken && !(darwin_open && darwin_wanted) && darwin_switch_to == 0) {
+			(void)msleep(&darwin_open, &darwin_lock, PZERO, "hakios-camera-idle", NULL);
+		}
+		unsigned to = darwin_switch_to;
+
+		darwin_switch_to = 0;
+		lck_mtx_unlock(&darwin_lock);
+		if (broken) {
+			break;
+		}
+		if (to != 0) {
+			if (!darwin_select((unsigned)darwin_to_sensor[to - 1], darwin_switch_mode)) {
+				give_up("a sensor that cannot be used");
+				break;
+			}
+			continue;
+		}
+		lck_mtx_lock(&darwin_lock);
+		darwin_wanted = false;
+		lck_mtx_unlock(&darwin_lock);
+		darwin_session();
+	}
+	say("cam6t: /dev/hakios-camera: no more frames in this run\n");
+}
+
 static void
 cam6t_thread(__unused void *arg, __unused wait_result_t wr_)
 {
 	bool clocks;
 
+	if (level >= 6) {
+		camdev_make();          /* (before mediaserverd starts: its capture stack looks for cameras once) */
+	}
 	delay_for_interval(after_s * 1000, NSEC_PER_MSEC);
 	map_pins();
 	say("cam6t: level %u%s\n", level, level >= 2 ? (which >= SENSORS ? ", all three sensors" : "") : ", reading only");
@@ -2251,8 +2996,10 @@ cam6t_thread(__unused void *arg, __unused wait_result_t wr_)
 			blocks_look();
 		} else if (level == 4) {
 			capture_tpg();
-		} else if (level >= 5) {
+		} else if (level == 5) {
 			capture_sensor(which_given && which < SENSORS ? which : 2);
+		} else if (level >= 6) {
+			serve_darwin();
 		}
 	}
 	pll2_down();
@@ -2267,7 +3014,8 @@ hakios_cam6t_init(void)
 {
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("cam6t", &level, sizeof(level)) || level == 0) {
+	(void)PE_parse_boot_argn("cam6t", &level, sizeof(level));
+	if (level == 0) {
 		return;
 	}
 	which_given = PE_parse_boot_argn("cam6t_sensor", &which, sizeof(which));
@@ -2278,7 +3026,16 @@ hakios_cam6t_init(void)
 	(void)PE_parse_boot_argn("cam6t_gain", &cam_gain, sizeof(cam_gain));
 	(void)PE_parse_boot_argn("cam6t_settle", &cam_settle, sizeof(cam_settle));
 	(void)PE_parse_boot_argn("cam6t_focus", &cam_focus, sizeof(cam_focus));
-	if (level >= 5) {
+	if (level >= 6) {
+		/* (a picture for the host, cam6t=6: in one piece, taken while there is memory in one piece) */
+		if (kmem_alloc_contig(kernel_map, &keep, FRAMES_KEPT_BYTES, PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+		    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
+			keep_bytes = FRAMES_KEPT_BYTES;
+		} else {
+			keep = 0;
+		}
+	}
+	if (level == 5) {
 		/* a sensor's frames are megabytes: taken now, in one piece, as redwood's driver takes its own at boot */
 		if (kmem_alloc_contig(kernel_map, &frames, FRAMES_KEPT_BYTES, PAGE_MASK, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 		    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {

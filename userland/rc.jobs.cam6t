@@ -1,0 +1,5 @@
+# Commands run by the launchd job com.hakios.demo for the 6T's cameras (cam6t=6): the back camera's frames through
+# /dev/hakios-camera and src/camera_isp.c, then the front's; the last picture of each left for the host (xl camera).
+/redwood/bin/devname
+/redwood/bin/camera_test raw 90
+/redwood/bin/camera_test raw 90 sensor 2

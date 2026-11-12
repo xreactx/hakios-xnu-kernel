@@ -3446,8 +3446,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	int more_cores = 0, battery_requested = 0, ufs_requested = 0;
 	/* "torch=N" (not 0) there too: the phone's flashlight is the kernel's (drivers/camera/hakios.torch.c) */
 	int torch_requested = 0;
-	/* "cam=5" there too: the phone's wide camera is Darwin's (drivers/camera/hakios.camera.c) */
-	int camera_requested = 0;
+	/* "cam=5" there too: the phone's wide camera is Darwin's (drivers/camera/hakios.camera.c); on the 6T, whose
+	 * cam6t driver gives Darwin its cameras unless "cam6t=0" says not (devices/fajita/drivers/camera), always */
+	int camera_requested = 0, cameras_off = 0;
 	/* (the loader stays for run after run: what the last run's arguments said must not hold for this one) */
 	gamut_p3 = 0;
 	/* a run that does not ask for writes does not get them, whatever an earlier run of this
@@ -3471,6 +3472,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		    (c[9] == 0 || c[9] == ' ');
 		torch_requested |= starts_with(c, "torch=") && (c == pi.cmdline || c[-1] == ' ') && c[6] >= '1' && c[6] <= '9';
 		camera_requested |= starts_with(c, "cam=5") && (c == pi.cmdline || c[-1] == ' ') && (c[5] == 0 || c[5] == ' ');
+		cameras_off |= starts_with(c, "cam6t=") && (c == pi.cmdline || c[-1] == ' ') && (c[6] < '6' || c[6] > '9') &&
+		    (c[7] == 0 || c[7] == ' ');
 		gamut_p3 |= starts_with(c, "gamut=p3") && (c == pi.cmdline || c[-1] == ' ');
 		if (starts_with(c, "ufs=") && (c == pi.cmdline || c[-1] == ' ') && c[4] >= '1' && c[4] <= '2' &&
 		    (c[5] == 0 || c[5] == ' ')) {
@@ -3781,6 +3784,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * it Control Center has no flashlight); with cam=5 the node itself, for a camera there is (with it
 	 * MobileGestalt's video-camera). The rest of the iPhone's camera is not here, nor said to be.
 	 */
+	if (PLAT != NULL && str_eq(PLAT->name, "fajita") && !cameras_off) {
+		camera_requested = 1;   /* (the 6T's cameras are Darwin's by default: cam6t=6 is its driver's own default) */
+	}
 	if (torch_requested || camera_requested) {
 		dt_begin(&w, "camera");
 		if (torch_requested) {
