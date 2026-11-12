@@ -487,25 +487,46 @@ render_line(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 		v_at = cells_h > 1 ? (float)cy0 / (cells_h - 1) : 0;
 		const uint8_t *t0 = raw + (size_t)cy0 * 2 * f->stride, *t1 = raw + (size_t)cy1 * 2 * f->stride;
 		float gains[3] = { 1, 1, 1 };
+		/*
+		 * The two lines of cells this line of pixels lies between, unpacked once: the cells a pixel blends were
+		 * unpacked four times a pixel before, ~6000 times a line for ~1150 cells (the 6T's front camera's 2304x1728
+		 * into a 1504-wide preview: 120 ms a frame). Red, the two greens' sum, blue a cell, of the cells the crop uses.
+		 */
+		enum { CELLS_MAX = 4096 };
+		uint16_t lines[2][3][CELLS_MAX];
+		uint32_t first = x0 > 0 ? x0 - 1 : 0, last = x0 + cw + 1 < cells_w ? x0 + cw + 1 : cells_w - 1;
 
+		if (cells_w > CELLS_MAX) {
+			return;
+		}
+		for (int l = 0; l < 2; l++) {
+			for (uint32_t cx = first; cx <= last; cx++) {
+				int v[4], g = 0;
+
+				cell(l ? t1 : t0, f->stride, cx, v);
+				for (int j = 0; j < 4; j++) {
+					g += j != r && j != b ? v[j] : 0;
+				}
+				lines[l][0][cx] = (uint16_t)v[r];
+				lines[l][1][cx] = (uint16_t)g;
+				lines[l][2][cx] = (uint16_t)v[b];
+			}
+		}
 		for (uint32_t x = 0; x < width; x++) {
-			float fx = x0 + (x + 0.5f) * cw / width - 0.5f, tx, c[3] = { 0, 0, 0 };
+			float fx = x0 + (x + 0.5f) * cw / width - 0.5f, tx, c[3];
 			uint32_t cx0 = fx < 0 ? 0 : (uint32_t)fx, cx1;
 
 			cx0 = cx0 > cells_w - 1 ? cells_w - 1 : cx0;
 			cx1 = cx0 + 1 > cells_w - 1 ? cells_w - 1 : cx0 + 1;
+			cx0 = cx0 < first ? first : cx0 > last ? last : cx0;
+			cx1 = cx1 < first ? first : cx1 > last ? last : cx1;
 			tx = fx < (float)cx0 ? 0 : fx - cx0;
-			for (int k = 0; k < 4; k++) {
-				int v[4];
-				float w = (k & 1 ? tx : 1 - tx) * (k & 2 ? ty : 1 - ty);
+			float w00 = (1 - tx) * (1 - ty), w01 = tx * (1 - ty), w10 = (1 - tx) * ty, w11 = tx * ty;
 
-				cell(k & 2 ? t1 : t0, f->stride, k & 1 ? cx1 : cx0, v);
-				c[0] += w * v[r];
-				c[2] += w * v[b];
-				for (int j = 0; j < 4; j++) {
-					c[1] += j != r && j != b ? w * v[j] * 0.5f : 0;
-				}
+			for (int k = 0; k < 3; k++) {
+				c[k] = w00 * lines[0][k][cx0] + w01 * lines[0][k][cx1] + w10 * lines[1][k][cx0] + w11 * lines[1][k][cx1];
 			}
+			c[1] *= 0.5f;
 			if (isp->lsc.on) {
 				lsc_at(isp, cells_w > 1 ? (float)cx0 / (cells_w - 1) : 0, v_at, gains);
 			}

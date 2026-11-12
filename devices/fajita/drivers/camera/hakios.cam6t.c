@@ -2901,7 +2901,12 @@ darwin_select(unsigned index, uint32_t mode_n)
 		 * photograph take a cell (2x2 pixels) a pixel from them; from the half-size modes (2328x1746, 2304x1728) it had
 		 * to blend four cells for each pixel, 120 ms a frame, and the preview kept up with one frame in four
 		 */
-		mode_n = index == 0 ? 9 : 0;    /* IMX519 4352x3264, IMX371 4608x3456, IMX376K 2592x1940 */
+		/*
+		 * (but not the IMX371's 4608x3456: its colour filter is four-cell -- a 2x2 of one colour, which Android's
+		 * remosaic node turns into a Bayer picture, its module file's "capability" 4 -- and cells of one colour each
+		 * made the preview grey; its binned 2304x1728 is Bayer)
+		 */
+		mode_n = index == 0 ? 9 : index == 2 ? 1 : 0;   /* IMX519 4352x3264, IMX371 2304x1728, IMX376K 2592x1940 */
 	}
 	darwin_index = index;
 	darwin_mode_n = mode_n;
