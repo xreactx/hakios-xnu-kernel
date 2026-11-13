@@ -21,6 +21,7 @@
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSBoolean.h>
+#include <libkern/c++/OSSerialize.h>
 #include <kern/thread_call.h>
 #include <sys/sysctl.h>
 #include <kern/thread.h>
@@ -202,6 +203,8 @@ static TUNABLE(uint32_t, gProbe, "fb_probe", 0);  /* (see scanProbe()) */
  */
 static TUNABLE(uint32_t, gFlip, "fb_flip", 0);
 static bool flipReady(uint64_t frontPhys, uint32_t rowBytes, uint32_t height, uint8_t * front);   /* (needs fb_map_mb=26) */
+static void panelLinkLock(void);
+static void panelLinkUnlock(void);
 static uint8_t * flipBack(void);
 static void flipShow(void);
 /*
@@ -448,6 +451,7 @@ public:
 	uint32_t        fRecCosted;             /* ... of how many frames: a line every 120 */
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
 	void publishRefresh(void);
 	MiniIOSurface * defaultSurface(void);
@@ -2045,10 +2049,326 @@ flipShow(void)
 	unsigned next = gFlipTarget;
 
 	__asm__ volatile ("dsb sy" ::: "memory");       /* (the write-combined frame out before the pipe reads it) */
+	panelLinkLock();
 	gFlipMdp[(FLIP_VIG0 + FLIP_SRC0_ADDR) / 4] = (uint32_t) gFlipPhys[next];
 	gFlipMdp[(FLIP_CTL0 + FLIP_CTL_FLUSH) / 4] = FLIP_VIG0_BIT;
 	__asm__ volatile ("dsb sy" ::: "memory");
+	panelLinkUnlock();
 	gFlipWritten = next;                            /* (shown once taken up: see flipBack()) */
+}
+
+/*
+ * The 6T's panel (soc_display=845): a Samsung S6E3FC2X01 in command mode on DSI 0 (0xae94000, Linux's mdss_dsi0;
+ * the phone's Android: "samsung_s6e3fc2x01_cmd_display"). Its brightness is DCS 0x51 with two bytes, high then low,
+ * 1 to 1023 (OnePlus's tree: qcom,mdss-bl-high2bit, bl-max-level 1023, mipi_dsi_dcs_set_display_brightness_samsung);
+ * off and on are DCS 0x28 + 0x10 and 0x11 + 0x29, between 9F A5 A5 and 9F 5A 5A as the tree's off and on
+ * sequences have them (dsi-panel-samsung_s6e3fc2x01.dtsi). A command goes through the controller's own FIFO
+ * (the test pattern generator's DMA FIFO, as Linux sends in a secure session: dsi_ctrl_hw_cmn.c,
+ * kickoff_fifo_command) -- nothing in memory for the controller to fetch. A packet there is a header word
+ * (data 0, data 1 -- or a long one's length --, data type, flags: 0x40 a payload follows, 0x80 the last one)
+ * and its payload padded to words with 0xff (dsi_ctrl.c, dsi_ctrl_copy_and_pad_cmd). Boot-arg fb_panel=0: no
+ * commands at all.
+ */
+#define DSI0_845                0x0ae94000
+#define DSI_HW_VERSION          0x000
+#define DSI_CTRL_REG            0x004
+#define DSI_CMD_DMA_CTRL        0x03c
+#define DSI_DMA_CMD_LENGTH      0x04c
+#define DSI_TRIG_CTRL           0x084
+#define DSI_CMD_DMA_SW_TRIGGER  0x090
+#define DSI_INT_CTRL            0x110
+#define DSI_TPG_CTRL            0x15c
+#define DSI_TPG_DMA_INIT_VAL    0x17c
+#define DSI_TPG_DMA_FIFO_RESET  0x1ec
+#define PANEL_LEVEL_MAX         1023
+
+static TUNABLE(uint32_t, gPanelCtl, "fb_panel", 1);
+static volatile uint32_t * gDsi;
+static IOLock * gPanelLock;
+static int gPanelState;                                 /* 0 not tried, 1 ready, -1 not to be used */
+static bool gPanelOff;                                  /* put to sleep (RequestPowerChange 0) */
+static uint32_t gPanelLevel;                            /* the brightness last asked for, 0 = never */
+static uint32_t gPanelSent, gPanelFailed, gPanelWaited;
+/*
+ * The link is the frames' and the commands' both: a command goes only while the controller sends no frame (as
+ * Linux waits, dsi_ctrl_hw_cmn_wait_for_cmd_mode_mdp_idle: DSI_STATUS bit 2, the MDP's command stream busy), and
+ * no frame is flushed to the pipe while a command goes (run 215251: a brightness sent across a frame froze the
+ * screen). gPanelLink is held for both; a flip waits at most the one command.
+ */
+#define DSI_STATUS_REG          0x008
+#define DSI_STATUS_MDP_BUSY     (1u << 2)
+#define DSI_STATUS_DMA_BUSY     (1u << 1)              /* (mdss_dsi_host.c: 0x02 the command DMA, 0x04 the MDP) */
+static IOSimpleLock * gPanelLink;
+
+static void
+panelLinkLock(void)
+{
+	if (gPanelLink != NULL) {
+		IOSimpleLockLock(gPanelLink);
+	}
+}
+
+static void
+panelLinkUnlock(void)
+{
+	if (gPanelLink != NULL) {
+		IOSimpleLockUnlock(gPanelLink);
+	}
+}
+
+/* Until the controller sends no frame (the pipe's last flush taken up and its frame out), at most 100 ms. */
+static bool
+panelLinkIdle(void)
+{
+	for (uint32_t us = 0; us < 100000; us += 20) {
+		if (!(gDsi[DSI_STATUS_REG / 4] & (DSI_STATUS_MDP_BUSY | DSI_STATUS_DMA_BUSY)) &&
+		    (gFlipMdp == NULL || !(gFlipMdp[(FLIP_CTL0 + FLIP_CTL_FLUSH) / 4] & FLIP_VIG0_BIT))) {
+			if (us != 0) {
+				gPanelWaited++;
+			}
+			return true;
+		}
+		IODelay(20);
+	}
+	return false;
+}
+
+static bool
+panelReady(void)
+{
+	volatile uint32_t * gcc, * dispcc;
+
+	if (gPanelState != 0) {
+		return gPanelState > 0;
+	}
+	gPanelState = -1;
+	if (gSocDisplay != 845 || gPanelCtl == 0) {
+		return false;
+	}
+	gcc = (volatile uint32_t *) ml_io_map(SCAN_GCC + SCAN_845_GCC_DISP_AHB_CBCR, 4);
+	dispcc = (volatile uint32_t *) ml_io_map(SCAN_DISPCC + SCAN_845_DISPCC_MDSS_AHB_CBCR, 4);
+	gDsi = (volatile uint32_t *) ml_io_map(DSI0_845, 0x400);
+	if (gcc == NULL || dispcc == NULL || gDsi == NULL) {
+		hakios_tl("fb_panel: the DSI controller cannot be mapped\n");
+		return false;
+	}
+	*gcc |= 1;
+	*dispcc |= 1;
+	IODelay(100);
+	hakios_tl("fb_panel: DSI 0 version %#x, control %#x, command DMA %#x, triggers %#x, interrupts %#x\n",
+	    gDsi[DSI_HW_VERSION / 4], gDsi[DSI_CTRL_REG / 4], gDsi[DSI_CMD_DMA_CTRL / 4], gDsi[DSI_TRIG_CTRL / 4],
+	    gDsi[DSI_INT_CTRL / 4]);
+	if ((gDsi[DSI_CTRL_REG / 4] & 0x5) != 0x5) {
+		hakios_tl("fb_panel: the controller is not on in command mode: no panel commands\n");
+		return false;
+	}
+	if ((gDsi[DSI_TRIG_CTRL / 4] & 0x7) != 0x4) {
+		hakios_tl("fb_panel: the command DMA's trigger was %u: now the software's (4)\n", gDsi[DSI_TRIG_CTRL / 4] & 0x7);
+		gDsi[DSI_TRIG_CTRL / 4] = (gDsi[DSI_TRIG_CTRL / 4] & ~0x7u) | 0x4;
+	}
+	gPanelState = 1;
+	return true;
+}
+
+/* One packet: its data type, then its bytes. Low-power mode or not. Under gPanelLock. */
+static bool
+panelSend(bool lp, uint8_t type, const uint8_t * data, uint32_t length)
+{
+	uint8_t packet[64];
+	uint32_t size, words, i;
+	uint64_t deadline;
+	bool done = false;
+
+	if (length + 4 > sizeof(packet)) {
+		return false;
+	}
+	if (type == 0x39 || type == 0x29) {                     /* long: the length in the header, the bytes after it */
+		packet[0] = length & 0xff;
+		packet[1] = length >> 8;
+		packet[2] = type;
+		packet[3] = 0x40 | 0x80;
+		memcpy(packet + 4, data, length);
+		size = (4 + length + 3) & ~3u;
+		memset(packet + 4 + length, 0xff, size - 4 - length);
+	} else {                                                /* short: up to two bytes in the header */
+		packet[0] = length > 0 ? data[0] : 0;
+		packet[1] = length > 1 ? data[1] : 0;
+		packet[2] = type;
+		packet[3] = 0x80;
+		size = 4;
+	}
+	words = size / 4;
+	panelLinkLock();
+	if (!panelLinkIdle()) {
+		panelLinkUnlock();
+		if (gPanelFailed++ < 8) {
+			hakios_tl("fb_panel: command %#x not sent: the link stayed busy 100 ms (status %#x)\n",
+			    length > 0 ? data[0] : 0, gDsi[DSI_STATUS_REG / 4]);
+		}
+		return false;
+	}
+	gDsi[DSI_TPG_CTRL / 4] = (1u << 1) | (1u << 2) | (3u << 16);
+	for (i = 0; i < words; i++) {
+		uint32_t w;
+
+		memcpy(&w, packet + 4 * i, 4);
+		gDsi[DSI_TPG_DMA_INIT_VAL / 4] = w;
+	}
+	if (words & 1) {
+		gDsi[DSI_TPG_DMA_INIT_VAL / 4] = 0;
+	}
+	{
+		uint32_t ctrl = gDsi[DSI_CMD_DMA_CTRL / 4] & ~((1u << 31) | (1u << 30));
+
+		(void) lp;                              /* (always low-power, as UEFI left it: 0x14000000) */
+		gDsi[DSI_CMD_DMA_CTRL / 4] = ctrl | (1u << 28) | (1u << 26);
+	}
+	gDsi[DSI_DMA_CMD_LENGTH / 4] = size;
+	gDsi[DSI_INT_CTRL / 4] = (gDsi[DSI_INT_CTRL / 4] & ~0x55555555u) | 1;    /* (only the DMA's done cleared) */
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gDsi[DSI_CMD_DMA_SW_TRIGGER / 4] = 1;
+	clock_interval_to_deadline(50, kMillisecondScale, &deadline);
+	while (mach_absolute_time() < deadline) {
+		if (gDsi[DSI_INT_CTRL / 4] & 1) {
+			done = true;
+			break;
+		}
+		IODelay(20);
+	}
+	gDsi[DSI_INT_CTRL / 4] = (gDsi[DSI_INT_CTRL / 4] & ~0x55555555u) | 1;
+	gDsi[DSI_TPG_CTRL / 4] = 0;
+	gDsi[DSI_TPG_DMA_FIFO_RESET / 4] = 1;
+	IODelay(1);
+	gDsi[DSI_TPG_DMA_FIFO_RESET / 4] = 0;
+	panelLinkUnlock();
+	if (done) {
+		gPanelSent++;
+	} else if (gPanelFailed++ < 8) {
+		hakios_tl("fb_panel: command %#x (type %#x, %u bytes) not sent in 50 ms (interrupts %#x, status %#x)\n",
+		    length > 0 ? data[0] : 0, type, length, gDsi[DSI_INT_CTRL / 4], gDsi[0x008 / 4]);
+	}
+	return done;
+}
+
+static void
+panelLock(bool wait)
+{
+	if (gPanelLock == NULL) {
+		return;
+	}
+	if (wait) {
+		IOLockLock(gPanelLock);
+	} else if (!IOLockTryLock(gPanelLock)) {
+		return;                 /* (the run's end: the others are stopped, whoever had it) */
+	}
+}
+
+static void
+panelUnlock(void)
+{
+	if (gPanelLock != NULL) {
+		IOLockUnlock(gPanelLock);
+	}
+}
+
+static const uint8_t kPanelKeyOn[] = { 0x9f, 0xa5, 0xa5 }, kPanelKeyOff[] = { 0x9f, 0x5a, 0x5a };
+
+static void
+panelBrightnessLocked(uint32_t level)
+{
+	uint8_t bytes[3] = { 0x51, (uint8_t) (level >> 8), (uint8_t) level };
+
+	panelSend(false, 0x39, bytes, sizeof(bytes));
+}
+
+/* Brightness 0 (dark) to 1023. */
+static void
+panelBrightness(uint32_t level)
+{
+	static uint32_t told;
+
+	if (level > PANEL_LEVEL_MAX) {
+		level = PANEL_LEVEL_MAX;
+	}
+	if (!panelReady()) {
+		return;
+	}
+	panelLock(true);
+	if (told++ < 6 || (told & 63) == 0) {
+		hakios_tl("fb_panel: brightness %u of %u%s (%u sent, %u failed, %u waited for a frame)\n", level, PANEL_LEVEL_MAX,
+		    gPanelOff ? ", kept for when it is on" : "", gPanelSent, gPanelFailed, gPanelWaited);
+	}
+	gPanelLevel = level == 0 ? 1 : level;   /* (0 is remembered as the dimmest: never "never asked") */
+	if (!gPanelOff) {
+		panelBrightnessLocked(level);
+	}
+	panelUnlock();
+}
+
+static void
+panelPowerLocked(bool on)
+{
+	static const uint8_t displayOff[] = { 0x28 }, sleepIn[] = { 0x10 }, sleepOut[] = { 0x11, 0x00 }, displayOn[] = { 0x29 };
+
+	if (on == !gPanelOff) {
+		return;
+	}
+	if (on) {
+		panelSend(true, 0x39, kPanelKeyOn, sizeof(kPanelKeyOn));
+		panelSend(true, 0x05, sleepOut, sizeof(sleepOut));
+		IOSleep(120);
+		panelSend(true, 0x05, displayOn, sizeof(displayOn));
+		panelSend(true, 0x39, kPanelKeyOff, sizeof(kPanelKeyOff));
+		gPanelOff = false;
+		if (gPanelLevel != 0) {
+			panelBrightnessLocked(gPanelLevel);
+		}
+	} else {
+		panelSend(false, 0x39, kPanelKeyOn, sizeof(kPanelKeyOn));
+		panelSend(false, 0x05, displayOff, sizeof(displayOff));
+		IODelay(10000);
+		panelSend(false, 0x05, sleepIn, sizeof(sleepIn));
+		panelSend(false, 0x39, kPanelKeyOff, sizeof(kPanelKeyOff));
+		gPanelOff = true;
+	}
+}
+
+static void
+panelPower(bool on)
+{
+	if (!panelReady()) {
+		return;
+	}
+	panelLock(true);
+	hakios_tl("fb_panel: the panel %s (%u sent, %u failed)\n", on ? "ON" : "OFF", gPanelSent, gPanelFailed);
+	panelPowerLocked(on);
+	panelUnlock();
+}
+
+/* The run's end (osfmk/arm64/loader_return.c): the panel on and bright for the loader, if this kernel changed it. */
+extern "C" void
+hakios_fb_quiesce(void)
+{
+	if (gPanelState <= 0) {
+		return;
+	}
+	panelLock(false);
+	gPanelLink = NULL;              /* (the other processors are stopped: one may have stopped holding it) */
+	if (gPanelOff) {
+		/* (no sleeping here: the 120 ms after sleep-out by the clock) */
+		static const uint8_t sleepOut[] = { 0x11, 0x00 }, displayOn[] = { 0x29 };
+
+		panelSend(true, 0x39, kPanelKeyOn, sizeof(kPanelKeyOn));
+		panelSend(true, 0x05, sleepOut, sizeof(sleepOut));
+		IODelay(120000);
+		panelSend(true, 0x05, displayOn, sizeof(displayOn));
+		panelSend(true, 0x39, kPanelKeyOff, sizeof(kPanelKeyOff));
+		gPanelOff = false;
+	}
+	if (gPanelLevel != 0) {
+		panelBrightnessLocked(PANEL_LEVEL_MAX);
+	}
+	hakios_tl("fb_panel: left on at full brightness for the loader (%u commands sent, %u failed)\n", gPanelSent, gPanelFailed);
 }
 
 /* The start of the first even-numbered scan at least `after` (mach_absolute_time); 0 if the counters cannot be had. */
@@ -2223,8 +2543,12 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	case kFBMethodSwapSignal:
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
-	case kFBMethodRequestPowerChange:
 	case kFBMethodChangeFrameInfo:
+		return kIOReturnSuccess;
+	case kFBMethodRequestPowerChange:               /* in: 1 on, 0 off (backboardd: the screen lit or dark) */
+		if (args->scalarInputCount >= 1) {
+			panelPower(in[0] != 0);
+		}
 		return kIOReturnSuccess;
 
 	case kFBMethodNotifications:                    /* in: callback (0 = off), its argument, type, 0 */
@@ -2372,6 +2696,134 @@ publishAccelerator(IOService * provider)
 }
 
 /*
+ * What asks for brightness, logged (the first fb_proplog=N times each, default 40): CoreBrightness sets it on the
+ * backlight service below or on the framebuffer (IOMFBBrightnessLevel); which, and in what units, as seen.
+ */
+static TUNABLE(uint32_t, gPropLog, "fb_proplog", 40);
+
+static void
+logProperties(const char * who, OSObject * properties)
+{
+	static uint32_t logged;
+	OSSerialize * text;
+
+	if (logged >= gPropLog || (text = OSSerialize::withCapacity(512)) == NULL) {
+		return;
+	}
+	logged++;
+	if (properties->serialize(text)) {
+		char procname[32] = "?";
+
+		proc_selfname(procname, sizeof(procname));
+		hakios_tl("fb_panel: %s[%d] sets on %s: %.700s\n", procname, proc_selfpid(), who, text->text());
+	}
+	text->release();
+}
+
+/* A number from a dictionary, directly or as a parameter's {value} (IODisplayParameters' style). */
+static bool
+numberIn(OSDictionary * dict, const char * key, uint64_t * value)
+{
+	OSObject * o = dict->getObject(key);
+	OSDictionary * d = OSDynamicCast(OSDictionary, o);
+	OSNumber * n = OSDynamicCast(OSNumber, o);
+
+	if (n == NULL && d != NULL) {
+		n = OSDynamicCast(OSNumber, d->getObject("value"));
+	}
+	if (n == NULL) {
+		return false;
+	}
+	*value = n->unsigned64BitValue();
+	return true;
+}
+
+IOReturn
+IOMobileFramebuffer::setProperties(OSObject * properties)
+{
+	logProperties("disp0", properties);
+	return kIOReturnSuccess;
+}
+
+/*
+ * The backlight: CoreBrightness's CBDisplayContaineriOS looks for a service of this class (and UserEventAgent
+ * watches it); its brightness parameter in IODisplayParameters, 0 to 1023 here, the panel's own range.
+ */
+class AppleARMBacklight : public IOService
+{
+	OSDeclareDefaultStructors(AppleARMBacklight);
+public:
+	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
+};
+
+OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+
+static OSDictionary *
+displayParameters(uint64_t value)
+{
+	OSDictionary * params = OSDictionary::withCapacity(1);
+	OSDictionary * brightness = OSDictionary::withCapacity(3);
+
+	if (params != NULL && brightness != NULL) {
+		setNumber(brightness, "min", 0);
+		setNumber(brightness, "max", PANEL_LEVEL_MAX);
+		setNumber(brightness, "value", value);
+		params->setObject("brightness", brightness);
+	}
+	OSSafeReleaseNULL(brightness);
+	return params;
+}
+
+IOReturn
+AppleARMBacklight::setProperties(OSObject * properties)
+{
+	OSDictionary * dict = OSDynamicCast(OSDictionary, properties), * params;
+	uint64_t value;
+
+	logProperties("backlight", properties);
+	if (dict == NULL) {
+		return kIOReturnBadArgument;
+	}
+	params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
+	if (numberIn(dict, "brightness", &value) || (params != NULL && numberIn(params, "brightness", &value))) {
+		OSDictionary * now = displayParameters(value > PANEL_LEVEL_MAX ? PANEL_LEVEL_MAX : value);
+
+		panelBrightness((uint32_t) value);
+		if (now != NULL) {
+			setProperty("IODisplayParameters", now);
+			now->release();
+		}
+	}
+	return kIOReturnSuccess;
+}
+
+static void
+publishBacklight(IOService * provider)
+{
+	AppleARMBacklight * backlight;
+	OSDictionary * params;
+
+	if (gSocDisplay != 845 || gPanelCtl == 0) {
+		return;
+	}
+	gPanelLock = IOLockAlloc();
+	gPanelLink = IOSimpleLockAlloc();
+	backlight = OSTypeAlloc(AppleARMBacklight);
+	if (backlight != NULL && backlight->init() && backlight->attach(provider)) {
+		backlight->setName("backlight");
+		backlight->setProperty("backlight-control", kOSBooleanTrue);
+		params = displayParameters(PANEL_LEVEL_MAX / 2);
+		if (params != NULL) {
+			backlight->setProperty("IODisplayParameters", params);
+			params->release();
+		}
+		backlight->registerService();
+		IOLog("MiniIOMobileFramebuffer: the backlight published (the 6T's panel, 0 to %u)\n", PANEL_LEVEL_MAX);
+	}
+	OSSafeReleaseNULL(backlight);
+}
+
+/*
  * A picture from inside the kernel (the GPU driver's first ones): rows of 32-bit pixels, put at
  * the top left corner of the panel as they are and cut to its size.
  */
@@ -2402,6 +2854,7 @@ MiniIOMobileFramebufferStart(IOService * provider)
 	if (fb->start(provider)) {
 		publishDisplayNode();
 		publishAccelerator(provider);
+		publishBacklight(provider);
 	} else {
 		fb->detach(provider);
 	}

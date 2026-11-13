@@ -124,8 +124,10 @@ FB_HZ	arg	fb_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp
 FB_INTF	arg	fb_intf	GPU and display	k	MiniIOMobileFramebuffer.cpp	the registers of the display interface the panel is on, for a port
 FB_MAP_MB	arg	fb_map_mb	GPU and display	k	(patch),MiniIOMobileFramebuffer.cpp	
 FB_MEASURE	arg	fb_measure	GPU and display	k	MiniIOMobileFramebuffer.cpp	how often the panel is really refreshed
+FB_PANEL	arg	fb_panel	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_PRI	arg	fb_pri	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_PROBE	arg	fb_probe	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_PROPLOG	arg	fb_proplog	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_QUEUE	arg	fb_queue	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_SCAN	arg	fb_scan	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_THREADS	arg	fb_threads	GPU and display	k	MiniIOMobileFramebuffer.cpp	

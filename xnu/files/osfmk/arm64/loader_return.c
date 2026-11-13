@@ -66,6 +66,7 @@ extern void hakios_haptic_quiesce(void);
 extern void hakios_synaptics_quiesce(void);
 extern void hakios_torch_quiesce(void);
 extern void hakios_camera_quiesce(void);
+extern void hakios_fb_quiesce(void);
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
 extern void hakios_var_save_on_return(void);   /* drivers/storage/hakios.ufs.c: the data volume into the flash */
@@ -398,6 +399,7 @@ loader_return(void)
 	hakios_synaptics_quiesce();    /* the touch chip's power and reset pins as they were found */
 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
 	hakios_camera_quiesce();       /* the camera powered down, if it was powered up */
+	hakios_fb_quiesce();           /* the 6T's panel on and bright again, if this kernel dimmed it or put it to sleep */
 	hakios_mic_quiesce();          /* (what the microphones' path did, said again: it happens in the log's middle) */
 	/*
 	 * A panic's text is first collected in the panic buffer and only later

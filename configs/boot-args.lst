@@ -133,8 +133,10 @@ fb_hz	k
 fb_intf	k
 fb_map_mb	k
 fb_measure	k
+fb_panel	k
 fb_pri	k
 fb_probe	k
+fb_proplog	k
 fb_queue	k
 fb_scan	k
 fb_threads	k
