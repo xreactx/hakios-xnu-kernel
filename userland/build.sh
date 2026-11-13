@@ -162,6 +162,11 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.app.dylib Sileo VoiceMemos
 /redwood/lib/libhakios.tweaks.dylib Preferences
 /redwood/lib/libhakios.bluetool.dylib BlueTool"}
+# (with the 6T's GPS, LOCATIOND=1: Settings, Maps and locationd are told by MobileGestalt that there is one --
+# src/inject_loc.c, which in Settings opens the tweak loader in its turn)
+if [ "${LOCATIOND-0}" != 0 ]; then
+	INJECT=$(printf '%s\n' "$INJECT" | sed 's|^/redwood/lib/libhakios.tweaks.dylib Preferences$|/redwood/lib/libhakios.loc.dylib Preferences Maps locationd|')
+fi
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -279,6 +284,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.bluetool.dylib -framework CoreFoundation \
 			-lMobileGestalt -o obj/libhakios.bluetool.dylib src/inject_bluetool.c
 		# ... and inside an application, to say what killed it (src/inject_app.c)
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.loc.dylib -framework CoreFoundation -lMobileGestalt -lobjc \
+			-o obj/libhakios.loc.dylib src/inject_loc.c
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -lobjc \
 			-o obj/libhakios.app.dylib src/inject_app.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
@@ -407,6 +414,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	cp obj/libhakios.dylib obj/libhakios.sb.dylib root/lib/
 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
+	[ -f obj/libhakios.loc.dylib ] && cp obj/libhakios.loc.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
 	[ -f obj/libhakios.bluetool.dylib ] && cp obj/libhakios.bluetool.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
