@@ -6286,6 +6286,8 @@ radio_name(uint8_t radio)
 }
 
 static void wds_advance(void);
+static void loc_open(void);
+static void loc_advance(void);
 static volatile bool wds_registered;      /* NAS says the modem is registered (set by nas_changed) */
 static void probe_dump(const char *who, const uint8_t *m, size_t length);
 
@@ -7222,6 +7224,7 @@ step_nas(void)
 		sim_probe_open();
 	}
 	wds_open();
+	loc_open();
 	began = now_us();
 	while (now_us() - began < wait_seconds * 1000000ull) {
 		if (online && !is_online && dms_port_number != 0 && now_us() - asked_online > 5000000ull) {
@@ -7260,6 +7263,7 @@ step_nas(void)
 			nas_polls += hakios_nas_client_poll(&nas) == 0;
 		}
 		wds_advance();          /* bind / start / retry the data session on its own clock */
+		loc_advance();
 		sleep_ms(1000);
 		if (nas.state.registered && nas.state.has_signal) {
 			if (!registered) {
@@ -7298,6 +7302,367 @@ step_nas(void)
 	return nas.connected;
 }
 
+
+/* ---- GNSS: the modem's location service (QMI LOC, 0x10) ------------------------------------------- */
+
+/*
+ * The SDM845's GPS receiver is the modem's; Android's GNSS HAL reaches it through QMI LOC (Qualcomm's
+ * loc_api_v02.h; libqmi's qmi-service-loc.json). Here, unless gnss=0: the events wanted are registered
+ * (0x21: position reports, satellites, NMEA, the engine's and the session's states, time requests), the
+ * engine lock lifted (0x3a: none), the operation mode made standalone (0x4a: 4 -- no assistance server
+ * here), the time given (0x38: UTC in ms, from the calendar the loader set) and a periodic session started
+ * (0x22: session 1, every second, high accuracy, intermediate reports). Every report is logged (the first
+ * gnss_log=N in full, default 30; then one in 30) and the last fix is kept for the system:
+ * kern.hakios.gnss_fix (0 none, 1 intermediate, 2 final), gnss_lat_e7, gnss_lon_e7 (degrees x 10^7),
+ * gnss_acc_cm (circular horizontal uncertainty), gnss_alt_cm, gnss_speed_cmps, gnss_heading_e1 (degrees x 10),
+ * gnss_time_ms (the fix's UTC, ms since 1970), gnss_svs (satellites seen in the last report), gnss_fixes.
+ * The numbers come as IEEE floats and doubles: turned into integers by hand (no floating point in the kernel).
+ */
+#define QMI_LOC                         0x10
+#define LOC_REG_EVENTS                  0x0021
+#define LOC_START                       0x0022
+#define LOC_STOP                        0x0023
+#define LOC_POSITION_REPORT             0x0024
+#define LOC_GNSS_SV_INFO                0x0025
+#define LOC_NMEA                        0x0026
+#define LOC_INJECT_TIME_REQ             0x0028
+#define LOC_ENGINE_STATE                0x002b
+#define LOC_FIX_SESSION_STATE           0x002c
+#define LOC_INJECT_UTC_TIME             0x0038
+#define LOC_SET_ENGINE_LOCK             0x003a
+#define LOC_SET_OPERATION_MODE          0x004a
+
+static struct hakios_qrtr_port *loc_port;
+static uint32_t loc_node, loc_port_number;
+static volatile int loc_stage;                  /* 0 not asked, 1 registered, 2 started */
+static volatile bool loc_time_wanted;
+static uint64_t loc_asked_at, loc_began;
+static uint16_t loc_transaction = 0x100;
+static uint32_t loc_reports, loc_logged, loc_nmea, loc_svinfo;
+static int gnss_fix, gnss_lat_e7, gnss_lon_e7, gnss_acc_cm, gnss_alt_cm, gnss_speed_cmps, gnss_heading_e1, gnss_svs, gnss_fixes;
+static int64_t gnss_time_ms;
+
+SYSCTL_INT(_kern_hakios, OID_AUTO, gnss_fix, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_fix, 0, "the last fix: 0 none, 1 intermediate, 2 final");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gnss_lat_e7, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_lat_e7, 0, "latitude, degrees x 10^7");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gnss_lon_e7, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_lon_e7, 0, "longitude, degrees x 10^7");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gnss_acc_cm, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_acc_cm, 0, "horizontal uncertainty, cm");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gnss_alt_cm, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_alt_cm, 0, "altitude over the ellipsoid, cm");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gnss_speed_cmps, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_speed_cmps, 0, "horizontal speed, cm/s; -1 unknown");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gnss_heading_e1, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_heading_e1, 0, "heading, degrees x 10; -1 unknown");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gnss_svs, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_svs, 0, "satellites in the last report");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gnss_fixes, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_fixes, 0, "fixes reported so far");
+SYSCTL_QUAD(_kern_hakios, OID_AUTO, gnss_time_ms, CTLFLAG_RD | CTLFLAG_LOCKED, &gnss_time_ms, "the last fix's UTC, ms since 1970");
+
+/* An IEEE double (its bits) times `scale`, rounded toward zero; |value * scale| must fit in 63 bits. */
+static int64_t
+ieee64_scaled(uint64_t bits, uint64_t scale)
+{
+	int exponent = (int)((bits >> 52) & 0x7ff);
+	uint64_t mantissa = bits & ((1ULL << 52) - 1);
+	__uint128_t product;
+	int64_t v;
+
+	if (exponent == 0 || exponent == 0x7ff) {
+		return 0;                               /* (zero, tiny, infinite or not a number: 0) */
+	}
+	mantissa |= 1ULL << 52;
+	product = (__uint128_t)mantissa * scale;
+	exponent -= 1075;                               /* value = mantissa x 2^exponent */
+	if (exponent >= 0) {
+		product = exponent < 40 ? product << exponent : 0;
+	} else {
+		product = -exponent < 128 ? product >> -exponent : 0;
+	}
+	v = (int64_t)(product > (__uint128_t)INT64_MAX ? INT64_MAX : (uint64_t)product);
+	return (bits >> 63) ? -v : v;
+}
+
+static int64_t
+ieee32_scaled(uint32_t bits, uint64_t scale)
+{
+	uint32_t exponent = (bits >> 23) & 0xff;
+
+	if (exponent == 0 || exponent == 0xff) {
+		return 0;
+	}
+	/* the same number as a double: sign, exponent rebiased, mantissa widened */
+	return ieee64_scaled(((uint64_t)(bits >> 31) << 63) | ((uint64_t)(exponent - 127 + 1023) << 52) |
+	    ((uint64_t)(bits & 0x7fffff) << 29), scale);
+}
+
+static uint64_t
+le64(const uint8_t *v)
+{
+	uint64_t x = 0;
+
+	for (int i = 7; i >= 0; i--) {
+		x = x << 8 | v[i];
+	}
+	return x;
+}
+
+static void
+loc_send(uint16_t message, const uint8_t *tlvs, uint16_t length)
+{
+	uint8_t m[7 + 64];
+
+	if (loc_port == NULL || loc_port_number == 0 || length > 64) {
+		return;
+	}
+	m[0] = QMI_REQUEST;
+	m[1] = loc_transaction & 0xff; m[2] = loc_transaction >> 8;
+	loc_transaction++;
+	m[3] = message & 0xff; m[4] = message >> 8;
+	m[5] = length & 0xff; m[6] = length >> 8;
+	memcpy(m + 7, tlvs, length);
+	qrtr_send(loc_port, loc_node, loc_port_number, m, 7u + length);
+}
+
+static void
+loc_inject_time(void)
+{
+	clock_sec_t secs;
+	clock_usec_t usecs;
+	uint64_t ms;
+	uint8_t t[3 + 8 + 3 + 4];
+
+	clock_get_calendar_microtime(&secs, &usecs);
+	ms = (uint64_t)secs * 1000 + usecs / 1000;
+	if (secs < 1700000000) {
+		tell("mpss: gnss: the calendar is not set (%lu s): no time given\n", (unsigned long)secs);
+		return;
+	}
+	t[0] = 0x01; t[1] = 8; t[2] = 0;
+	for (int i = 0; i < 8; i++) {
+		t[3 + i] = (uint8_t)(ms >> (8 * i));
+	}
+	t[11] = 0x02; t[12] = 4; t[13] = 0;
+	t[14] = 0x10; t[15] = 0x27; t[16] = 0; t[17] = 0;       /* uncertain by 10 s */
+	loc_send(LOC_INJECT_UTC_TIME, t, sizeof(t));
+	tell("mpss: gnss: the time given: %llu ms since 1970 (uncertain by 10 s)\n", ms);
+}
+
+static void
+loc_position(const uint8_t *m, size_t length)
+{
+	uint16_t size;
+	const uint8_t *v;
+	uint32_t status = ~0u;
+	int64_t lat = 0, lon = 0;
+	int acc = -1, alt = 0, speed = -1, heading = -1;
+	bool has_lat = false, has_lon = false;
+	uint64_t utc = 0;
+
+	loc_reports++;
+	if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 4) {
+		status = le32(v);
+	}
+	if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 8) {
+		lat = ieee64_scaled(le64(v), 10000000);
+		has_lat = true;
+	}
+	if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 8) {
+		lon = ieee64_scaled(le64(v), 10000000);
+		has_lon = true;
+	}
+	if ((v = qmi_tlv(m, length, 0x12, &size)) != NULL && size >= 4) {
+		acc = (int)ieee32_scaled(le32(v), 100);
+	}
+	if ((v = qmi_tlv(m, length, 0x18, &size)) != NULL && size >= 4) {
+		speed = (int)ieee32_scaled(le32(v), 100);
+	}
+	if ((v = qmi_tlv(m, length, 0x1a, &size)) != NULL && size >= 4) {
+		alt = (int)ieee32_scaled(le32(v), 100);
+	}
+	if ((v = qmi_tlv(m, length, 0x1d, &size)) != NULL && size >= 4) {
+		heading = (int)ieee32_scaled(le32(v), 10);
+	}
+	if ((v = qmi_tlv(m, length, 0x1f, &size)) != NULL && size >= 8) {
+		utc = le64(v);
+	}
+	/* (a report without an uncertainty is the engine's remembered position, not a fix: run 223834's first ten were that,
+	 * hundreds of km off, until the first real one 10 s in) */
+	if ((status == 0 || status == 1) && has_lat && has_lon && (lat != 0 || lon != 0) && acc > 0) {
+		gnss_lat_e7 = (int)lat;
+		gnss_lon_e7 = (int)lon;
+		gnss_acc_cm = acc;
+		gnss_alt_cm = alt;
+		gnss_speed_cmps = speed;
+		gnss_heading_e1 = heading;
+		gnss_time_ms = (int64_t)utc;
+		gnss_fix = status == 0 ? 2 : 1;
+		if (gnss_fixes++ == 0) {
+			tell("mpss: gnss: FIRST FIX %llu s after the session started\n", (now_us() - loc_began) / 1000000);
+		}
+	}
+	if (loc_logged < 30 || (loc_reports % 30) == 0) {
+		loc_logged++;
+		/* (the position is logged to 0.001 degree only: about 100 m) */
+		tell("mpss: gnss: report %u: status %u (0 final, 1 intermediate, 2 failure, 3 timeout), %s%lld.%03lld, %lld.%03lld, "
+		    "uncertain %d m, altitude %d m, speed %d cm/s, %u satellites\n", loc_reports, status, has_lat ? "" : "(no position) ",
+		    lat / 10000000, (lat < 0 ? -lat : lat) % 10000000 / 10000, lon / 10000000, (lon < 0 ? -lon : lon) % 10000000 / 10000,
+		    acc < 0 ? -1 : acc / 100, alt / 100, speed, gnss_svs);
+	}
+}
+
+static void
+loc_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	uint16_t message, size;
+	const uint8_t *v;
+
+	if (length < 7) {
+		return;
+	}
+	message = (uint16_t)(m[3] | m[4] << 8);
+	if (m[0] == QMI_RESPONSE) {
+		uint16_t result = 0xffff, error = 0xffff;
+
+		if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
+			result = (uint16_t)(v[0] | v[1] << 8);
+			error = (uint16_t)(v[2] | v[3] << 8);
+		}
+		tell("mpss: gnss: message %#x answered: result %u, error %u\n", message, result, error);
+		if (message == LOC_REG_EVENTS && result == 0 && loc_stage == 0) {
+			loc_stage = 1;
+		} else if (message == LOC_START && result == 0) {
+			loc_stage = 2;
+		}
+		return;
+	}
+	switch (message) {
+	case LOC_POSITION_REPORT:
+		loc_position(m, length);
+		break;
+	case LOC_GNSS_SV_INFO:
+		/* TLV 0x10: a count, then per satellite 28 bytes (libqmi's "List": validity mask, system, PRN, health, process
+		 * status, ephemeris/almanac, elevation, azimuth, SNR); only how many is kept */
+		if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 1) {
+			gnss_svs = v[0];
+		}
+		if (loc_svinfo++ < 3 || (loc_svinfo % 60) == 0) {
+			tell("mpss: gnss: satellites: %d in view (report %u)\n", gnss_svs, loc_svinfo);
+		}
+		break;
+	case LOC_NMEA:
+		if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size > 0) {
+			char line[100];
+			uint16_t n = size < sizeof(line) - 1 ? size : sizeof(line) - 1;
+
+			memcpy(line, v, n);
+			line[n] = 0;
+			while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == '\n' || line[n - 1] == 0)) {
+				line[--n] = 0;
+			}
+			/* the fix's own lines (GGA, RMC) only: the position in them is cut to whole degrees */
+			if ((strncmp(line + 3, "GGA", 3) == 0) && (loc_nmea++ < 5 || (loc_nmea % 60) == 0)) {
+				const char *rest = line;
+
+				for (int commas = 0; commas < 6 && rest != NULL; commas++) {
+					rest = strchr(rest, ',');
+					rest = rest != NULL ? rest + 1 : NULL;
+				}
+				tell("mpss: gnss: NMEA %.6s ... fix quality, satellites used, HDOP...: %s\n", line, rest != NULL ? rest : "");
+			}
+		}
+		break;
+	case LOC_INJECT_TIME_REQ:
+		loc_time_wanted = true;
+		break;
+	case LOC_ENGINE_STATE:
+	case LOC_FIX_SESSION_STATE:
+		if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 4) {
+			tell("mpss: gnss: the %s is %u (1 on, 2 off / 1 started, 2 finished)\n", message == LOC_ENGINE_STATE ? "engine" :
+			    "fix session", le32(v));
+		}
+		break;
+	default:
+		if (m[0] == QMI_INDICATION && loc_logged < 40) {
+			loc_logged++;
+			if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 4) {
+				tell("mpss: gnss: notice %#x: status %u\n", message, le32(v));
+			} else {
+				tell("mpss: gnss: notice %#x (%zu bytes)\n", message, length);
+			}
+		}
+		break;
+	}
+}
+
+static void
+loc_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance, uint32_t node,
+    uint32_t port)
+{
+	if (service != QMI_LOC) {
+		return;
+	}
+	if (arrived) {
+		loc_node = node;
+		loc_port_number = port;
+		tell("mpss: gnss: the location service is there (node %u port %u)\n", node, port);
+	} else if (node == loc_node && port == loc_port_number) {
+		loc_node = loc_port_number = 0;
+		loc_stage = 0;
+	}
+}
+
+static void
+loc_open(void)
+{
+	uint32_t gnss = 1;              /* (on with the modem: gnss=0 leaves the GPS alone; the command line has no room) */
+
+	PE_parse_boot_argn("gnss", &gnss, sizeof(gnss));
+	if (loc_port != NULL || gnss == 0) {
+		return;
+	}
+	loc_port = qrtr_open(loc_receive, loc_server, NULL);
+	if (loc_port != NULL) {
+		qrtr_lookup(loc_port, QMI_LOC, 0, 0);
+	}
+}
+
+/* From the threads that poll NAS: register, then start; asked again every 5 s until answered. */
+static void
+loc_advance(void)
+{
+	if (loc_port == NULL || loc_port_number == 0) {
+		return;
+	}
+	if (loc_time_wanted) {
+		loc_time_wanted = false;
+		loc_inject_time();
+	}
+	if (loc_stage == 2 || now_us() - loc_asked_at < 5000000ull) {
+		return;
+	}
+	loc_asked_at = now_us();
+	if (loc_stage == 0) {
+		/* position 0x1, satellites 0x2, NMEA 0x4, time request 0x10, engine state 0x80, fix session state 0x100 */
+		static const uint8_t events[] = { 0x01, 8, 0, 0x97, 0x01, 0, 0, 0, 0, 0, 0 };
+		static const uint8_t unlock[] = { 0x01, 4, 0, 1, 0, 0, 0 };            /* lock: 1 none */
+		static const uint8_t standalone[] = { 0x01, 4, 0, 4, 0, 0, 0 };        /* mode: 4 standalone */
+
+		loc_send(LOC_SET_ENGINE_LOCK, unlock, sizeof(unlock));
+		loc_send(LOC_SET_OPERATION_MODE, standalone, sizeof(standalone));
+		loc_inject_time();
+		loc_send(LOC_REG_EVENTS, events, sizeof(events));
+		tell("mpss: gnss: events registered for, engine unlocked, standalone, time given\n");
+	} else {
+		static const uint8_t start[] = {
+			0x01, 1, 0, 1,                          /* session 1 */
+			0x10, 4, 0, 1, 0, 0, 0,                 /* recurrence: 1 periodic */
+			0x11, 4, 0, 3, 0, 0, 0,                 /* accuracy: 3 high */
+			0x12, 4, 0, 1, 0, 0, 0,                 /* intermediate reports: 1 on */
+			0x13, 4, 0, 0xe8, 0x03, 0, 0,           /* every 1000 ms */
+		};
+
+		loc_began = now_us();
+		loc_send(LOC_START, start, sizeof(start));
+		tell("mpss: gnss: THE POSITION SESSION IS ASKED TO START (every second, high accuracy)\n");
+	}
+}
+
 /* With modem=1: NAS asked every two seconds while the modem runs, on a thread of its own. */
 static volatile bool nas_wanted, nas_runs;
 
@@ -7308,6 +7673,7 @@ nas_thread(__unused void *parameter, __unused wait_result_t result)
 		if (nas_opened && nas.connected) {
 			nas_polls += hakios_nas_client_poll(&nas) == 0;
 		}
+		loc_advance();
 		for (unsigned ms = 0; ms < 2000 && nas_wanted; ms += 100) {
 			sleep_ms(100);
 		}

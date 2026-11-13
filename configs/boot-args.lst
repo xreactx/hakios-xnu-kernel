@@ -182,6 +182,7 @@ gltrace_shaders	u
 gltrace_uniforms	u
 glwait	u
 glyes	u
+gnss	k
 gpu	k
 gpu_cached	k
 gpu_exact	k

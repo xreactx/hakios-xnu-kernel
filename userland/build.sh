@@ -127,6 +127,14 @@ DARWIN_JOBS=${JOBS-"
 # (Count a QEMU run log with its duplicate lines removed: run-darwin.sh prints launchd's log twice.)
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && DARWIN_JOBS="$DARWIN_JOBS com.apple.wifid"
+# Darwin's location daemon, for the 6T's GPS (gnss=1: the modem's fixes, handed to it by src/gnssd.m, com.hakios.gnssd).
+# It was left out (mkjobs.py DENY) while no phone had a GPS. On by default for the 6T; LOCATIOND=0 leaves both out.
+[ -z "${LOCATIOND+set}" ] && { [ "${DEVICE:-}" = fajita ] && LOCATIOND=1 || LOCATIOND=0; }
+if [ "${LOCATIOND-0}" != 0 ]; then
+	DARWIN_JOBS="$DARWIN_JOBS com.apple.locationd"
+	export ALLOW="${ALLOW:+$ALLOW }locationd"
+	[ "${LOCLOG-0}" != 0 ] && OSLOG="${OSLOG-com.apple.backboardd} com.apple.locationd"
+fi
 # Darwin's own Bluetooth daemon, for the 6T's WCN3990 (devices/fajita/soc/drivers/bt/hakios.bt6t.c, bt6t=5): the kernel
 # brings the controller up and hands it over as /dev/cu.bluetooth with the IOService "bluetooth" (transport-encoding
 # 1, H4), which is how bluetoothd takes a UART controller. BLUETOOTHD=1 puts it in (BTLOG=1: its os_log on the console).
@@ -242,6 +250,10 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
+		# the 6T's GPS fixes handed to locationd as Xcode's simulated locations are (src/gnssd.m): signed with the entitlement
+		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/gnssd src/gnssd.m &&
+			{ ${LDID:-ldid} -Ssrc/gnssd.entitlements obj/gnssd 2>/dev/null ||
+			  echo "build.sh: no ldid: gnssd is unsigned, and locationd will not take its fixes"; }
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
 		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/battery_test.c &&
 			{ ${LDID:-ldid} -Ssrc/battery_test.entitlements obj/battery_test 2>/dev/null ||
@@ -378,6 +390,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
 	[ -f obj/fps_info ] && cp obj/fps_info root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
+	[ -f obj/gnssd ] && cp obj/gnssd root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
 	[ -f obj/wifipw_test ] && cp obj/wifipw_test root/bin/
@@ -489,9 +502,30 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	# and not by what select-system.py extracted here (--root-volume; seven jobs turn on the difference,
 	# fairplayd among them).
 	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
+	[ "${LOCATIOND-0}" != 0 ] && cp com.hakios.gnssd.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $DARWIN/rootfs.slt ] && VOLUME="--root-volume $DARWIN/rootfs.slt"
 	[ -n "$DARWIN_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $DARWIN/rootfs root/LaunchDaemons $DARWIN_JOBS
+	# locationd (LOCATIOND=1, the 6T): 31 MB, so not in the system image (select-system.py, BIG_PROGRAM; and the
+	# system image has no room left before the /private/var store at the end of system_a). It travels in the small
+	# image instead, zlib-compressed to about 12 MB, as /redwood/bin/locationd, and its job is pointed there. Taken
+	# out of the volume once (rootfs.dmg, 7-Zip) into sysimage/extra/.
+	if [ "${LOCATIOND-0}" != 0 ]; then
+		if [ ! -s $DARWIN/extra/usr/libexec/locationd ] && [ -f $DARWIN/rootfs.dmg ]; then
+			mkdir -p $DARWIN/extra
+			(cd $DARWIN/extra && $(command -v 7zz || command -v 7z) x -y ../rootfs.dmg usr/libexec/locationd >/dev/null)
+		fi
+		if [ -s $DARWIN/extra/usr/libexec/locationd ] && [ -f root/LaunchDaemons/com.apple.locationd.plist ]; then
+			cp $DARWIN/extra/usr/libexec/locationd root/bin/locationd
+			python3 -c 'import plistlib, sys
+p = sys.argv[1]; d = plistlib.load(open(p, "rb"))
+d["ProgramArguments"] = ["/redwood/bin/locationd"] + d.get("ProgramArguments", [])[1:]
+d.pop("Program", None)
+plistlib.dump(d, open(p, "wb"))' root/LaunchDaemons/com.apple.locationd.plist
+		else
+			echo "build.sh: no locationd (sysimage/rootfs.dmg is needed once): the GPS will reach no application" >&2
+		fi
+	fi
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
 # (it is the vendor's and never in the repository): the kernel's GPU bring-up, drivers/gpu/hakios.adreno.c, finds it in fw/
@@ -617,7 +651,7 @@ done
 # image, in /usr/local/redwood, with a link in their place here: the small image is loaded with the kernel, in the
 # 64 MB the loader takes for both (with them it grew from 6.6 to 26 MB).
 rm -rf big
-for f in $(cd root && find lib bin -type f -size +4M 2>/dev/null); do
+for f in $(cd root && find lib bin -type f -size +4M ! -name locationd 2>/dev/null); do
 	mkdir -p big/$(dirname $f)
 	mv root/$f big/$f
 	ln -s /usr/local/redwood/$f root/$f
