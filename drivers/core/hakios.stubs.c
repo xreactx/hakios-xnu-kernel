@@ -25,6 +25,7 @@
 /* the ends of a run (loader_return.c, the guards), which have no header of their own */
 void hakios_adsp_stop(void);
 void hakios_adsp_quiesce(void);
+void hakios_slpi_quiesce(void);
 void hakios_mpss_stop(void);
 void hakios_mpss_quiesce(void);
 void hakios_ddr_quiesce(void);
@@ -88,6 +89,11 @@ void HakiosWLANStart(__unused const char *interface, __unused const uint8_t *add
 void hakios_adsp_init(void) {}
 void hakios_adsp_stop(void) {}
 void hakios_adsp_quiesce(void) {}
+#endif
+
+#ifndef HAKIOS_SLPI
+void hakios_slpi_init(void) {}
+void hakios_slpi_quiesce(void) {}
 #endif
 
 #ifndef HAKIOS_MODEM

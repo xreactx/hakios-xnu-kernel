@@ -51,6 +51,7 @@ extern void hakios_wifi_stop(void);
 extern void hakios_wifi_quiesce(void);
 extern void hakios_adsp_stop(void);
 extern void hakios_adsp_quiesce(void);
+extern void hakios_slpi_quiesce(void);
 extern void hakios_mpss_stop(void);
 extern void hakios_mpss_quiesce(void);
 extern void hakios_ddr_quiesce(void);
@@ -385,6 +386,7 @@ loader_return(void)
 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	hakios_adsp_quiesce();         /* nor the audio DSP */
+	hakios_slpi_quiesce();         /* nor the sensors DSP (the 6T's SLPI) */
 	hakios_mpss_quiesce();         /* nor the modem */
 	hakios_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
 	hakios_thermal_quiesce();      /* (how warm the SDM845 got, said before its clocks go back down) */

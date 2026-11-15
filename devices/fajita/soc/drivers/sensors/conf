@@ -1,0 +1,6 @@
+# soc/drivers/sensors/conf: the SDM845's sensors DSP (SLPI), where the accelerometer and gyroscope are.
+
+driver SLPI
+	file    bsd/dev/hakios.slpi.c
+	help    the SLPI started and linked (slpi=1, slpi_step=N): the audio DSP's driver with the SLPI's numbers. Needs its
+	help    firmware from the phone (fw-sensors/, SENSORS=1 in userland/build.sh)

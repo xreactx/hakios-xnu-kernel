@@ -624,6 +624,14 @@ if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	# the OnePlus 6T's speaker amplifier: its set-up as Android's driver did it (tools/tfa-trace2replay.py; hakios.tfa9894.c)
 	[ ! -f ../fw-audio/tfa9894-coldboot.replay ] || install -m 0644 ../fw-audio/tfa9894-coldboot.replay root/fw/
 fi
+# ... and the 6T's sensors DSP (SLPI, devices/fajita/soc/drivers/sensors/hakios.slpi.c): slpi.mdt and its segments,
+# 7 MB, from ../fw-sensors (pulled from the phone's /vendor/firmware_mnt/image). On by default for the 6T when they are
+# there; SENSORS=0 leaves them out.
+[ -z "${SENSORS+set}" ] && { [ "${DEVICE:-}" = fajita ] && SENSORS=1 || SENSORS=0; }
+if [ "${SENSORS-0}" != 0 ] && [ -f ../fw-sensors/slpi.mdt ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-sensors/slpi.mdt ../fw-sensors/slpi.b[0-9][0-9] root/fw/
+fi
 # Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
 # device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone
 # slot on 19 October 2026. It is the vendor's and never in the repository, so a copy made with bare
