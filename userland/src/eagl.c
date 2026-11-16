@@ -249,7 +249,7 @@ struct eagl {
 	id object;                      /* the EAGLContext */
 	struct hakios_gl *gl;
 	unsigned long api;
-	struct image images[256];
+	struct image images[512];       /* (256 filled up after a rotation, run 192713: see image_sweep()) */
 	unsigned image_count;
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
@@ -528,12 +528,47 @@ image_of(struct eagl *e, GLuint texture)
 	return NULL;
 }
 
+/*
+ * The entries whose texture is gone. A texture deleted through this context's glDeleteTextures takes its entry with it
+ * (image_forget()), but CoreAnimation lets go of some another way -- a context sharing the textures, or the texture
+ * names simply never used again -- and after a rotation (new surfaces for every layer at the new size) the table was
+ * full: from then on a new surface's texture got no picture, and Calculator's keys came out white (run 192713). An entry
+ * whose texture GL no longer knows is let go here, when the table is full.
+ */
+static unsigned
+image_sweep(struct eagl *e)
+{
+	unsigned gone = 0;
+
+	for (unsigned i = 0; i < e->image_count;) {
+		if (!glIsTexture(e->images[i].texture)) {
+			if (e->images[i].mirror != 0) {
+				glDeleteTextures(1, &e->images[i].mirror);
+			}
+			CFRelease(e->images[i].surface);
+			e->images[i] = e->images[--e->image_count];
+			gone++;
+		} else {
+			i++;
+		}
+	}
+	return gone;
+}
+
 static struct image *
 image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 {
 	struct image *image = image_of(e, texture);
 
 	if (image == NULL) {
+		if (e->image_count == sizeof(e->images) / sizeof(e->images[0])) {
+			unsigned gone = image_sweep(e);
+			static unsigned told;
+
+			if (told++ < 10) {
+				say("hakios-gl: the textures with IOSurfaces fill the table: %u of them gone, let go\n", gone);
+			}
+		}
 		if (e->image_count == sizeof(e->images) / sizeof(e->images[0])) {
 			say("hakios-gl: more textures with IOSurfaces than there is room for\n");
 			return NULL;
