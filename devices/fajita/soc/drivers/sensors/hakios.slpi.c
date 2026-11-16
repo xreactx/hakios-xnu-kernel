@@ -4511,17 +4511,50 @@ frpc_start(void)
 static struct hakios_qrtr_port *see_port;
 static uint32_t see_node, see_port_number;
 static uint16_t see_transaction = 1;
-static volatile bool see_asked_suid, see_asked_samples;
-static uint64_t accel_suid[2];
-static volatile bool accel_known;
+/*
+ * The sensors asked for: the SUID service is asked for each type; the first SUID it names is configured -- a
+ * streaming sensor with sns_std_sensor_config (513, its rate), an on-change one with an empty request 514. Its events
+ * (1025 sns_std_sensor_event, floats; 769 sns_proximity_event: near or far, the raw reading) are kept x 1000 in the
+ * sysctls named by `name`: kern.hakios.<name>_x/_y/_z (or <name> alone for one value) and <name>_samples.
+ */
+enum { SEE_ACCEL, SEE_GYRO, SEE_MAG, SEE_LIGHT, SEE_PROXIMITY, SEE_SENSORS };
+static struct see_sensor {
+	const char *type;
+	uint32_t config;                        /* 513 streaming, 514 on change */
+	uint32_t rate;                          /* (513) samples a second, as a float's bits */
+	volatile bool asked, known, configured;
+	uint64_t suid[2];
+	uint32_t events;
+} see_sensor[SEE_SENSORS] = {
+	[SEE_ACCEL] = { "accel", 513, 0x41200000u },            /* 10 */
+	[SEE_GYRO] = { "gyro", 513, 0x41200000u },
+	[SEE_MAG] = { "mag", 513, 0x41200000u },
+	[SEE_LIGHT] = { "ambient_light", 514, 0 },
+	[SEE_PROXIMITY] = { "proximity", 514, 0 },
+};
 static uint32_t see_events, see_logged;
 static int accel_x, accel_y, accel_z, accel_samples;
+static int gyro_x, gyro_y, gyro_z, gyro_samples, mag_x, mag_y, mag_z, mag_samples, light, light_samples, proximity = -1,
+    proximity_raw, proximity_samples;
 
 SYSCTL_DECL(_kern_hakios);
 SYSCTL_INT(_kern_hakios, OID_AUTO, accel_x, CTLFLAG_RD | CTLFLAG_LOCKED, &accel_x, 0, "the accelerometer's x, mm/s^2");
 SYSCTL_INT(_kern_hakios, OID_AUTO, accel_y, CTLFLAG_RD | CTLFLAG_LOCKED, &accel_y, 0, "the accelerometer's y, mm/s^2");
 SYSCTL_INT(_kern_hakios, OID_AUTO, accel_z, CTLFLAG_RD | CTLFLAG_LOCKED, &accel_z, 0, "the accelerometer's z, mm/s^2");
 SYSCTL_INT(_kern_hakios, OID_AUTO, accel_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &accel_samples, 0, "samples so far");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gyro_x, CTLFLAG_RD | CTLFLAG_LOCKED, &gyro_x, 0, "the gyroscope's x, mrad/s");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gyro_y, CTLFLAG_RD | CTLFLAG_LOCKED, &gyro_y, 0, "the gyroscope's y, mrad/s");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gyro_z, CTLFLAG_RD | CTLFLAG_LOCKED, &gyro_z, 0, "the gyroscope's z, mrad/s");
+SYSCTL_INT(_kern_hakios, OID_AUTO, gyro_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &gyro_samples, 0, "samples so far");
+SYSCTL_INT(_kern_hakios, OID_AUTO, mag_x, CTLFLAG_RD | CTLFLAG_LOCKED, &mag_x, 0, "the magnetometer's x, nT");
+SYSCTL_INT(_kern_hakios, OID_AUTO, mag_y, CTLFLAG_RD | CTLFLAG_LOCKED, &mag_y, 0, "the magnetometer's y, nT");
+SYSCTL_INT(_kern_hakios, OID_AUTO, mag_z, CTLFLAG_RD | CTLFLAG_LOCKED, &mag_z, 0, "the magnetometer's z, nT");
+SYSCTL_INT(_kern_hakios, OID_AUTO, mag_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &mag_samples, 0, "samples so far");
+SYSCTL_INT(_kern_hakios, OID_AUTO, light, CTLFLAG_RD | CTLFLAG_LOCKED, &light, 0, "ambient light, millilux");
+SYSCTL_INT(_kern_hakios, OID_AUTO, light_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &light_samples, 0, "samples so far");
+SYSCTL_INT(_kern_hakios, OID_AUTO, proximity, CTLFLAG_RD | CTLFLAG_LOCKED, &proximity, 0, "1 near, 0 far, -1 not known yet");
+SYSCTL_INT(_kern_hakios, OID_AUTO, proximity_raw, CTLFLAG_RD | CTLFLAG_LOCKED, &proximity_raw, 0, "the proximity sensor's reading");
+SYSCTL_INT(_kern_hakios, OID_AUTO, proximity_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &proximity_samples, 0, "events so far");
 
 /* A TLV of a QMI message: its value and length, or NULL (as hakios.mpss.c's). */
 static const uint8_t *
@@ -4713,27 +4746,97 @@ see_request(const uint64_t suid[2], uint32_t msg_id, const uint8_t *payload, siz
 }
 
 static void
-see_ask_suid(void)
+see_ask_suid(struct see_sensor *sensor)
 {
 	static const uint64_t lookup[2] = { 0xababababababababULL, 0xababababababababULL };
-	uint8_t req[32];
+	uint8_t req[48];
 	struct pb b = { req, req + sizeof(req), false };
 
-	pb_bytes(&b, 1, "accel", 5);                   /* data_type */
-	pb_key(&b, 2, 0); pb_varint(&b, 1);            /* register_updates */
+	pb_bytes(&b, 1, sensor->type, strlen(sensor->type));  /* data_type */
+	pb_key(&b, 2, 0); pb_varint(&b, 1);                     /* register_updates */
 	see_request(lookup, SUID_MSGID_REQ, req, (size_t)(b.at - req));
-	printf("slpi: see: the SUID service asked which sensor is \"accel\"\n");
+	printf("slpi: see: the SUID service asked which sensor is \"%s\"\n", sensor->type);
 }
 
 static void
-see_ask_samples(void)
+see_configure(struct see_sensor *sensor)
 {
 	uint8_t req[8];
 	struct pb b = { req, req + sizeof(req), false };
 
-	pb_fixed(&b, 1, 0x41200000u, 4);               /* sample_rate: 10.0 */
-	see_request(accel_suid, SENSOR_MSGID_CONFIG, req, (size_t)(b.at - req));
-	printf("slpi: see: the accelerometer (SUID %016llx %016llx) asked for 10 samples a second\n", accel_suid[1], accel_suid[0]);
+	if (sensor->config == SENSOR_MSGID_CONFIG) {
+		pb_fixed(&b, 1, sensor->rate, 4);               /* sample_rate */
+	}
+	see_request(sensor->suid, sensor->config, req, (size_t)(b.at - req));
+	printf("slpi: see: \"%s\" (SUID %016llx %016llx) asked for its %s\n", sensor->type, sensor->suid[1], sensor->suid[0],
+	    sensor->config == SENSOR_MSGID_CONFIG ? "samples, 10 a second" : "changes");
+}
+
+/* The other sensors' events: floats x 1000 into their sysctls; the proximity sensor's near or far. */
+static void
+see_other(unsigned k, uint32_t msg_id, const uint8_t *p, size_t length)
+{
+	const uint8_t *at = p, *end = p + length;
+	struct pb_field f;
+	int64_t v[3] = { 0, 0, 0 };
+	unsigned n = 0;
+	int *x, *y, *z, *samples;
+	static const char *const units[SEE_SENSORS] = { "mm/s^2", "mrad/s", "nT", "mlux", "" };
+
+	see_sensor[k].events++;
+	if (k == SEE_PROXIMITY && (msg_id == 769 || msg_id == 1031)) {
+		uint64_t near = 0, raw = 0;
+
+		while (pb_next(&at, end, &f)) {
+			if (f.field == 1 && f.wire == 0) {
+				near = f.value;
+			} else if (f.field == 2 && f.wire == 0) {
+				raw = f.value;
+			}
+		}
+		proximity = near ? 1 : 0;
+		proximity_raw = (int)raw;
+		if (proximity_samples++ < 20 || (proximity_samples % 50) == 0) {
+			tell("slpi: see: PROXIMITY %s (raw %llu), event %d\n", near ? "NEAR" : "far", raw, proximity_samples);
+		}
+		return;
+	}
+	if (msg_id != SENSOR_MSGID_EVENT) {
+		if (see_logged++ < 30) {
+			printf("slpi: see: \"%s\": event %u, %zu bytes%s\n", see_sensor[k].type, msg_id, length,
+			    msg_id == STD_MSGID_ERROR_EVENT ? " (an error)" : "");
+		}
+		return;
+	}
+	while (pb_next(&at, end, &f)) {
+		if (f.field == 1 && f.wire == 5 && n < 3) {
+			v[n++] = float_scaled((uint32_t)f.value, 1000);
+		} else if (f.field == 1 && f.wire == 2) {
+			for (size_t i = 0; i + 4 <= f.length && n < 3; i += 4) {
+				v[n++] = float_scaled((uint32_t)(f.data[i] | f.data[i + 1] << 8 | f.data[i + 2] << 16 |
+				    (uint32_t)f.data[i + 3] << 24), 1000);
+			}
+		}
+	}
+	switch (k) {
+	case SEE_GYRO:
+		x = &gyro_x; y = &gyro_y; z = &gyro_z; samples = &gyro_samples;
+		break;
+	case SEE_MAG:
+		x = &mag_x; y = &mag_y; z = &mag_z; samples = &mag_samples;
+		break;
+	default:                                                /* the light: one value */
+		x = &light; y = NULL; z = NULL; samples = &light_samples;
+		break;
+	}
+	*x = (int)v[0];
+	if (y != NULL) {
+		*y = (int)v[1];
+		*z = (int)v[2];
+	}
+	if ((*samples)++ < 5 || (*samples % (k == SEE_LIGHT ? 20 : 100)) == 0) {
+		tell("slpi: see: %s sample %d: %lld %lld %lld %s\n", see_sensor[k].type, *samples, v[0], v[1], v[2], units[k]);
+	}
 }
 
 /* One event of a sns_client_event_msg: from the SUID service, or a sample, or an error. */
@@ -4765,17 +4868,33 @@ see_event(const uint64_t suid[2], uint32_t msg_id, const uint8_t *p, size_t leng
 					}
 				}
 				printf("slpi: see: \"%s\" is SUID %016llx %016llx\n", type, one[1], one[0]);
-				if (suids++ == 0 && !accel_known && strcmp(type, "accel") == 0) {
-					accel_suid[0] = one[0];
-					accel_suid[1] = one[1];
-					accel_known = true;
+				for (unsigned k = 0; k < SEE_SENSORS; k++) {
+					if (suids == 0 && !see_sensor[k].known && strcmp(type, see_sensor[k].type) == 0) {
+						see_sensor[k].suid[0] = one[0];
+						see_sensor[k].suid[1] = one[1];
+						see_sensor[k].known = true;
+					}
 				}
+				suids++;
 			}
 		}
 		if (suids == 0) {
 			tell("slpi: see: NO SENSOR IS \"%s\" (yet: the SUID service tells again when one comes)\n", type);
 		}
 		return;
+	}
+	{
+		unsigned k;
+
+		for (k = 0; k < SEE_SENSORS; k++) {
+			if (see_sensor[k].known && see_sensor[k].suid[0] == suid[0] && see_sensor[k].suid[1] == suid[1]) {
+				break;
+			}
+		}
+		if (k < SEE_SENSORS && k != SEE_ACCEL) {
+			see_other(k, msg_id, p, length);
+			return;
+		}
 	}
 	if (msg_id == SENSOR_MSGID_EVENT) {
 		int64_t v[3] = { 0, 0, 0 };
@@ -4884,30 +5003,37 @@ see_server(__unused void *context, bool arrived, uint32_t service, __unused uint
 	}
 }
 
-/* On the DSP's thread once it is up: the client opened, the accelerometer looked up, its samples asked for. */
+/* On the DSP's thread once it is up: the client opened, each sensor looked up, its samples or changes asked for. */
 static void
 see_run(void)
 {
 	uint64_t began = now_us();
+	unsigned configured = 0;
 
 	see_port = qrtr_open(see_receive, see_server, NULL);
 	if (see_port == NULL || qrtr_lookup(see_port, QMI_SEE, 0, 0) != 0) {
 		tell("slpi: see: no port for the sensors' service\n");
 		return;
 	}
-	while (now_us() - began < 60000000ull && !see_asked_samples) {
-		if (see_port_number != 0 && !see_asked_suid) {
-			see_asked_suid = true;
-			see_ask_suid();
-		}
-		if (accel_known && !see_asked_samples) {
-			see_asked_samples = true;
-			see_ask_samples();
+	while (now_us() - began < 60000000ull && configured < SEE_SENSORS) {
+		for (unsigned k = 0; k < SEE_SENSORS && see_port_number != 0; k++) {
+			if (!see_sensor[k].asked) {
+				see_sensor[k].asked = true;
+				see_ask_suid(&see_sensor[k]);
+				sleep_ms(50);
+			}
+			if (see_sensor[k].known && !see_sensor[k].configured) {
+				see_sensor[k].configured = true;
+				configured++;
+				see_configure(&see_sensor[k]);
+			}
 		}
 		sleep_ms(100);
 	}
-	tell("slpi: see: after %llu ms: the service %s, the accelerometer %s; %u events so far\n", (now_us() - began) / 1000,
-	    see_port_number ? "there" : "NOT THERE", accel_known ? "found" : "NOT FOUND", see_events);
+	tell("slpi: see: after %llu ms: %s; found: %s%s%s%s%s\n", (now_us() - began) / 1000, see_port_number ? "the service there" :
+	    "THE SERVICE NOT THERE", see_sensor[SEE_ACCEL].known ? "accel " : "", see_sensor[SEE_GYRO].known ? "gyro " : "",
+	    see_sensor[SEE_MAG].known ? "mag " : "", see_sensor[SEE_LIGHT].known ? "ambient_light " : "",
+	    see_sensor[SEE_PROXIMITY].known ? "proximity" : "");
 }
 
 static void
