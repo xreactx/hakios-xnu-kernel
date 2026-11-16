@@ -3719,7 +3719,7 @@ struct hakios_qrtr_port {
 
 static LCK_MTX_DECLARE(qrtr_lock, &mpss_lock_group);    /* the tables below */
 static LCK_MTX_DECLARE(qrtr_calling, &mpss_lock_group); /* held by the link's thread around a callback */
-static struct hakios_qrtr_port qrtr_ports[16];
+static struct hakios_qrtr_port qrtr_ports[32];         /* (16 were all taken once IMSA came: its client got none) */
 static struct {
 	uint32_t service, instance, node, port;
 	bool there;
@@ -6290,6 +6290,8 @@ static void loc_open(void);
 static void loc_advance(void);
 static void sms_open(void);
 static void sms_advance(void);
+static void voice_open(void);
+static void voice_advance(void);
 static volatile bool wds_registered;      /* NAS says the modem is registered (set by nas_changed) */
 static void probe_dump(const char *who, const uint8_t *m, size_t length);
 
@@ -7228,6 +7230,7 @@ step_nas(void)
 	wds_open();
 	loc_open();
 	sms_open();
+	voice_open();
 	began = now_us();
 	while (now_us() - began < wait_seconds * 1000000ull) {
 		if (online && !is_online && dms_port_number != 0 && now_us() - asked_online > 5000000ull) {
@@ -7268,6 +7271,7 @@ step_nas(void)
 		wds_advance();          /* bind / start / retry the data session on its own clock */
 		loc_advance();
 		sms_advance();
+		voice_advance();
 		sleep_ms(1000);
 		if (nas.state.registered && nas.state.has_signal) {
 			if (!registered) {
@@ -7687,6 +7691,900 @@ sms_advance(void)
 	qrtr_send(wms_port, wms_node, wms_port_number, q, at);
 }
 
+/* ---- Calls: the modem's voice service (QMI VOICE, 9) ---------------------------------------------- */
+
+/*
+ * The first step to calls: their control, no sound yet (the voice itself runs on the audio DSP: a later step).
+ * On by default (call=0 off): once VOICE is found, its call events are asked for (Indication Register 0x03, TLV 0x13
+ * = 1), and from then every All Call Status indication (0x2E) is logged: each call's id, state, direction and the other
+ * party's number. Boot-args:
+ *   call_to=DIGITS   dial it (Dial Call 0x20, TLV 1 = the number as text) some 10 s after the modem is registered,
+ *                    once; hung up (End Call 0x21) call_secs (30) after it is answered, or after 60 s unanswered.
+ *   call_answer=1    an incoming call is answered (Answer Call 0x22) after some 4 s, and hung up after call_secs.
+ * kern.hakios.call_state (0 none, else the last call's QMI state: 1 dialling, 2 incoming, 3 talking, 5 ringing at
+ * the far end, 9 ended) and call_number for userland.
+ */
+#define QMI_VOICE               9
+#define VOICE_INDICATION_REGISTER 0x0003
+#define VOICE_DIAL_CALL         0x0020
+#define VOICE_END_CALL          0x0021
+#define VOICE_ANSWER_CALL       0x0022
+#define VOICE_ALL_CALL_STATUS   0x002e
+
+static struct hakios_qrtr_port *voice_port;
+static uint32_t voice_node, voice_port_number;
+static volatile int voice_setup;                /* 0 not yet, 1 events asked */
+static char call_to[24];
+static int call_answer, call_secs = 30;
+static volatile int call_dialled;               /* call_to dialled (once) */
+static volatile uint8_t call_id, call_state_raw, call_direction;
+static volatile uint64_t call_since_us;         /* when the state last changed */
+static volatile int call_hung;                  /* an End Call asked for this call */
+static volatile int call_answered;              /* an Answer asked for this call */
+static uint64_t call_registered_us;
+static int call_state;
+static char call_number[32];
+
+SYSCTL_INT(_kern_hakios, OID_AUTO, call_state, CTLFLAG_RD | CTLFLAG_LOCKED, &call_state, 0,
+    "the last call's state: 0 none, 1 dialling, 2 incoming, 3 talking, 5 ringing there, 9 ended");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, call_number, CTLFLAG_RD | CTLFLAG_LOCKED, call_number, sizeof(call_number),
+    "the last call's other party");
+
+static const char *
+call_state_name(uint8_t s)
+{
+	static const char *names[] = { "?", "DIALLING", "INCOMING", "TALKING", "being set up", "RINGING AT THE OTHER END",
+		"on hold", "waiting", "hanging up", "ENDED", "setting up", };
+
+	return s < sizeof(names) / sizeof(names[0]) ? names[s] : "?";
+}
+
+static void
+voice_request(uint16_t id, uint8_t tid, const uint8_t *tlvs, unsigned size)
+{
+	uint8_t q[7 + 64];
+
+	if (size > 64) {
+		return;
+	}
+	q[0] = QMI_REQUEST; q[1] = tid; q[2] = 0x00;
+	q[3] = (uint8_t)(id & 0xff); q[4] = (uint8_t)(id >> 8);
+	q[5] = (uint8_t)size; q[6] = 0;
+	memcpy(q + 7, tlvs, size);
+	qrtr_send(voice_port, voice_node, voice_port_number, q, 7 + size);
+}
+
+static void
+voice_call_ask(uint16_t what, uint8_t tid, uint8_t id)
+{
+	uint8_t t[4] = { 0x01, 1, 0, id };
+
+	voice_request(what, tid, t, sizeof(t));
+}
+
+static void
+voice_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data, *v;
+	uint16_t size, result = 0xffff, error = 0xffff, id;
+
+	if (length < 7) {
+		return;
+	}
+	id = (uint16_t)(m[3] | m[4] << 8);
+	if (m[0] == QMI_RESPONSE && (v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
+		result = (uint16_t)(v[0] | v[1] << 8);
+		error = (uint16_t)(v[2] | v[3] << 8);
+	}
+	if (m[0] == QMI_RESPONSE) {
+		switch (id) {
+		case VOICE_INDICATION_REGISTER:
+			tell("mpss: call: call events asked for: result %u, error %u%s\n", result, error,
+			    result == 0 ? " -- READY FOR CALLS" : "");
+			break;
+		case VOICE_DIAL_CALL:
+			tell("mpss: call: DIAL %s: result %u, error %u\n", call_to, result, error);
+			if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 1) {
+				tell("mpss: call: the call's id %u\n", v[0]);
+			}
+			break;
+		case VOICE_ANSWER_CALL:
+			tell("mpss: call: ANSWER: result %u, error %u\n", result, error);
+			break;
+		case VOICE_END_CALL:
+			tell("mpss: call: HANG UP: result %u, error %u\n", result, error);
+			break;
+		}
+		return;
+	}
+	if (m[0] != QMI_INDICATION || id != VOICE_ALL_CALL_STATUS) {
+		return;
+	}
+	sms_hex("call status", m, (unsigned)length);
+	/* TLV 1: count, then per call: id, state, type, direction, mode, multiparty, als (7 bytes) */
+	if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 1) {
+		unsigned count = v[0];
+
+		for (unsigned i = 0; i < count && 1 + 7 * (i + 1) <= size; i++) {
+			const uint8_t *c = v + 1 + 7 * i;
+			char number[32] = "";
+			const uint8_t *r;
+			uint16_t rsize;
+
+			/* TLV 0x10: count, then per call: id, presentation, length, the number */
+			if ((r = qmi_tlv(m, length, 0x10, &rsize)) != NULL && rsize >= 1) {
+				unsigned k = 1;
+
+				for (unsigned j = 0; j < r[0] && k + 3 <= rsize; j++) {
+					unsigned n = r[k + 2];
+
+					if (r[k] == c[0] && k + 3 + n <= rsize) {
+						unsigned w = n < sizeof(number) - 1 ? n : sizeof(number) - 1;
+
+						memcpy(number, r + k + 3, w);
+						number[w] = 0;
+					}
+					k += 3 + n;
+				}
+			}
+			if (c[0] != call_id || c[1] != call_state_raw) {
+				if (c[0] != call_id) {
+					call_hung = 0;
+					call_answered = 0;
+				}
+				call_id = c[0];
+				call_state_raw = c[1];
+				call_direction = c[3];
+				call_since_us = now_us();
+				call_state = c[1];
+				if (number[0] != 0) {
+					strlcpy(call_number, number, sizeof(call_number));
+				}
+				tell("mpss: call: call %u, %s, %s: %s (type %u, mode %u)\n", c[0],
+				    c[3] == 2 ? "incoming" : "outgoing", call_number[0] ? call_number : "number not given",
+				    call_state_name(c[1]), c[2], c[4]);
+			}
+		}
+	}
+	/* TLV 0x20 the end reasons: count, then per call: id, reason (16 bits) */
+	if ((v = qmi_tlv(m, length, 0x20, &size)) != NULL && size >= 4) {
+		tell("mpss: call: call %u ended, reason %u\n", v[1], v[2] | v[3] << 8);
+	}
+}
+
+static void
+voice_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance,
+    uint32_t node, uint32_t port)
+{
+	if (service != QMI_VOICE) {
+		return;
+	}
+	if (arrived) {
+		voice_node = node;
+		voice_port_number = port;
+	} else if (node == voice_node && port == voice_port_number) {
+		voice_node = voice_port_number = 0;
+		voice_setup = 0;
+	}
+}
+
+/*
+ * IMS (QMI IMSA, 0x21): on an LTE network without 2G/3G, calls go by VoLTE, for which the modem must be registered with
+ * the carrier's IMS. Its registration status (Get Registration Status 0x20: TLV 0x10 registered, 0x11 the error code,
+ * 0x12 the status: 0 not registered, 1 registering, 2 registered, 3 limited) is asked every 10 s and logged when it
+ * changes.
+ */
+#define QMI_IMSA                0x21
+#define IMSA_GET_REGISTRATION   0x0020
+#define IMSA_GET_SERVICES       0x0021
+#define IMSA_BIND               0x0033
+
+static struct hakios_qrtr_port *imsa_port;
+static uint32_t imsa_node, imsa_port_number;
+static uint64_t imsa_asked_us;
+static int imsa_last = -1, imsa_services_last = -1;
+static volatile int imsa_bound;                 /* 0 not yet, 1 asked, 2 answered */
+
+static void
+imsa_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data, *v;
+	uint16_t size, result = 0xffff, error = 0xffff;
+	int registered = -1, status = -1, code = -1, key;
+
+	if (length < 7 || m[0] != QMI_RESPONSE) {
+		return;
+	}
+	if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
+		result = (uint16_t)(v[0] | v[1] << 8);
+		error = (uint16_t)(v[2] | v[3] << 8);
+	}
+	if ((m[3] | m[4] << 8) == IMSA_BIND) {
+		tell("mpss: ims: bound to the primary subscription: result %u, error %u\n", result, error);
+		imsa_bound = 2;
+		return;
+	}
+	if ((m[3] | m[4] << 8) == IMSA_GET_SERVICES) {
+		/* TLV 0x10 SMS, 0x11 voice, 0x12 video: 0 unavailable, 1 limited, 2 available (32 bits each) */
+		int sms = -1, voice = -1;
+
+		if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 4) {
+			sms = v[0];
+		}
+		if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 4) {
+			voice = v[0];
+		}
+		key = result << 16 ^ sms << 8 ^ voice;
+		if (key != imsa_services_last) {
+			static const char *names[] = { "unavailable", "limited", "AVAILABLE" };
+
+			imsa_services_last = key;
+			tell("mpss: ims: services: result %u, error %u; voice over IMS %s, SMS over IMS %s\n", result, error,
+			    voice >= 0 && voice < 3 ? names[voice] : "not said", sms >= 0 && sms < 3 ? names[sms] : "not said");
+		}
+		return;
+	}
+	if ((m[3] | m[4] << 8) != IMSA_GET_REGISTRATION) {
+		return;
+	}
+	if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 1) {
+		registered = v[0];
+	}
+	if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 2) {
+		code = v[0] | v[1] << 8;
+	}
+	if ((v = qmi_tlv(m, length, 0x12, &size)) != NULL && size >= 4) {
+		status = (int)(v[0] | v[1] << 8 | v[2] << 16 | (uint32_t)v[3] << 24);
+	}
+	key = result << 20 ^ registered << 16 ^ status << 8 ^ code;
+	if (key != imsa_last) {
+		static const char *names[] = { "NOT REGISTERED", "registering", "REGISTERED (VoLTE possible)", "limited" };
+
+		imsa_last = key;
+		tell("mpss: ims: result %u, error %u; registered %d, status %d (%s), error code %d\n", result, error, registered,
+		    status, status >= 0 && status < 4 ? names[status] : "?", code);
+		if (result != 0) {
+			sms_hex("ims", m, (unsigned)length);
+		}
+	}
+}
+
+static void
+imsa_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance,
+    uint32_t node, uint32_t port)
+{
+	if (service != QMI_IMSA) {
+		return;
+	}
+	if (arrived) {
+		imsa_node = node;
+		imsa_port_number = port;
+		tell("mpss: ims: the IMS service is there (node %u port %u)\n", node, port);
+	} else if (node == imsa_node && port == imsa_port_number) {
+		imsa_node = imsa_port_number = 0;
+	}
+}
+
+static void
+imsa_advance(void)
+{
+	uint8_t q[7] = { QMI_REQUEST, 0x91, 0, IMSA_GET_REGISTRATION & 0xff, IMSA_GET_REGISTRATION >> 8, 0, 0 };
+
+	uint8_t services[7] = { QMI_REQUEST, 0x92, 0, IMSA_GET_SERVICES & 0xff, IMSA_GET_SERVICES >> 8, 0, 0 };
+
+	if (imsa_port == NULL || imsa_port_number == 0) {
+		return;
+	}
+	if (imsa_bound == 0) {
+		uint8_t bind[14] = { QMI_REQUEST, 0x90, 0, IMSA_BIND & 0xff, IMSA_BIND >> 8, 7, 0, 0x10, 4, 0, 0, 0, 0, 0 };
+
+		imsa_bound = 1;
+		qrtr_send(imsa_port, imsa_node, imsa_port_number, bind, sizeof(bind));
+		return;
+	}
+	if (imsa_bound != 2 || now_us() - imsa_asked_us < 10000000ull) {
+		return;
+	}
+	imsa_asked_us = now_us();
+	qrtr_send(imsa_port, imsa_node, imsa_port_number, q, sizeof(q));
+	qrtr_send(imsa_port, imsa_node, imsa_port_number, services, sizeof(services));
+}
+
+/*
+ * The modem's carrier configurations (QMI PDC, 0x24), read only: which software configuration (MBN) is active, and the
+ * description of each one the modem holds (Get Selected Config 0x22, List Configs 0x24, Get Config Info 0x28 -- each
+ * answered by an indication of the same number). VoLTE needs a carrier configuration that enables IMS. Off with pdc=0.
+ * With pdc_use=TEXT the first configuration whose description has TEXT is selected (0x23) and activated (0x27). The
+ * modem's storage is not written through to the phone here (rmtfs keeps its writes in memory), so it lasts one run.
+ * (Run 174949: 25 configurations, none active, "VoLTE-ATT" pending; Lyca in the US is T-Mobile's: pdc_use=TMO.)
+ */
+#define QMI_PDC                 0x24
+#define PDC_REGISTER            0x0020
+#define PDC_GET_SELECTED        0x0022
+#define PDC_LIST_CONFIGS        0x0024
+#define PDC_SET_SELECTED        0x0023
+#define PDC_ACTIVATE            0x0027
+#define PDC_GET_CONFIG_INFO     0x0028
+#define PDC_REFRESH             0x002f
+
+static struct hakios_qrtr_port *pdc_port;
+static uint32_t pdc_node, pdc_port_number;
+static volatile int pdc_step;                   /* 0 nothing yet; 1 registered asked; 2 selected asked; 3 listed asked; 4 infos */
+static uint8_t pdc_ids[48][40];
+static uint8_t pdc_id_lengths[48];
+static unsigned pdc_count, pdc_info_next;
+static uint64_t pdc_asked_us;
+static char pdc_use[32];                        /* boot-arg pdc_use=TEXT: the configuration whose description has it is activated */
+static int pdc_chosen = -1;
+
+static void
+pdc_id_text(const uint8_t *id, unsigned n, char *out, size_t size)
+{
+	unsigned o = 0;
+
+	for (unsigned i = 0; i < n && o + 3 < size; i++) {
+		o += (unsigned)snprintf(out + o, size - o, "%02x", id[i]);
+	}
+	out[o] = 0;
+}
+
+static void
+pdc_info_ask(void)
+{
+	uint8_t q[7 + 3 + 5 + 40 + 7];
+	unsigned at = 7, n;
+
+	if (pdc_info_next >= pdc_count) {
+		pdc_step = 5;
+		tell("mpss: pdc: all %u configurations described\n", pdc_count);
+		if (pdc_use[0] != 0 && pdc_chosen < 0) {
+			tell("mpss: pdc: no configuration's description has \"%s\": none chosen\n", pdc_use);
+		} else if (pdc_chosen >= 0) {
+			unsigned n2 = pdc_id_lengths[pdc_chosen];
+
+			n = n2;
+			q[0] = QMI_REQUEST; q[1] = 0xa5; q[2] = 0;
+			q[3] = PDC_SET_SELECTED & 0xff; q[4] = PDC_SET_SELECTED >> 8;
+			q[at++] = 0x01; q[at++] = (uint8_t)(5 + n); q[at++] = 0;
+			q[at++] = 1; q[at++] = 0; q[at++] = 0; q[at++] = 0;
+			q[at++] = (uint8_t)n;
+			memcpy(q + at, pdc_ids[pdc_chosen], n);
+			at += n;
+			q[at++] = 0x10; q[at++] = 4; q[at++] = 0; q[at++] = 0x23; q[at++] = 0; q[at++] = 0; q[at++] = 0;
+			q[5] = (uint8_t)(at - 7); q[6] = 0;
+			tell("mpss: pdc: selecting configuration %d for \"%s\"\n", pdc_chosen, pdc_use);
+			pdc_step = 7;
+			pdc_asked_us = now_us();
+			qrtr_send(pdc_port, pdc_node, pdc_port_number, q, at);
+		}
+		return;
+	}
+	n = pdc_id_lengths[pdc_info_next];
+	q[0] = QMI_REQUEST; q[1] = 0xa4; q[2] = 0;
+	q[3] = PDC_GET_CONFIG_INFO & 0xff; q[4] = PDC_GET_CONFIG_INFO >> 8;
+	q[at++] = 0x01; q[at++] = (uint8_t)(5 + n); q[at++] = 0;
+	q[at++] = 1; q[at++] = 0; q[at++] = 0; q[at++] = 0;  /* software (carrier) configurations */
+	q[at++] = (uint8_t)n;
+	memcpy(q + at, pdc_ids[pdc_info_next], n);
+	at += n;
+	q[at++] = 0x10; q[at++] = 4; q[at++] = 0; q[at++] = (uint8_t)pdc_info_next; q[at++] = 0; q[at++] = 0; q[at++] = 0;
+	q[5] = (uint8_t)(at - 7); q[6] = 0;
+	pdc_asked_us = now_us();
+	qrtr_send(pdc_port, pdc_node, pdc_port_number, q, at);
+}
+
+static void
+pdc_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data, *v;
+	uint16_t size, id, result = 0xffff;
+	char text[96];
+
+	if (length < 7) {
+		return;
+	}
+	id = (uint16_t)(m[3] | m[4] << 8);
+	if (m[0] == QMI_RESPONSE) {
+		if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4 && (v[0] | v[1] << 8) != 0) {
+			tell("mpss: pdc: request %#x refused: error %u\n", id, v[2] | v[3] << 8);
+		}
+		return;
+	}
+	if (m[0] != QMI_INDICATION) {
+		return;
+	}
+	if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 2) {
+		result = (uint16_t)(v[0] | v[1] << 8);
+	}
+	switch (id) {
+	case PDC_GET_SELECTED: {
+		char active[96] = "none", pending[96] = "none";
+
+		if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 1 && 1u + v[0] <= size) {
+			pdc_id_text(v + 1, v[0], active, sizeof(active));
+		}
+		if ((v = qmi_tlv(m, length, 0x12, &size)) != NULL && size >= 1 && 1u + v[0] <= size) {
+			pdc_id_text(v + 1, v[0], pending, sizeof(pending));
+		}
+		tell("mpss: pdc: the carrier configuration: result %u; ACTIVE %s, pending %s\n", result, active, pending);
+		pdc_step = 3;
+		break;
+	}
+	case PDC_LIST_CONFIGS:
+		pdc_count = 0;
+		if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 1) {
+			unsigned k = 1;
+
+			for (unsigned i = 0; i < v[0] && k + 5 <= size; i++) {
+				unsigned n = v[k + 4];
+
+				if (k + 5 + n > size) {
+					break;
+				}
+				if (pdc_count < 48 && n <= 40) {
+					memcpy(pdc_ids[pdc_count], v + k + 5, n);
+					pdc_id_lengths[pdc_count++] = (uint8_t)n;
+				}
+				k += 5 + n;
+			}
+		}
+		tell("mpss: pdc: %u carrier configurations in the modem (result %u)\n", pdc_count, result);
+		pdc_step = 4;
+		pdc_info_next = 0;
+		pdc_info_ask();
+		break;
+	case PDC_GET_CONFIG_INFO: {
+		char description[80] = "";
+		uint32_t version = 0, total = 0;
+
+		if ((v = qmi_tlv(m, length, 0x12, &size)) != NULL && size >= 1 && 1u + v[0] <= size) {
+			unsigned n = v[0] < sizeof(description) - 1 ? v[0] : sizeof(description) - 1;
+
+			memcpy(description, v + 1, n);
+			description[n] = 0;
+		}
+		if ((v = qmi_tlv(m, length, 0x13, &size)) != NULL && size >= 4) {
+			version = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | (uint32_t)v[3] << 24);
+		}
+		if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 4) {
+			total = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | (uint32_t)v[3] << 24);
+		}
+		if (pdc_info_next < pdc_count) {
+			pdc_id_text(pdc_ids[pdc_info_next], pdc_id_lengths[pdc_info_next], text, sizeof(text));
+			tell("mpss: pdc: config %u: \"%s\" version %#x, %u bytes (result %u; id %s)\n", pdc_info_next, description,
+			    version, total, result, text);
+			if (pdc_use[0] != 0 && pdc_chosen < 0 && strnstr(description, pdc_use, sizeof(description)) != NULL) {
+				pdc_chosen = (int)pdc_info_next;
+			}
+		}
+		pdc_info_next++;
+		pdc_info_ask();
+		break;
+	}
+	case PDC_SET_SELECTED:
+		tell("mpss: pdc: selected: result %u%s\n", result, result == 0 ? " -- now activating it" : "");
+		if (result == 0) {
+			uint8_t q[7 + 7 + 7] = { QMI_REQUEST, 0xa6, 0, PDC_ACTIVATE & 0xff, PDC_ACTIVATE >> 8, 14, 0,
+			    0x01, 4, 0, 1, 0, 0, 0, 0x10, 4, 0, 0x27, 0, 0, 0 };
+
+			pdc_step = 8;
+			pdc_asked_us = now_us();
+			qrtr_send(pdc_port, pdc_node, pdc_port_number, q, sizeof(q));
+		}
+		break;
+	case PDC_ACTIVATE:
+		tell("mpss: pdc: ACTIVATED: result %u (the modem may now restart or refresh)\n", result);
+		pdc_step = 9;
+		break;
+	case PDC_REFRESH:
+		tell("mpss: pdc: a refresh, event %u\n", result);
+		break;
+	case 0x0021:
+		tell("mpss: pdc: the configuration changed\n");
+		break;
+	default:
+		tell("mpss: pdc: indication %#x\n", id);
+		break;
+	}
+}
+
+static void
+pdc_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance,
+    uint32_t node, uint32_t port)
+{
+	if (service != QMI_PDC) {
+		return;
+	}
+	if (arrived) {
+		pdc_node = node;
+		pdc_port_number = port;
+	} else if (node == pdc_node && port == pdc_port_number) {
+		pdc_node = pdc_port_number = 0;
+	}
+}
+
+static void
+pdc_advance(void)
+{
+	if (pdc_port == NULL || pdc_port_number == 0) {
+		return;
+	}
+	if (pdc_step == 0) {
+		uint8_t q[11] = { QMI_REQUEST, 0xa1, 0, PDC_REGISTER & 0xff, PDC_REGISTER >> 8, 4, 0, 0x10, 1, 0, 1 };
+
+		pdc_step = 1;
+		qrtr_send(pdc_port, pdc_node, pdc_port_number, q, sizeof(q));
+		pdc_asked_us = now_us();
+		return;
+	}
+	if (pdc_step == 1 && now_us() - pdc_asked_us > 1000000ull) {
+		uint8_t q[7 + 7 + 7] = { QMI_REQUEST, 0xa2, 0, PDC_GET_SELECTED & 0xff, PDC_GET_SELECTED >> 8, 14, 0,
+		    0x01, 4, 0, 1, 0, 0, 0, 0x10, 4, 0, 0x22, 0, 0, 0 };
+
+		pdc_step = 2;
+		qrtr_send(pdc_port, pdc_node, pdc_port_number, q, sizeof(q));
+		pdc_asked_us = now_us();
+		return;
+	}
+	if (pdc_step == 3) {
+		uint8_t q[7 + 7 + 7] = { QMI_REQUEST, 0xa3, 0, PDC_LIST_CONFIGS & 0xff, PDC_LIST_CONFIGS >> 8, 14, 0,
+		    0x10, 4, 0, 0x24, 0, 0, 0, 0x11, 4, 0, 1, 0, 0, 0 };
+
+		pdc_step = 31;
+		qrtr_send(pdc_port, pdc_node, pdc_port_number, q, sizeof(q));
+		pdc_asked_us = now_us();
+		return;
+	}
+	if ((pdc_step == 2 || pdc_step == 31 || pdc_step == 4) && now_us() - pdc_asked_us > 15000000ull) {
+		tell("mpss: pdc: no indication after step %d: given up\n", pdc_step);
+		pdc_step = 6;
+	}
+}
+
+/*
+ * The modem's IMS settings (QMI IMS settings, 0x12): whether VoLTE, IMS registration and SMS over IMS are enabled -- on
+ * Android the "VoLTE / Enhanced 4G LTE" switch reaches the modem here. Bind (0x98, primary), then Get IMS Services
+ * Enabled Setting (0x90: 0x11 voice, 0x19 registration, 0x1b SMS) and the policy manager's settings (0x48: 0x1a the
+ * APNs). With volte=1 they are switched on (Set 0x8f: 0x10 VoLTE, 0x18 IMS, 0x1a SMS over IMS) and read again; like the
+ * carrier configuration this lasts the run (rmtfs).
+ */
+#define QMI_IMSS                0x12
+#define IMSS_GET_POLICY         0x0048
+#define IMSS_SET_SERVICES       0x008f
+#define IMSS_GET_SERVICES       0x0090
+#define IMSS_BIND               0x0098
+
+static struct hakios_qrtr_port *imss_port;
+static uint32_t imss_node, imss_port_number;
+static volatile int imss_step;          /* 0, 1 bound asked, 2 bound, 3 read asked, 4 set asked, 5 read again asked, 6 done */
+static int volte_wanted;
+
+static void
+imss_request(uint16_t id, uint8_t tid, const uint8_t *tlvs, unsigned size)
+{
+	uint8_t q[7 + 32];
+
+	q[0] = QMI_REQUEST; q[1] = tid; q[2] = 0;
+	q[3] = (uint8_t)(id & 0xff); q[4] = (uint8_t)(id >> 8);
+	q[5] = (uint8_t)size; q[6] = 0;
+	memcpy(q + 7, tlvs, size);
+	qrtr_send(imss_port, imss_node, imss_port_number, q, 7 + size);
+}
+
+static void
+imss_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data, *v;
+	uint16_t size, result = 0xffff, error = 0xffff, id;
+
+	if (length < 7 || m[0] != QMI_RESPONSE) {
+		return;
+	}
+	id = (uint16_t)(m[3] | m[4] << 8);
+	if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
+		result = (uint16_t)(v[0] | v[1] << 8);
+		error = (uint16_t)(v[2] | v[3] << 8);
+	}
+	switch (id) {
+	case IMSS_BIND:
+		tell("mpss: ims settings: bound: result %u, error %u\n", result, error);
+		imss_step = 2;
+		break;
+	case IMSS_GET_SERVICES: {
+		int volte = -1, registration = -1, sms = -1, wifi = -1;
+
+		if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 1) volte = v[0];
+		if ((v = qmi_tlv(m, length, 0x19, &size)) != NULL && size >= 1) registration = v[0];
+		if ((v = qmi_tlv(m, length, 0x1b, &size)) != NULL && size >= 1) sms = v[0];
+		if ((v = qmi_tlv(m, length, 0x15, &size)) != NULL && size >= 1) wifi = v[0];
+		tell("mpss: ims settings: result %u, error %u: VOLTE %s, IMS REGISTRATION %s, SMS over IMS %s, Wi-Fi calling %s\n",
+		    result, error, volte == 1 ? "ON" : volte == 0 ? "OFF" : "?", registration == 1 ? "ON" : registration == 0 ? "OFF" : "?",
+		    sms == 1 ? "on" : sms == 0 ? "off" : "?", wifi == 1 ? "on" : wifi == 0 ? "off" : "?");
+		if (result != 0) {
+			sms_hex("ims settings", m, (unsigned)length);
+		}
+		imss_step = imss_step == 3 ? (volte_wanted ? 31 : 6) : 6;
+		break;
+	}
+	case IMSS_GET_POLICY:
+		tell("mpss: ims settings: policy: result %u, error %u\n", result, error);
+		sms_hex("ims policy", m, (unsigned)length);
+		break;
+	case IMSS_SET_SERVICES:
+		tell("mpss: ims settings: VoLTE, IMS and SMS over IMS switched on: result %u, error %u\n", result, error);
+		imss_step = 41;
+		break;
+	}
+}
+
+static void
+imss_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance,
+    uint32_t node, uint32_t port)
+{
+	if (service != QMI_IMSS) {
+		return;
+	}
+	if (arrived) {
+		imss_node = node;
+		imss_port_number = port;
+	} else if (node == imss_node && port == imss_port_number) {
+		imss_node = imss_port_number = 0;
+	}
+}
+
+static void
+imss_advance(void)
+{
+	if (imss_port == NULL || imss_port_number == 0) {
+		return;
+	}
+	switch (imss_step) {
+	case 0: {
+		uint8_t t[7] = { 0x01, 4, 0, 0, 0, 0, 0 };
+
+		imss_step = 1;
+		imss_request(IMSS_BIND, 0xb0, t, sizeof(t));
+		break;
+	}
+	case 2:
+		imss_step = 3;
+		imss_request(IMSS_GET_SERVICES, 0xb1, NULL, 0);
+		imss_request(IMSS_GET_POLICY, 0xb2, NULL, 0);
+		break;
+	case 31: {
+		uint8_t t[12] = { 0x10, 1, 0, 1, 0x18, 1, 0, 1, 0x1a, 1, 0, 1 };
+
+		imss_step = 4;
+		imss_request(IMSS_SET_SERVICES, 0xb3, t, sizeof(t));
+		break;
+	}
+	case 41:
+		imss_step = 5;
+		imss_request(IMSS_GET_SERVICES, 0xb4, NULL, 0);
+		break;
+	default:
+		break;
+	}
+}
+
+/*
+ * The IMS data connection (ims_pdn=1): the modem's IMS policy names the APN "ims" (run 181527), and on Android the
+ * connection to it is opened from the application processor (Qualcomm's imsdatadaemon), not by the modem. A WDS client
+ * of its own: IP family IPv6 (Set IP Family 0x4d), then Start Network Interface with APN "ims" and family 6, retried
+ * every 10 s while refused, with the verbose end reason logged. Bound to mux 2 of the embedded port first (unbound,
+ * every start was refused with 70); nothing of ours carries mux 2's packets.
+ */
+static struct hakios_qrtr_port *ims_pdn_port;
+static uint32_t ims_pdn_node, ims_pdn_port_number;
+static volatile int ims_pdn_step;               /* 0, 1 family asked, 2 start asked, 3 up */
+static uint64_t ims_pdn_tried_us;
+static int ims_pdn_wanted, ims_pdn_family = 6;
+
+static void
+ims_pdn_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data, *v;
+	uint16_t size, result = 0xffff, error = 0xffff, id;
+
+	if (length < 7 || m[0] != QMI_RESPONSE) {
+		return;
+	}
+	id = (uint16_t)(m[3] | m[4] << 8);
+	if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
+		result = (uint16_t)(v[0] | v[1] << 8);
+		error = (uint16_t)(v[2] | v[3] << 8);
+	}
+	if (id == WDS_BIND_MUX_DATA_PORT) {
+		tell("mpss: ims pdn: the client bound to mux %u: result %u, error %u\n", DATA_MUX + 1, result, error);
+		ims_pdn_step = 21;
+		return;
+	}
+	if (id == WDS_SET_IP_FAMILY) {
+		tell("mpss: ims pdn: the client's family IPv%d: result %u, error %u\n", ims_pdn_family, result, error);
+		ims_pdn_step = 11;
+		return;
+	}
+	if (id != WDS_START_NETWORK_INTERFACE) {
+		return;
+	}
+	if (result == 0) {
+		tell("mpss: ims pdn: THE IMS CONNECTION IS UP (APN ims, IPv%d)\n", ims_pdn_family);
+		ims_pdn_step = 3;
+		return;
+	}
+	{
+		int reason = -1, vtype = -1, vreason = -1;
+
+		if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 2) {
+			reason = v[0] | v[1] << 8;
+		}
+		if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 4) {
+			vtype = v[0] | v[1] << 8;
+			vreason = v[2] | v[3] << 8;
+		}
+		tell("mpss: ims pdn: refused: result %u, error %u, end reason %d, verbose type %d reason %d (retried in 10 s)\n",
+		    result, error, reason, vtype, vreason);
+	}
+	ims_pdn_step = 11;
+	ims_pdn_tried_us = now_us();
+}
+
+static void
+ims_pdn_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance,
+    uint32_t node, uint32_t port)
+{
+	if (service != QMI_WDS) {
+		return;
+	}
+	if (arrived && ims_pdn_port_number == 0) {
+		ims_pdn_node = node;
+		ims_pdn_port_number = port;
+	} else if (!arrived && node == ims_pdn_node && port == ims_pdn_port_number) {
+		ims_pdn_node = ims_pdn_port_number = 0;
+	}
+}
+
+static void
+ims_pdn_advance(void)
+{
+	if (ims_pdn_port == NULL || ims_pdn_port_number == 0 || !nas.state.registered) {
+		return;
+	}
+	if (ims_pdn_step == 0) {
+		/* bound first, as the data session's client is (a client never bound is told 70, invalid operation: run 182236) */
+		uint8_t bind[7 + 11 + 4] = { QMI_REQUEST, 0xc2, 0, WDS_BIND_MUX_DATA_PORT & 0xff, WDS_BIND_MUX_DATA_PORT >> 8, 15, 0,
+		    0x10, 8, 0, DATA_ENDPOINT_EMBEDDED, 0, 0, 0, DATA_ENDPOINT_INTERFACE, 0, 0, 0, 0x11, 1, 0, DATA_MUX + 1 };
+
+		ims_pdn_step = 1;
+		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, bind, sizeof(bind));
+		return;
+	}
+	if (ims_pdn_step == 21) {
+		uint8_t q[11] = { QMI_REQUEST, 0xc0, 0, WDS_SET_IP_FAMILY & 0xff, WDS_SET_IP_FAMILY >> 8, 4, 0, 0x01, 1, 0,
+		    (uint8_t)ims_pdn_family };
+
+		ims_pdn_step = 22;
+		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, q, sizeof(q));
+		return;
+	}
+	if (ims_pdn_step == 11 && now_us() - ims_pdn_tried_us > 10000000ull) {
+		/* (TLV 0x35, the call type: 1 embedded -- the device's own, as the modem's IMS stack's would be) */
+		uint8_t q[7 + 4 + 6 + 4] = { QMI_REQUEST, 0xc1, 0, WDS_START_NETWORK_INTERFACE & 0xff, WDS_START_NETWORK_INTERFACE >> 8,
+		    14, 0, 0x19, 1, 0, (uint8_t)ims_pdn_family, 0x14, 3, 0, 'i', 'm', 's', 0x35, 1, 0, 1 };
+
+		ims_pdn_step = 2;
+		ims_pdn_tried_us = now_us();
+		tell("mpss: ims pdn: starting the connection to APN ims (IPv%d)\n", ims_pdn_family);
+		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, q, sizeof(q));
+	}
+}
+
+static void
+voice_open(void)
+{
+	int on = 1;
+
+	if (voice_port != NULL || (PE_parse_boot_argn("call", &on, sizeof(on)) && on == 0)) {
+		return;
+	}
+	PE_parse_boot_argn("call_answer", &call_answer, sizeof(call_answer));
+	PE_parse_boot_argn("call_secs", &call_secs, sizeof(call_secs));
+	/* (a string: PE_parse_boot_argn would take the digits for a number) */
+	if (PE_parse_boot_arg_str("call_to", call_to, sizeof(call_to))) {
+		for (const char *c = call_to; *c != 0; c++) {
+			if ((*c < '0' || *c > '9') && *c != '+') {
+				tell("mpss: call: call_to=%s is not a number: nothing is dialled\n", call_to);
+				call_to[0] = 0;
+				break;
+			}
+		}
+	}
+	voice_port = qrtr_open(voice_receive, voice_server, NULL);
+	if (voice_port != NULL) {
+		qrtr_lookup(voice_port, QMI_VOICE, 0, 0);
+	}
+	if (!PE_parse_boot_argn("pdc", &on, sizeof(on)) || on != 0) {
+		PE_parse_boot_arg_str("pdc_use", pdc_use, sizeof(pdc_use));
+		pdc_port = qrtr_open(pdc_receive, pdc_server, NULL);
+		if (pdc_port != NULL) {
+			qrtr_lookup(pdc_port, QMI_PDC, 0, 0);
+		}
+	}
+	PE_parse_boot_argn("volte", &volte_wanted, sizeof(volte_wanted));
+	PE_parse_boot_argn("ims_pdn", &ims_pdn_wanted, sizeof(ims_pdn_wanted));
+	if (ims_pdn_wanted) {
+		ims_pdn_family = ims_pdn_wanted == 4 ? 4 : 6;  /* (ims_pdn=4: IPv4) */
+		ims_pdn_port = qrtr_open(ims_pdn_receive, ims_pdn_server, NULL);
+		if (ims_pdn_port != NULL) {
+			qrtr_lookup(ims_pdn_port, QMI_WDS, 0, 0);
+		}
+	}
+	imss_port = qrtr_open(imss_receive, imss_server, NULL);
+	if (imss_port != NULL) {
+		qrtr_lookup(imss_port, QMI_IMSS, 0, 0);
+	}
+	imsa_port = qrtr_open(imsa_receive, imsa_server, NULL);
+	if (imsa_port != NULL) {
+		qrtr_lookup(imsa_port, QMI_IMSA, 0, 0);
+	} else {
+		tell("mpss: ims: no QRTR port left for the IMS client\n");
+	}
+}
+
+/* Every second or two: events asked for once; call_to dialled; an incoming call answered; calls hung up on time. */
+static void
+voice_advance(void)
+{
+	uint64_t now = now_us();
+
+	imsa_advance();
+	imss_advance();
+	ims_pdn_advance();
+	pdc_advance();
+	if (voice_port == NULL || voice_port_number == 0) {
+		return;
+	}
+	if (voice_setup == 0) {
+		uint8_t t[4] = { 0x13, 1, 0, 1 };     /* call notification events */
+
+		voice_setup = 1;
+		voice_request(VOICE_INDICATION_REGISTER, 0x81, t, sizeof(t));
+	}
+	if (!nas.state.registered) {
+		return;
+	}
+	if (call_registered_us == 0) {
+		call_registered_us = now;
+	}
+	if (call_to[0] != 0 && !call_dialled && now - call_registered_us > 10000000ull) {
+		uint8_t t[3 + 24];
+		unsigned n = (unsigned)strlen(call_to);
+
+		call_dialled = 1;
+		t[0] = 0x01; t[1] = (uint8_t)n; t[2] = 0;
+		memcpy(t + 3, call_to, n);
+		tell("mpss: call: dialling %s\n", call_to);
+		voice_request(VOICE_DIAL_CALL, 0x82, t, 3 + n);
+		return;
+	}
+	if (call_id == 0 || call_state_raw == 9 || call_hung) {
+		return;
+	}
+	if (call_state_raw == 2 && call_answer && !call_answered && now - call_since_us > 4000000ull) {
+		call_answered = 1;
+		tell("mpss: call: answering call %u\n", call_id);
+		voice_call_ask(VOICE_ANSWER_CALL, 0x83, call_id);
+		return;
+	}
+	if ((call_state_raw == 3 && now - call_since_us > (uint64_t)call_secs * 1000000ull) ||
+	    ((call_state_raw == 1 || call_state_raw == 5) && call_direction == 1 && now - call_since_us > 60000000ull)) {
+		call_hung = 1;
+		tell("mpss: call: hanging up call %u (%s for %llu s)\n", call_id, call_state_name(call_state_raw),
+		    (now - call_since_us) / 1000000);
+		voice_call_ask(VOICE_END_CALL, 0x84, call_id);
+	}
+}
+
 /* ---- GNSS: the modem's location service (QMI LOC, 0x10) ------------------------------------------- */
 
 /*
@@ -8059,6 +8957,7 @@ nas_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 		loc_advance();
 		sms_advance();
+		voice_advance();
 		for (unsigned ms = 0; ms < 2000 && nas_wanted; ms += 100) {
 			sleep_ms(100);
 		}
@@ -8246,6 +9145,19 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		    "services; NAS %s, %s, %u bars (%d dBm, %s); it stays on, asked every two seconds\n", (now_us() - began) / 1000, qrtr_peer,
 		    services, nas.connected ? "there" : "NOT THERE", nas.state.registered ? "REGISTERED" : "not registered", nas.state.bars,
 		    nas.state.has_signal ? nas.state.dbm : 0, radio_name(nas.state.radio_interface));
+		{
+			char list[64 * 9];
+			unsigned at = 0;
+
+			for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]) && at + 10 < sizeof(list); i++) {
+				if (qrtr_servers[i].there) {
+					at += (unsigned)snprintf(list + at, sizeof(list) - at, "%u.%u ", qrtr_servers[i].service,
+					    qrtr_servers[i].instance >> 8);
+				}
+			}
+			list[at] = 0;
+			tell("mpss: the modem's services (service.instance): %s\n", list);
+		}
 		nas_start();
 	} else {
 		tell("mpss: THE MODEM DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
