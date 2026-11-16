@@ -1255,6 +1255,85 @@ watch_metallib_lookups(const char *arguments)
 	    ca_metallib ? ca_metallib : "");
 }
 
+
+/*
+ * The 6T's accelerometer (the SLPI's BMI160, read by the kernel: kern.hakios.accel_x/_y/_z in mm/s^2, Android's axes --
+ * x to the right, y to the top, z out of the screen; lying face up z reads +9.8) turned into the device's orientation for
+ * backboardd. Its BKOrientationManager would have it from CoreMotion, which here has no motion coprocessor to ask; it is
+ * told instead, as its CoreMotion path tells it (-updateDeviceOrientation:changeSource:, source 1: backboardd 20F66,
+ * -_queue_updateDeviceOrientationFromCoreMotion: at 0x10007b518). UIDeviceOrientation: 1 portrait, 2 upside down,
+ * 3 landscape left (the top to the left: x up), 4 landscape right, 5 face up, 6 face down. An axis has to carry 70% of
+ * gravity and lead the next by 30%, and the answer has to stay for three readings (0.3 s) before it is passed on.
+ */
+static long
+accel_read(const char *name, int *ok)
+{
+	int v = 0;
+	size_t size = sizeof(v);
+
+	if (sysctlbyname(name, &v, &size, NULL, 0) != 0) {
+		*ok = 0;
+	}
+	return v;
+}
+
+static long
+orientation_from(long x, long y, long z)
+{
+	long ax = labs(x), ay = labs(y), az = labs(z), g = 9807;
+
+	if (ay > g * 7 / 10 && ay > ax + g * 3 / 10 && ay > az + g * 3 / 10) {
+		return y > 0 ? 1 : 2;
+	}
+	if (ax > g * 7 / 10 && ax > ay + g * 3 / 10 && ax > az + g * 3 / 10) {
+		return x > 0 ? 3 : 4;
+	}
+	if (az > g * 7 / 10 && az > ax + g * 3 / 10 && az > ay + g * 3 / 10) {
+		return z > 0 ? 5 : 6;
+	}
+	return 0;                                       /* (between two: nothing new) */
+}
+
+static void
+orientation_start(void)
+{
+	int ok = 1;
+	dispatch_source_t timer;
+	static long told, seen, same;
+
+	accel_read("kern.hakios.accel_samples", &ok);
+	if (!ok) {
+		return;                                 /* (no accelerometer in this kernel) */
+	}
+	timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+	dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC / 10, NSEC_PER_SEC / 50);
+	dispatch_source_set_event_handler(timer, ^{
+		int good = 1;
+		long x = accel_read("kern.hakios.accel_x", &good), y = accel_read("kern.hakios.accel_y", &good),
+		    z = accel_read("kern.hakios.accel_z", &good), samples = accel_read("kern.hakios.accel_samples", &good), o;
+		Class manager;
+		id shared;
+
+		if (!good || samples == 0 || (o = orientation_from(x, y, z)) == 0) {
+			return;
+		}
+		same = o == seen ? same + 1 : 1;
+		seen = o;
+		if (same < 3 || o == told) {
+			return;
+		}
+		if ((manager = objc_getClass("BKOrientationManager")) == Nil ||
+		    (shared = ((id (*)(Class, SEL))objc_msgSend)(manager, sel_registerName("sharedInstance"))) == nil) {
+			return;
+		}
+		((void (*)(id, SEL, long long, long long))objc_msgSend)(shared, sel_registerName("updateDeviceOrientation:changeSource:"), o, 1);
+		say("hakios: the device's orientation is %ld (accelerometer %ld %ld %ld mm/s^2)\n", o, x, y, z);
+		told = o;
+	});
+	dispatch_resume(timer);
+	say("hakios: the accelerometer gives backboardd the device's orientation\n");
+}
+
 __attribute__((constructor))
 static void
 hakios_init(void)
@@ -1322,6 +1401,7 @@ hakios_init(void)
 		 * survive; not tried again since, and until it is, the five seconds stay.)
 		 */
 		input_start();
+		orientation_start();
 	} else if (strncmp(name, "containermanagerd", 17) == 0) {
 		container_manager_fixes();
 	}
