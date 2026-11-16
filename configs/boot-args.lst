@@ -22,6 +22,7 @@ adsp_pause	k
 adsp_return	k
 adsp_step	k
 adsp_wait	k
+als_hid	u
 apfs_cheap	k
 apfs_check	k
 apfs_chunk	k
@@ -125,6 +126,7 @@ display_probe	k
 epoch	k
 fastrpc_log	k
 fastrpc_mem	k
+fb_auto	k
 fb_beam	k
 fb_beat	k
 fb_ca_hz	k

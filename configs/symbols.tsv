@@ -21,6 +21,7 @@ ADSP_PAUSE	arg	adsp_pause	Audio and battery	k	hakios.adsp.c
 ADSP_RETURN	arg	adsp_return	Audio and battery	k	hakios.adsp.c	
 ADSP_STEP	arg	adsp_step	Audio and battery	k	hakios.adsp.c	
 ADSP_WAIT	arg	adsp_wait	Audio and battery	k	hakios.adsp.c	
+ALS_HID	arg	als_hid	User space	u	inject.c	
 APFS_CHEAP	arg	apfs_cheap	Storage and APFS	k	apfs_vfsops.c	
 APFS_CHECK	arg	apfs_check	Storage and APFS	k	hakios.apfs_check.c	walk the whole volume and print only the totals
 APFS_CHUNK	arg	apfs_chunk	Storage and APFS	k	hakios.apfs_check.c	
@@ -116,6 +117,7 @@ DDR_VOTE	arg	ddr_vote	CPU, memory and boot	k	hakios.cpufreq.c
 DISPLAY_PROBE	arg	display_probe	GPU and display	k	hakios.adreno.c	before any step: read what the firmware left the display controller doing (display_probe() below; two clocks are turned on, nothing else written)
 FASTRPC_LOG	arg	fastrpc_log	User space	k	hakios.slpi.c	
 FASTRPC_MEM	hex	fastrpc_mem	User space	k	hakios.slpi.c	
+FB_AUTO	arg	fb_auto	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_BEAM	arg	fb_beam	GPU and display	k	MiniIOMobileFramebuffer.cpp	frames written to the panel's memory whenever their beat comes, as before
 FB_BEAT	arg	fb_beat	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_CA_HZ	arg	fb_ca_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	the refresh rate told to CoreAnimation (IOMFBDisplayRefresh) when it is not to be fb_hz's

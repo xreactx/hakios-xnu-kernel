@@ -614,6 +614,9 @@ extern IOHIDEventRef IOHIDEventCreateKeyboardEvent(CFAllocatorRef allocator, uin
     Boolean down, uint32_t options);
 extern void IOHIDEventAppendEvent(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
 extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFIndex value);
+extern void IOHIDEventSetFloatValue(IOHIDEventRef event, uint32_t field, double value);
+extern IOHIDEventRef IOHIDEventCreateAmbientLightSensorEvent(CFAllocatorRef allocator, uint64_t time, int32_t level, int32_t channel0,
+    int32_t channel1, int32_t channel2, int32_t channel3, uint32_t options);
 extern CFIndex IOHIDEventGetIntegerValue(IOHIDEventRef event, uint32_t field);
 
 #define HID_CLIENT_SIMPLE               4       /* a client that only sends */
@@ -838,6 +841,67 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 	return service;
 }
 
+
+/*
+ * The 6T's ambient light sensor (the SLPI's, read by the kernel: kern.hakios.light, millilux) as the HID service
+ * CoreBrightness looks for (CBALSService: Apple's vendor page 0xff00, usage 4), made while CoreBrightness still waits
+ * for one to arrive (-[BLControl waitForALSArrival], five seconds from the window server's start). Its events, twice a
+ * second while the light changes and every five seconds anyway: the level in lux and the illuminance
+ * (kIOHIDEventFieldAmbientLightSensorIlluminance: type 12's field 11), as CoreBrightness logs them.
+ */
+#define HID_PAGE_APPLE_VENDOR           0xff00
+#define HID_USAGE_AMBIENT_LIGHT         4
+#define FIELD_ALS_ILLUMINANCE           (12u << 16 | 11)
+
+static void
+als_start(IOHIDEventSystemClientRef client)
+{
+	int light = 0;
+	size_t size = sizeof(light);
+	static IOHIDServiceClientRef als;
+	dispatch_source_t timer;
+
+	if (sysctlbyname("kern.hakios.light_samples", &light, &size, NULL, 0) != 0) {
+		return;                                 /* (no light sensor in this kernel) */
+	}
+	als = make_service(client, "HakiOS ambient light sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_AMBIENT_LIGHT, false);
+	say("hakios: input: ambient light sensor service %p\n", (void *)als);
+	if (als == NULL) {
+		return;
+	}
+	timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+	dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC / 2, NSEC_PER_SEC / 20);
+	dispatch_source_set_event_handler(timer, ^{
+		static int last = -1, quiet, told;
+		int millilux = 0, samples = 0;
+		size_t n = sizeof(millilux);
+		IOHIDEventRef event;
+
+		if (sysctlbyname("kern.hakios.light", &millilux, &n, NULL, 0) != 0) {
+			return;
+		}
+		n = sizeof(samples);
+		sysctlbyname("kern.hakios.light_samples", &samples, &n, NULL, 0);
+		if (samples == 0 || (millilux == last && ++quiet < 10)) {
+			return;
+		}
+		quiet = 0;
+		last = millilux;
+		event = IOHIDEventCreateAmbientLightSensorEvent(NULL, mach_absolute_time(), millilux / 1000, millilux / 1000, 0, 0, 0, 0);
+		if (event == NULL) {
+			return;
+		}
+		IOHIDEventSetFloatValue(event, FIELD_ALS_ILLUMINANCE, millilux / 1000.0);
+		IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
+		IOHIDVirtualServiceClientDispatchEvent(als, event);
+		CFRelease(event);
+		if (told++ < 5 || (told % 120) == 0) {
+			say("hakios: input: ambient light %d.%03d lux given to the event server\n", millilux / 1000, millilux % 1000);
+		}
+	});
+	dispatch_resume(timer);
+}
+
 /* One frame of the touch screen: the hand, and under it every finger that is down or has just lifted. */
 static void
 send_touch(IOHIDServiceClientRef screen, const struct hakios_touch *t)
@@ -982,6 +1046,19 @@ input_thread(__unused void *arg)
 	}
 	if (screen != NULL) {
 		buttons = make_service(client, "HakiOS buttons", HID_PAGE_CONSUMER, HID_USAGE_CONSUMER_CONTROL, false);
+		/*
+		 * (not by default: with this service CoreBrightness crashed backboardd 13 times in a row, run 201535 -- a NULL
+		 * object's +0x1c8 read in CoreBrightness at 0x1af0a2030, from 0x1af03a05c: an ALS model it builds from Apple's
+		 * own calibration, which this phone has not got. Boot-arg als_hid=1 to try it.)
+		 */
+		{
+			char arguments[1024] = "";
+			size_t size = sizeof(arguments) - 1;
+
+			if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "als_hid=1") != NULL) {
+				als_start(client);
+			}
+		}
 	}
 	say("hakios: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
 	dispatch_semaphore_signal(input_services_made); /* see wait_for_als_arrival() */

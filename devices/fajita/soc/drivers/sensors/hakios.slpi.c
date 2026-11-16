@@ -57,6 +57,7 @@ extern lck_mtx_t hakios_rsc_lock;            /* RPMh's sequencer, shared with th
 
 static LCK_GRP_DECLARE(slpi_lock_group, "hakios-slpi");
 static void frpc_give_back(void);       /* (the FastRPC buffer ours alone again, when the SLPI is stopped) */
+extern void hakios_fb_ambient(int millilux);     /* iokit/Kernel/MiniIOMobileFramebuffer.cpp */
 
 #define STEPS                   10
 #define HAKIOS_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin */
@@ -4830,6 +4831,9 @@ see_other(unsigned k, uint32_t msg_id, const uint8_t *p, size_t length)
 		break;
 	}
 	*x = (int)v[0];
+	if (k == SEE_LIGHT) {
+		hakios_fb_ambient((int)v[0]);   /* (auto-brightness: the panel's driver, MiniIOMobileFramebuffer.cpp) */
+	}
 	if (y != NULL) {
 		*y = (int)v[1];
 		*z = (int)v[2];

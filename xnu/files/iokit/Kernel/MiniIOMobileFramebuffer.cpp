@@ -2281,7 +2281,98 @@ panelBrightnessLocked(uint32_t level)
 	panelSend(false, 0x39, bytes, sizeof(bytes));
 }
 
-/* Brightness 0 (dark) to 1023. */
+/*
+ * Auto-brightness, here (boot-arg fb_auto=0: not). CoreBrightness's own needs an ambient light sensor with Apple's
+ * calibration (with ours as a HID service it crashed backboardd, run 201535), so the kernel does it: what the slider
+ * asks (gPanelLevel) is scaled by the room's light, which the SLPI's sensor reports (hakios_fb_ambient(), from
+ * hakios.slpi.c) -- 0.3x in the dark, 1x at 300 lux, up to 2x in daylight, never above the panel's 1023 -- and a change
+ * of the light is followed over a second or two, a quarter of the way every 60 ms.
+ */
+static TUNABLE(uint32_t, gAutoBrightness, "fb_auto", 1);
+static volatile int gAmbientMillilux = -1;
+static int gAmbientApplied = -1;                        /* the light the shown level was worked out for */
+static uint32_t gShownLevel;                            /* what the panel shows (0: not set by us yet) */
+static thread_call_t gPanelRamp;
+
+static uint32_t
+autoLevel(uint32_t user)
+{
+	static const struct { int millilux; uint32_t factor; } curve[] = {
+		{ 0, 300 }, { 5000, 450 }, { 20000, 650 }, { 80000, 850 }, { 300000, 1000 }, { 1000000, 1250 }, { 5000000, 1600 },
+		{ 20000000, 2000 },
+	};
+	int lux = gAmbientMillilux;
+	uint32_t factor = 1000, level;
+	unsigned i;
+
+	if (!gAutoBrightness || lux < 0 || user == 0) {
+		return user;
+	}
+	for (i = 1; i < sizeof(curve) / sizeof(curve[0]) && lux > curve[i].millilux; i++) {
+	}
+	if (i == sizeof(curve) / sizeof(curve[0])) {
+		factor = curve[i - 1].factor;
+	} else {
+		uint64_t span = (uint64_t)(curve[i].millilux - curve[i - 1].millilux), in = (uint64_t)(lux - curve[i - 1].millilux);
+
+		factor = curve[i - 1].factor + (uint32_t)((curve[i].factor - curve[i - 1].factor) * in / span);
+	}
+	level = (uint32_t)((uint64_t)user * factor / 1000);
+	return level < 4 ? 4 : level > PANEL_LEVEL_MAX ? PANEL_LEVEL_MAX : level;
+}
+
+/* A step of a change of light: a quarter of the way (at least one), then again in 60 ms until there. */
+static void
+panelRampFired(__unused thread_call_param_t a, __unused thread_call_param_t b)
+{
+	uint32_t target, next;
+	uint64_t deadline;
+
+	if (!panelReady()) {
+		return;
+	}
+	panelLock(true);
+	target = autoLevel(gPanelLevel);
+	next = gShownLevel;
+	if (next < target) {
+		next += (target - next + 3) / 4;
+	} else if (next > target) {
+		next -= (next - target + 3) / 4;
+	}
+	if (next != gShownLevel && !gPanelOff && gPanelLevel != 0) {
+		gShownLevel = next;
+		panelBrightnessLocked(next);
+	}
+	panelUnlock();
+	if (next != target && !gPanelOff) {
+		clock_interval_to_deadline(60, kMillisecondScale, &deadline);
+		thread_call_enter_delayed(gPanelRamp, deadline);
+	}
+}
+
+/* The SLPI's ambient light sensor, in millilux (hakios.slpi.c, on each change). */
+extern "C" void
+hakios_fb_ambient(int millilux)
+{
+	int last = gAmbientApplied;
+	static uint32_t told;
+
+	gAmbientMillilux = millilux;
+	/* (a change worth following: a fifth either way, or from nothing) */
+	if (last >= 0 && millilux * 5 <= last * 6 && millilux * 6 >= last * 5) {
+		return;
+	}
+	gAmbientApplied = millilux;
+	if (told++ < 10 || (told & 31) == 0) {
+		hakios_tl("fb_panel: ambient light %d.%03d lux: the panel to %u of %u (the slider's %u)\n", millilux / 1000, millilux % 1000,
+		    autoLevel(gPanelLevel), PANEL_LEVEL_MAX, gPanelLevel);
+	}
+	if (gPanelRamp != NULL && gPanelLevel != 0) {
+		thread_call_enter(gPanelRamp);
+	}
+}
+
+/* Brightness 0 (dark) to 1023: what the slider asks, before the light is taken into account. */
 static void
 panelBrightness(uint32_t level)
 {
@@ -2299,8 +2390,9 @@ panelBrightness(uint32_t level)
 		    gPanelOff ? ", kept for when it is on" : "", gPanelSent, gPanelFailed, gPanelWaited);
 	}
 	gPanelLevel = level == 0 ? 1 : level;   /* (0 is remembered as the dimmest: never "never asked") */
+	gShownLevel = level == 0 ? 0 : autoLevel(level);
 	if (!gPanelOff) {
-		panelBrightnessLocked(level);
+		panelBrightnessLocked(gShownLevel);
 	}
 	panelUnlock();
 }
@@ -2321,7 +2413,8 @@ panelPowerLocked(bool on)
 		panelSend(true, 0x39, kPanelKeyOff, sizeof(kPanelKeyOff));
 		gPanelOff = false;
 		if (gPanelLevel != 0) {
-			panelBrightnessLocked(gPanelLevel);
+			gShownLevel = autoLevel(gPanelLevel);
+			panelBrightnessLocked(gShownLevel);
 		}
 	} else {
 		panelSend(false, 0x39, kPanelKeyOn, sizeof(kPanelKeyOn));
@@ -2808,6 +2901,7 @@ publishBacklight(IOService * provider)
 	}
 	gPanelLock = IOLockAlloc();
 	gPanelLink = IOSimpleLockAlloc();
+	gPanelRamp = thread_call_allocate(panelRampFired, NULL);
 	backlight = OSTypeAlloc(AppleARMBacklight);
 	if (backlight != NULL && backlight->init() && backlight->attach(provider)) {
 		backlight->setName("backlight");
