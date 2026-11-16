@@ -4,7 +4,7 @@
  * sensors registry: bmi160_0_platform.config) are not the application processor's to reach: the SLPI's firmware
  * (Qualcomm's "SEE") owns them, and offers them over QMI.
  *
- * This is the audio DSP's driver (drivers/audio/hakios.adsp.c) copied with the SLPI's numbers, as that one was
+ * This is the sensors DSP's driver (drivers/audio/hakios.adsp.c) copied with the SLPI's numbers, as that one was
  * the Wi-Fi DSP's: its comments say why each thing is done so. What is different:
  *   - processor 3 in the shared memory; its SMP2P items 481 (its) and 430 (ours), its last words in item 424
  *   - its doorbells: bits 24 (GLINK) and 26 (SMP2P) of the APCS's IPC register; its rings to us GIC 170 and 172
@@ -40,6 +40,7 @@
 
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);
@@ -54,7 +55,8 @@ extern lck_mtx_t hakios_aop_mailbox_lock;
 extern lck_mtx_t hakios_smem_alloc_lock;
 extern lck_mtx_t hakios_rsc_lock;            /* RPMh's sequencer, shared with the other DSP's driver */
 
-static LCK_GRP_DECLARE(slpi_lock_group, "hakios-adsp");
+static LCK_GRP_DECLARE(slpi_lock_group, "hakios-slpi");
+static void frpc_give_back(void);       /* (the FastRPC buffer ours alone again, when the SLPI is stopped) */
 
 #define STEPS                   10
 #define HAKIOS_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin */
@@ -421,11 +423,11 @@ show_partition(void)
 	char line[320];
 
 	if (partition == 0 || !smem_peek(partition, &header, sizeof(header))) {
-		printf("slpi: %u: there is no partition for us and the audio DSP (0 and 2)\n", step);
+		printf("slpi: %u: there is no partition for us and the sensors DSP (0 and 2)\n", step);
 		return;
 	}
 	count = smem_items(partition, cacheline, found, 256);
-	printf("slpi: %u: the partition for us and the audio DSP (0 and 2): at %#lx, %#x bytes, of which %#x free; %u items\n", step,
+	printf("slpi: %u: the partition for us and the sensors DSP (0 and 2): at %#lx, %#x bytes, of which %#x free; %u items\n", step,
 	    smem_phys + partition, size, header.free_cached - header.free_uncached, count);
 	for (unsigned i = 0; i < count && i < 256;) {
 		int at = 0;
@@ -536,7 +538,7 @@ show_crash_reason(void)
 	if (text[0] == 0) {
 		printf("slpi: %u: item %u, the DSP's last words (%u bytes): none\n", step, ITEM_CRASH_REASON, size);
 	} else {
-		printf("slpi: %u: THE AUDIO DSP'S LAST WORDS (item %u, %u bytes): \"%s\"\n", step, ITEM_CRASH_REASON, size, text);
+		printf("slpi: %u: THE SENSORS DSP'S LAST WORDS (item %u, %u bytes): \"%s\"\n", step, ITEM_CRASH_REASON, size, text);
 	}
 }
 
@@ -576,7 +578,7 @@ static struct block ipcc = { "ipcc", 0x00408000, 0x1000 };
 
 /*
  * A SoC without IPCC (the SDM845; soc_apcs_ipc=0x1799000c, the APCS's IPC register) rings every other
- * processor by a bit of that one register, written alone: the audio DSP's GLINK is bit 8, its SMP2P bit
+ * processor by a bit of that one register, written alone: the sensors DSP's GLINK is bit 8, its SMP2P bit
  * 10, the always-on processor bit 0 (dt: qcom,irq-mask of qcom,glink-smem-native-xprt-adsp, qcom,irq-bitmask
  * of the qcom,smp2p with remote-pid 2, the second reg of qcom,qmp-aop). The DSP's rings to us are the
  * GIC's interrupts 156 (GLINK) and 158 (SMP2P), edge-triggered; nothing here takes interrupts, so their
@@ -593,7 +595,7 @@ static struct block gicd = { "gic", 0x17a00000, 0x1000 };
 #define GICD_ISPENDR(id)        (0x200 + 4 * ((id) / 32))
 #define GICD_ICPENDR(id)        (0x280 + 4 * ((id) / 32))
 
-/* A ring of the audio DSP's doorbell for that signal (IPCC_GLINK or IPCC_SMP2P). */
+/* A ring of the sensors DSP's doorbell for that signal (IPCC_GLINK or IPCC_SMP2P). */
 static void
 ring_dsp(uint32_t signal)
 {
@@ -606,7 +608,7 @@ ring_dsp(uint32_t signal)
 	wr(ipcc.base + IPCC_SEND, IPCC_LPASS << 16 | signal);
 }
 
-/* A ring from the audio DSP, cleared: its signal (IPCC_GLINK or IPCC_SMP2P), or -1: none. */
+/* A ring from the sensors DSP, cleared: its signal (IPCC_GLINK or IPCC_SMP2P), or -1: none. */
 static int
 heard(void)
 {
@@ -674,7 +676,7 @@ static struct {
 } doorbell;
 
 /*
- * The audio DSP's rings, counted and cleared. Another's ring (the Wi-Fi DSP's, the always-on
+ * The sensors DSP's rings, counted and cleared. Another's ring (the Wi-Fi DSP's, the always-on
  * processor's) is left for whoever listens for it: IPCC names the same one until it is cleared,
  * so the look ends there.
  */
@@ -693,7 +695,7 @@ doorbells(void)
 			uint64_t now = now_us() - doorbell.since;
 
 			doorbell.said++;
-			printf("slpi: doorbell: +%llu.%03llu ms: signal %u of the audio DSP; heard and cleared\n", now / 1000, now % 1000,
+			printf("slpi: doorbell: +%llu.%03llu ms: signal %u of the sensors DSP; heard and cleared\n", now / 1000, now % 1000,
 			    who);
 		}
 	}
@@ -825,7 +827,7 @@ out:
 /* ---- RPMh: the DSP's two rails, asked for while it boots ------------------------------------------------ */
 
 /*
- * The audio DSP's logic and memories run from LPASS's own rails, LCX and LMX (dt: vdd_cx and
+ * The sensors DSP's logic and memories run from LPASS's own rails, LCX and LMX (dt: vdd_cx and
  * vdd_mx of qcom,lpass@3700000 are PM7325 L5 and L4 "level" regulators, RPMh resources lcx.lvl and
  * lmx.lvl), which the boot loader leaves at retention (16). Linux and Android ask for level 384
  * while the DSP boots, until it says it has asked for its own (bit 2, "proxy-unvote"); without it
@@ -1005,7 +1007,7 @@ rails(uint32_t level)
 		printf("slpi: %u: about to ask RPMh, through TCS %u, for %s (%#x) = %u (level %u)\n", step, RPMH_TCS, names[0],
 		    addresses[0], values[0], level);
 	}
-	snprintf(last_write, sizeof(last_write), "step %u asked RPMh for the audio DSP's rails at level %u", step, level);
+	snprintf(last_write, sizeof(last_write), "step %u asked RPMh for the sensors DSP's rails at level %u", step, level);
 	hold();
 	irq_enable = rd(rsc.base + RSC_IRQ_ENABLE);
 	wr(rsc.base + RSC_IRQ_ENABLE, irq_enable | 1u << RPMH_TCS);    /* (the done bit follows it, as hakios.synaptics.c found) */
@@ -1125,7 +1127,7 @@ step_survey(void)
 	{
 		char what[120];
 
-		snprintf(what, sizeof(what), "read our partition with the audio DSP in the shared memory (%#lx), and its items", smem_phys);
+		snprintf(what, sizeof(what), "read our partition with the sensors DSP in the shared memory (%#lx), and its items", smem_phys);
 		announce(what);
 	}
 	show_partition();
@@ -1292,7 +1294,7 @@ step_firmware(void)
 	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
 	uint8_t first[4] = { 0 };
 
-	announce("find the audio DSP's image in the small image or on the root, and check it against its own header");
+	announce("find the sensors DSP's image in the small image or on the root, and check it against its own header");
 	image_forget();
 	image.segments = 0;
 	header = image_file("slpi.mdt", &size);
@@ -1429,7 +1431,8 @@ extern bool hakios_tz_enter(void);
 extern void hakios_tz_leave(bool held);
 
 static int32_t
-scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third, uint64_t *answer)
+scm4(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third, uint64_t fourth,
+    uint64_t *answer)
 {
 	uint64_t session = 0;
 	bool held;
@@ -1445,7 +1448,7 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 		register uint64_t x2 __asm__("x2") = first;
 		register uint64_t x3 __asm__("x3") = second;
 		register uint64_t x4 __asm__("x4") = third;
-		register uint64_t x5 __asm__("x5") = 0;
+		register uint64_t x5 __asm__("x5") = fourth;
 		register uint64_t x6 __asm__("x6") = session;
 		register uint64_t x7 __asm__("x7") = 0;
 
@@ -1462,6 +1465,12 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 	printf("slpi: %u: TrustZone keeps saying the call was interrupted\n", step);
 	hakios_tz_leave(held);
 	return -1;
+}
+
+static int32_t
+scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third, uint64_t *answer)
+{
+	return scm4(what, function, arguments, first, second, third, 0, answer);
 }
 
 static uint32_t
@@ -1535,7 +1544,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	value_at = at + SMP2P_AT_VALUE((uint32_t)entry);
 	printf("slpi: %u: about to ask the DSP to stop: bit 0 of our entry \"%s\" at %#lx, and its SMP2P doorbell\n", step,
 	    OUR_ENTRY_STOP, smem_phys + value_at);
-	snprintf(last_write, sizeof(last_write), "step %u asked the audio DSP to stop", step);
+	snprintf(last_write, sizeof(last_write), "step %u asked the sensors DSP to stop", step);
 	smem_poke(value_at, ours.entry[entry].value | DSP_STOP);
 	settle();
 	ring_dsp(IPCC_SMP2P);
@@ -1549,7 +1558,7 @@ dsp_ask_to_stop(uint32_t bound_ms)
 	}
 	state = dsp_words(&theirs) ? dsp_state(&theirs) : 0;
 	printf("slpi: %u: %s after %llu.%03llu ms; its entry says %#x\n", step, state & DSP_STOP_ACK ?
-	    "THE AUDIO DSP ACKNOWLEDGES THE STOP" : "THE AUDIO DSP DOES NOT ACKNOWLEDGE THE STOP", (now - asked) / 1000,
+	    "THE SENSORS DSP ACKNOWLEDGES THE STOP" : "THE SENSORS DSP DOES NOT ACKNOWLEDGE THE STOP", (now - asked) / 1000,
 	    (now - asked) % 1000, state);
 	smem_poke(value_at, ours.entry[entry].value & ~DSP_STOP);
 	settle();
@@ -1566,18 +1575,19 @@ dsp_shutdown(const char *why)
 	uint64_t answer = ~0ull;
 	int32_t result;
 
-	printf("slpi: %u: %s: the audio DSP is asked to stop, then TrustZone to shut it down\n", step, why);
+	printf("slpi: %u: %s: the sensors DSP is asked to stop, then TrustZone to shut it down\n", step, why);
 	if (!leaving) {
 		link_stop();
 	}
 	stopped_by_its_word = dsp_ask_to_stop(leaving ? 2000 : 5000);
-	result = scm("to shut the audio DSP down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_SLPI, 0, 0, &answer);
+	result = scm("to shut the sensors DSP down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_SLPI, 0, 0, &answer);
 	if (result != 0 || answer != 0) {
-		printf("slpi: %u: TRUSTZONE DOES NOT SHUT THE AUDIO DSP DOWN: the call returns %d, its answer is %#llx\n", step, result,
+		printf("slpi: %u: TRUSTZONE DOES NOT SHUT THE SENSORS DSP DOWN: the call returns %d, its answer is %#llx\n", step, result,
 		    answer);
 		return false;
 	}
-	printf("slpi: %u: THE AUDIO DSP IS SHUT DOWN\n", step);
+	printf("slpi: %u: THE SENSORS DSP IS SHUT DOWN\n", step);
+	frpc_give_back();
 	listen_doorbells(false);
 	doorbells();
 	dsp_started = false;
@@ -1609,7 +1619,7 @@ step_header(void)
 			return false;
 		}
 		if (!stopped_by_its_word && !option("slpi_again")) {
-			printf("slpi: %u: THE AUDIO DSP IS NOT STARTED AGAIN: it was shut down without having acknowledged a stop, and "
+			printf("slpi: %u: THE SENSORS DSP IS NOT STARTED AGAIN: it was shut down without having acknowledged a stop, and "
 			    "with the Wi-Fi's DSP a start after that reset the phone (slpi_again=1 to try all the same)\n", step);
 			return false;
 		}
@@ -1627,12 +1637,12 @@ step_header(void)
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
 	}
 	settle();
-	result = scm("to take the audio DSP's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_SLPI, kvtophys(page), 0, &answer);
+	result = scm("to take the sensors DSP's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_SLPI, kvtophys(page), 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("slpi: %u: TRUSTZONE DOES NOT TAKE THE HEADER: the call returns %d, its answer is %#llx\n", step, result, answer);
 		return false;
 	}
-	printf("slpi: %u: TRUSTZONE ACCEPTS THE AUDIO DSP'S SIGNATURE FROM THIS KERNEL\n", step);
+	printf("slpi: %u: TRUSTZONE ACCEPTS THE SENSORS DSP'S SIGNATURE FROM THIS KERNEL\n", step);
 
 	announce("tell TrustZone where the image will be");
 	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_SLPI, slpi_memory, image.size, &answer);
@@ -1671,7 +1681,7 @@ step_image(void)
 	{
 		char what[200];
 
-		snprintf(what, sizeof(what), "put the image's segments into the audio DSP's memory (%#x, %u MB: memory of nobody's until "
+		snprintf(what, sizeof(what), "put the image's segments into the sensors DSP's memory (%#x, %u MB: memory of nobody's until "
 		    "TrustZone starts the DSP), with zeroes where a segment is longer than its file, and read them back", slpi_memory,
 		    slpi_memory_size >> 20);
 		announce(what);
@@ -1835,7 +1845,7 @@ step_our_item(void)
 	struct smp2p ours;
 	uint32_t cacheline = 0, size = 0, partition, name[4] = { 0 };
 
-	announce("look for an SMP2P item of ours (429) in our partition with the audio DSP, make it if there is none, and fill it in");
+	announce("look for an SMP2P item of ours (429) in our partition with the sensors DSP, make it if there is none, and fill it in");
 	partition = smem_partition(SMEM_US, SMEM_SLPI, &cacheline, &size);
 	if (partition == 0 || !smem_peek(partition, &header, sizeof(header))) {
 		printf("slpi: %u: there is no such partition\n", step);
@@ -1913,7 +1923,7 @@ step_start(void)
 	PE_parse_boot_argn("slpi_wait", &wait_seconds, sizeof(wait_seconds));
 	bzero(&last, sizeof(last));
 	have = dsp_words(&last);
-	announce("listen for the audio DSP's doorbells, ask RPMh for its rails, tell the always-on processor that its image is "
+	announce("listen for the sensors DSP's doorbells, ask RPMh for its rails, tell the always-on processor that its image is "
 	    "loaded, and ask TrustZone to authenticate the image and let the DSP out of reset");
 	listen_doorbells(true);
 	bzero(&doorbell, sizeof(doorbell));
@@ -1929,12 +1939,12 @@ step_start(void)
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
-	result = scm("to authenticate the audio DSP's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_SLPI, 0, 0,
+	result = scm("to authenticate the sensors DSP's image and start it", SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_SLPI, 0, 0,
 	    &answer);
 	doorbell.since = started = now_us();
 	image_written = false;
 	if (result != 0 || answer != 0) {
-		printf("slpi: %u: TRUSTZONE DOES NOT START THE AUDIO DSP: the call returns %d, its answer is %#llx\n", step, result,
+		printf("slpi: %u: TRUSTZONE DOES NOT START THE SENSORS DSP: the call returns %d, its answer is %#llx\n", step, result,
 		    answer);
 		mailbox_send("{class: image, res: load_state, name: slpi, val: off}");
 		rails(0);
@@ -1944,7 +1954,7 @@ step_start(void)
 	}
 	dsp_started = true;
 	lck_mtx_unlock(&dsp_lock);
-	printf("slpi: %u: TRUSTZONE HAS AUTHENTICATED THE IMAGE AND LET THE AUDIO DSP OUT OF RESET; watching for %u s\n", step,
+	printf("slpi: %u: TRUSTZONE HAS AUTHENTICATED THE IMAGE AND LET THE SENSORS DSP OUT OF RESET; watching for %u s\n", step,
 	    wait_seconds);
 	limit = started + wait_seconds * 1000000ull;
 	for (;;) {
@@ -1969,7 +1979,7 @@ step_start(void)
 			if ((state & DSP_READY) && ready_at == 0) {
 				ready_at = now;
 				limit = now + 3000000ull;
-				printf("slpi: %u: THE AUDIO DSP SAYS IT IS UP: \"slave-kernel\" says %#x, %llu.%03llu ms after TrustZone started "
+				printf("slpi: %u: THE SENSORS DSP SAYS IT IS UP: \"slave-kernel\" says %#x, %llu.%03llu ms after TrustZone started "
 				    "it\n", step, state, (now - started) / 1000, (now - started) % 1000);
 			}
 			if ((state & DSP_HANDOVER) && !handed_over) {
@@ -1984,7 +1994,7 @@ step_start(void)
 				lck_mtx_unlock(&dsp_lock);
 			}
 			if (state & DSP_FATAL) {
-				printf("slpi: %u: THE AUDIO DSP SAYS IT HAS GIVEN UP\n", step);
+				printf("slpi: %u: THE SENSORS DSP SAYS IT HAS GIVEN UP\n", step);
 				show_crash_reason();
 				break;
 			}
@@ -2022,13 +2032,13 @@ step_start(void)
 		return false;
 	}
 	if (ready_at == 0) {
-		printf("slpi: %u: %s\n", step, spoke ? "THE AUDIO DSP RUNS BUT HAS NOT SAID \"UP\"" : "NOT A WORD FROM THE AUDIO DSP");
+		printf("slpi: %u: %s\n", step, spoke ? "THE SENSORS DSP RUNS BUT HAS NOT SAID \"UP\"" : "NOT A WORD FROM THE SENSORS DSP");
 		show_crash_reason();
 	}
 	return ready_at != 0;
 }
 
-/* ---- GLINK (hakios.wifi.c; items 478 to 480 of our partition with the audio DSP) ------------------- */
+/* ---- GLINK (hakios.wifi.c; items 478 to 480 of our partition with the sensors DSP) ------------------- */
 
 #define GLINK_OUR_TAIL          0
 #define GLINK_OUR_HEAD          4
@@ -2096,11 +2106,14 @@ static struct {
 } glink = {
 	.channel = {
 		[CHANNEL_QRTR] = { .name = "IPCRTR", .ours = 1, .intents = { { 0x800, 5 }, { 0x2000, 3 }, { 0x4400, 2 } } },
-		[CHANNEL_APR] = { .name = "apr_audio_svc", .ours = 2, .intents = { { 0x200, 8 }, { 0x1000, 4 }, { 0x2000, 2 } } },
+		/* (on the SLPI this slot is FastRPC's: its answers are 16 bytes, its requests to us 40) */
+		[CHANNEL_APR] = { .name = "fastrpcglink-apps-dsp", .ours = 2, .intents = { { 0x40, 16 }, { 0x200, 4 }, { 0, 0 } } },
 		/* the battery manager's (battmgr below): answers of a few dozen bytes, a name of 128 */
 		[CHANNEL_PMIC] = { .name = "PMIC_RTR_ADSP_APPS", .ours = 3, .intents = { { 0x200, 6 }, { 0x1000, 2 }, { 0, 0 } } },
 	},
 };
+
+static void fastrpc_input(const uint8_t *data, uint32_t length);
 
 static struct glink_channel *
 glink_theirs(uint32_t theirs)
@@ -2591,7 +2604,7 @@ qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to
 
 /*
  * QRTR ports of our own on the DSP's link, for the QMI helpers (sys/hakios.qrtr.h): what hakios.wifi.c has for
- * the Wi-Fi DSP, the same here -- the SLIMbus driver (hakios.slim.c) asks the audio DSP's SLIMbus service
+ * the Wi-Fi DSP, the same here -- the SLIMbus driver (hakios.slim.c) asks the sensors DSP's SLIMbus service
  * (769) through it. Ports are numbered as Linux numbers those that ask for no number.
  */
 #define HAKIOS_QRTR_MAX         8192
@@ -2754,7 +2767,7 @@ qrtr_close(struct hakios_qrtr_port *port)
 
 static const struct hakios_qrtr_ops slpi_qrtr_ops = { .open = qrtr_open, .send = qrtr_send, .lookup = qrtr_lookup, .close = qrtr_close };
 
-/* The audio DSP's link as a QRTR transport for the QMI helpers (hakios_qmi_handle_init_transport()); NULL before it is up. */
+/* The sensors DSP's link as a QRTR transport for the QMI helpers (hakios_qmi_handle_init_transport()); NULL before it is up. */
 static __unused const struct hakios_qrtr_ops *
 hakios_slpi_qrtr(void)
 {
@@ -3091,7 +3104,7 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 /* ---- the battery manager, on the channel PMIC_RTR_ADSP_APPS ------------------------------------------ */
 
 /*
- * On this SoC the audio DSP also runs the battery's and the charger's management -- the fuel gauge,
+ * On this SoC the sensors DSP also runs the battery's and the charger's management -- the fuel gauge,
  * the charging -- and the operating system only asks it how things are: Android's
  * qti_battery_charger.c, Linux's qcom_battmgr.c over pmic_glink.c, on the channel PMIC_RTR_ADSP_APPS
  * that the DSP opens. A message is a header (owner 32778, the battery manager; type 1, request and
@@ -3341,7 +3354,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			dsp_listen(&words);
 			if ((dsp_state(&words) & DSP_FATAL) && !gave_up) {
 				gave_up = true;
-				printf("slpi: link: THE AUDIO DSP SAYS IT HAS GIVEN UP (\"slave-kernel\" = %#x)\n", dsp_state(&words));
+				printf("slpi: link: THE SENSORS DSP SAYS IT HAS GIVEN UP (\"slave-kernel\" = %#x)\n", dsp_state(&words));
 				show_crash_reason();
 			}
 		}
@@ -3369,7 +3382,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			} else if (from == CHANNEL_PMIC) {
 				battmgr_input(packet->data, packet->length);
 			} else {
-				apr_input(packet->data, packet->length);
+				fastrpc_input(packet->data, packet->length);
 			}
 			kfree_data(packet, sizeof(*packet) + packet->length);
 		}
@@ -3429,7 +3442,7 @@ step_queues(void)
 	struct glink_message message;
 	uint32_t head, tail;
 
-	announce("find GLINK's descriptor and the two queues, and read what the audio DSP has put into its own");
+	announce("find GLINK's descriptor and the two queues, and read what the sensors DSP has put into its own");
 	if (!glink_find()) {
 		printf("slpi: %u: GLINK's items are not all there, or not of a shape this knows (descriptor %#x, ours %#x of %u bytes, "
 		    "the DSP's %#x of %u)\n", step, glink.descriptor, glink.ours, glink.ours_size, glink.theirs, glink.theirs_size);
@@ -3470,7 +3483,7 @@ step_link(void)
 	if (!dsp_started || glink.descriptor == 0) {
 		return false;
 	}
-	announce("take up GLINK with the audio DSP: our version, then whatever its messages call for; a thread of ours listens "
+	announce("take up GLINK with the sensors DSP: our version, then whatever its messages call for; a thread of ours listens "
 	    "from here on, every millisecond");
 	snprintf(last_write, sizeof(last_write), "step %u took up GLINK", step);
 	lck_mtx_lock(&glink_lock);
@@ -3544,7 +3557,7 @@ __unused step_apr(void)
 	uint64_t began = now_us();
 
 	PE_parse_boot_argn("slpi_apr_wait", &wait_seconds, sizeof(wait_seconds));
-	announce("ask the audio DSP's core service over APR whether the audio services are up (again and again, as Android "
+	announce("ask the sensors DSP's core service over APR whether the audio services are up (again and again, as Android "
 	    "does), then which services it has");
 	for (unsigned ms = 0; ms < 3000 && !glink.channel[CHANNEL_APR].open; ms++) {
 		sleep_ms(1);
@@ -3597,7 +3610,7 @@ steps_over(uint32_t done)
 {
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started && done == last_step && keep) {
-		printf("slpi: THE AUDIO DSP STAYS ON while the system runs%s\n", link_runs ? ", and the link with it" : "");
+		printf("slpi: THE SENSORS DSP STAYS ON while the system runs%s\n", link_runs ? ", and the link with it" : "");
 	} else if (dsp_started) {
 		dsp_shutdown("the steps are over");
 	}
@@ -3622,7 +3635,7 @@ hakios_slpi_stop(void)
 		}
 		down = dsp_shutdown("the run is about to end");
 		/* (said again at the end: a long run's log keeps its beginning and its end, and the middle may be gone) */
-		tell("slpi: the audio DSP is off: it had been up%s (node %u, %u services; audio services %s), it %s, and TrustZone %s\n",
+		tell("slpi: the sensors DSP is off: it had been up%s (node %u, %u services; audio services %s), it %s, and TrustZone %s\n",
 		    node ? " and linked" : ", NOT LINKED", node, services, audio_up ? "up" : "NOT UP", stopped_by_its_word ?
 		    "stopped when asked" : "DID NOT SAY IT HAD STOPPED", down ? "has shut it down" : "DID NOT SHUT IT DOWN");
 	}
@@ -3672,6 +3685,1231 @@ run_steps(void)
 	printf("slpi: over after step %u; %s\n", done, last_write);
 }
 
+/* ---- step 11a: FastRPC, the SLPI's file server (what Android's sscrpcd and postmarketOS's hexagonrpcd are) --- */
+
+/*
+ * The SLPI's sensors process (its "sensorspd") reads its configuration through FastRPC: the registry in persist
+ * (/mnt/vendor/persist/sensors/registry/registry/...), the drivers' JSON (/vendor/etc/sensors/config/...) and
+ * sns_reg_config. Without them no physical sensor is set up (run 182055: the SUID service knew no "accel"). Here,
+ * as hexagonrpcd -s does (linux-msm/hexagonrpc; Linux's drivers/misc/fastrpc.c for the wire):
+ *   - a message on GLINK's fastrpcglink-apps-dsp is struct fastrpc_msg (pid, tid, ctx = id << 4 | pd, handle, sc,
+ *     addr, size): addr is the physical address of a buffer holding the arguments' descriptions (per argument: a
+ *     pointer and length; its page list; its physical pages) and, 128-aligned, the input buffers' bytes and room
+ *     for the outputs. The SLPI has no SMMU context for FastRPC on the SDM845 (dt: no sdsprpc compute bank):
+ *     physical addresses as they are. The answer is {ctx, retval}.
+ *   - attach to the sensors process (handle 1, method 0, our "tgid" in, pd 2), open "adsp_default_listener" through
+ *     remotectl (handle 0) and register it, then adsp_listener (handle 3): init2, and next2 over and over -- each
+ *     carries the answer to the SLPI's last request and brings its next one (a handle, a method in sc, and its input
+ *     buffers packed as length, 8-alignment, bytes).
+ *   - the requests answered: remotectl open/close of our interfaces (0 remotectl, 1 apps_std, 2 apps_mem), and
+ *     apps_std's fopen_with_env, fread, fseek, fclose, fflush, opendir, readdir, closedir, stat -- from fw/sns.bundle in
+ *     the small image (userland/build.sh packs fw-sensors' persist and vendor files into it), read only.
+ * Every request is logged (the first fastrpc_log=N, default 200).
+ */
+#define FRPC_BUFFER             (256 * 1024)
+#define FRPC_ALIGN              128
+#define FRPC_TGID               0x4d2           /* (any number of ours: the "process" the sensors process serves) */
+#define FRPC_SENSORS_PD         2
+#define FRPC_SC(method, in, out) ((uint32_t)(method) << 24 | (uint32_t)(in) << 16 | (uint32_t)(out) << 8)
+#define AEE_EFAILED             1
+#define AEE_ENOMEMORY           2
+#define AEE_EBADPARM            14
+#define AEE_EUNSUPPORTED        20
+
+struct frpc_msg {
+	int32_t pid, tid;
+	uint64_t ctx;
+	uint32_t handle, sc;
+	uint64_t addr, size;
+};
+
+static vm_offset_t frpc_buffer;
+static bool frpc_assigned;                      /* shared with the SLPI: given back to us alone when it is stopped */
+static uint64_t frpc_buffer_phys;
+static volatile uint64_t frpc_answer_ctx;
+static volatile int32_t frpc_answer;
+static volatile bool frpc_answered;
+static uint32_t frpc_next_id = 1, frpc_logged, frpc_log = 200;
+static uint32_t frpc_requests, frpc_files_opened, frpc_files_missing;
+
+static void
+fastrpc_input(const uint8_t *data, uint32_t length)
+{
+	if (length >= 12) {
+		uint64_t ctx;
+		int32_t retval;
+
+		memcpy(&ctx, data, 8);
+		memcpy(&retval, data + 8, 4);
+		frpc_answer_ctx = ctx;
+		frpc_answer = retval;
+		__asm__ volatile ("dmb sy" ::: "memory");
+		frpc_answered = true;
+	} else {
+		printf("slpi: fastrpc: a message of %u bytes from the SLPI (not an answer)\n", length);
+	}
+}
+
+static void
+frpc_cache(vm_offset_t from, size_t length)
+{
+	for (vm_offset_t line = from & ~63ul; line < from + length; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+struct frpc_buf {
+	void *p;
+	uint32_t length;
+};
+
+/*
+ * One call to the SLPI: `in` input buffers (copied in) and `out` output buffers (copied back), as Linux's
+ * fastrpc_get_args lays them out. 0, or the SLPI's retval, or -1 if it did not answer in `wait_ms` (0: for ever,
+ * while the link is up).
+ */
+static int
+frpc_invoke(int32_t pid, uint32_t handle, uint32_t sc, struct frpc_buf *bufs, unsigned in, unsigned out, uint32_t wait_ms)
+{
+	unsigned n = in + out;
+	uint64_t *pv_len, *pages;
+	uint32_t *list;
+	size_t meta = (16 + 8 + 16) * (size_t)n + 8 * 16 + 4 * 64, at;
+	vm_offset_t buffer = frpc_buffer;
+	struct frpc_msg msg;
+	uint64_t ctx, began = now_us();
+	int error;
+
+	if (buffer == 0 || n > 16) {
+		return -1;
+	}
+	bzero((void *)buffer, meta);
+	pv_len = (uint64_t *)buffer;                            /* union fastrpc_remote_arg: pv, len */
+	list = (uint32_t *)(buffer + 16 * n);                   /* struct fastrpc_invoke_buf: num, pgidx */
+	pages = (uint64_t *)(buffer + 24 * n);                  /* struct fastrpc_phy_page: addr, size */
+	at = (meta + FRPC_ALIGN - 1) & ~(size_t)(FRPC_ALIGN - 1);
+	for (unsigned i = 0; i < n; i++) {
+		uint32_t length = bufs[i].length;
+		vm_offset_t va = buffer + at;
+
+		pv_len[2 * i] = (uint64_t)va;
+		pv_len[2 * i + 1] = length;
+		list[2 * i] = length ? 1 : 0;
+		list[2 * i + 1] = i;
+		if (length == 0) {
+			continue;
+		}
+		if (at + length > FRPC_BUFFER) {
+			printf("slpi: fastrpc: %u bytes of arguments do not fit\n", (unsigned)(at + length));
+			return -1;
+		}
+		pages[2 * i] = (frpc_buffer_phys + at) & ~0xfffull;
+		pages[2 * i + 1] = ((((frpc_buffer_phys + at + length - 1) >> 12) - ((frpc_buffer_phys + at) >> 12)) + 1) << 12;
+		if (i < in) {
+			memcpy((void *)va, bufs[i].p, length);
+		} else {
+			bzero((void *)va, length);
+		}
+		at = (at + length + FRPC_ALIGN - 1) & ~(size_t)(FRPC_ALIGN - 1);
+	}
+	frpc_cache(buffer, at);
+	ctx = (uint64_t)(frpc_next_id++ & 0xff) << 4 | FRPC_SENSORS_PD;
+	/* (the thread's id is the same for every call, as Linux's current->pid for the one listening thread: a new one each
+	 * time and the SLPI answered -1 from the 37th on, runs 185214, 190009, 190437 alike) */
+	msg = (struct frpc_msg){ pid, FRPC_TGID + 1, ctx, handle, sc, frpc_buffer_phys, (at + 0xfff) & ~0xfffull };
+	frpc_answered = false;
+	error = glink_send(&glink.channel[CHANNEL_APR], &msg, sizeof(msg));     /* (it takes glink_lock itself) */
+	if (error != 0) {
+		printf("slpi: fastrpc: the message could not be sent (%d)\n", error);
+		return -1;
+	}
+	while (!(frpc_answered && frpc_answer_ctx == ctx)) {
+		if ((wait_ms != 0 && now_us() - began > wait_ms * 1000ull) || !glink.up || leaving) {
+			printf("slpi: fastrpc: no answer to handle %u sc %#x in %llu ms\n", handle, sc, (now_us() - began) / 1000);
+			return -1;
+		}
+		sleep_us(200);
+	}
+	frpc_cache(buffer, at);
+	for (unsigned i = in; i < n; i++) {
+		if (bufs[i].length != 0) {
+			memcpy(bufs[i].p, (const void *)(vm_offset_t)pv_len[2 * i], bufs[i].length);
+		}
+	}
+	return frpc_answer;
+}
+
+
+/*
+ * Who may touch the FastRPC buffer: TrustZone's hyp-assign (SCM 0xc/0x16, as hakios.mpss.c's mss_assign_owners), from
+ * `from` to `to` (VMIDs: 3 HLOS, 15 the modem's MSA, 5 the SLPI, 6 the audio DSP -- mainline's qcom,vmids of the
+ * SDM845 sdsp's FastRPC; all read, write, execute). Without it the SLPI's first read of the buffer faults in the
+ * hypervisor's tables (run 184042: crash dump, TZ: "CB ISR", NOCERR, the secure watchdog's barks).
+ */
+#define SCM_MP_ASSIGN           SCM_CALL(0xc, 0x16)
+#define SCM_ASSIGN_ARGUMENTS    0x1117
+static const uint32_t frpc_vmids[4] = { 3, 15, 5, 6 };
+
+static bool
+frpc_assign(uint64_t address, uint64_t size, const uint32_t *from, unsigned froms, const uint32_t *to, unsigned tos)
+{
+	struct {
+		uint64_t address, size;
+		uint64_t pad0[6];
+		uint32_t sources[4];                    /* +64 */
+		uint32_t pad1[12];
+		struct {                                /* +128 */
+			uint32_t vmid, permission;
+			uint64_t context;
+			uint32_t context_size, unused;
+		} destinations[4];
+		uint8_t pad2[16];
+		uint64_t more[7];                       /* +240 */
+	} *page;
+	static vm_offset_t memory;              /* (kept: the give-back runs at the run's end, where nothing is to be allocated) */
+	uint64_t answer = ~0ull, pa;
+	int32_t result;
+
+	_Static_assert(__builtin_offsetof(__typeof__(*page), more) == 240, "the assign page's layout");
+	if (memory == 0 && kmem_alloc(kernel_map, &memory, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
+	    KERN_SUCCESS) {
+		memory = 0;
+		return false;
+	}
+	page = (void *)memory;
+	bzero(page, PAGE_SIZE);
+	page->address = address;
+	page->size = (size + 0xfff) & ~0xfffull;
+	for (unsigned i = 0; i < froms && i < 4; i++) {
+		page->sources[i] = from[i];
+	}
+	for (unsigned i = 0; i < tos && i < 4; i++) {
+		page->destinations[i].vmid = to[i];
+		page->destinations[i].permission = 7;
+	}
+	pa = kvtophys(memory);
+	page->more[0] = froms * 4;
+	page->more[1] = pa + 128;
+	page->more[2] = tos * sizeof(page->destinations[0]);
+	page->more[3] = 0;
+	for (vm_offset_t line = memory; line < memory + PAGE_SIZE; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	}
+	settle();
+	result = scm4("to share the FastRPC buffer", SCM_MP_ASSIGN, SCM_ASSIGN_ARGUMENTS, pa, 16, pa + 64, pa + 240, &answer);
+	printf("slpi: fastrpc: hyp-assign of %#llx (%#llx bytes) to %u owners: call %d, answer %#llx\n", address, size, tos, result,
+	    answer);
+	return result == 0 && answer == 0;
+}
+
+static void
+frpc_give_back(void)
+{
+	static const uint32_t hlos[1] = { 3 };
+
+	if (frpc_assigned) {
+		frpc_assigned = !frpc_assign(frpc_buffer_phys, FRPC_BUFFER, frpc_vmids, 4, hlos, 1);
+	}
+}
+
+/* ---- the files: fw/sns.bundle ("SNSB", a count, then per file: a length of 16 bits, the path, a size of 32, the bytes) */
+
+#define SNS_FILES               512
+#define SNS_OPEN                32
+
+static struct {
+	const char *path;                               /* "persist/sensors/...", "vendor/etc/sensors/..." (no NUL: path_length) */
+	uint16_t path_length;
+	const uint8_t *data;
+	uint32_t size;
+} sns_file[SNS_FILES];
+static unsigned sns_files;
+static struct {
+	bool used, dir;
+	unsigned file;                                  /* a file: which; a directory: the next entry to look at */
+	uint32_t pos;
+	char prefix[160];                               /* a directory: its path and "/" */
+	char given[8][64];                              /* (names already returned: a directory's entries are unique) */
+	unsigned givens;
+} sns_open[SNS_OPEN];
+
+static bool
+sns_load(void)
+{
+	uint64_t size = 0;
+	const uint8_t *b = image_file("sns.bundle", &size), *at, *end;
+	uint32_t count;
+
+	if (b == NULL || size < 8 || memcmp(b, "SNSB", 4) != 0) {
+		printf("slpi: fastrpc: no fw/sns.bundle in the small image: no file to give the SLPI\n");
+		return false;
+	}
+	memcpy(&count, b + 4, 4);
+	at = b + 8;
+	end = b + size;
+	for (uint32_t i = 0; i < count && sns_files < SNS_FILES; i++) {
+		uint16_t pl;
+		uint32_t fs;
+
+		if (at + 2 > end) {
+			break;
+		}
+		memcpy(&pl, at, 2);
+		if (at + 2 + pl + 4 > end) {
+			break;
+		}
+		memcpy(&fs, at + 2 + pl, 4);
+		if (at + 6 + pl + fs > end) {
+			break;
+		}
+		sns_file[sns_files].path = (const char *)(at + 2);
+		sns_file[sns_files].path_length = pl;
+		sns_file[sns_files].size = fs;
+		sns_file[sns_files].data = at + 6 + pl;
+		sns_files++;
+		at += 6 + pl + fs;
+	}
+	printf("slpi: fastrpc: %u files to give the SLPI (fw/sns.bundle, %llu bytes)\n", sns_files, size);
+	return sns_files != 0;
+}
+
+/* A path as the SLPI gives it, made ours: no leading "/", "/persist/x" -> "mnt/vendor/persist/x", "/system/vendor/x" -> "vendor/x"; no "//" or trailing "/". */
+static void
+sns_path(const char *given, char *out, size_t size)
+{
+	static const struct { const char *from, *to; } map[] = {
+		{ "/mnt/vendor/mnt/vendor/", "mnt/vendor/" },   /* (once /mnt/vendor lists, the SLPI puts it before its own path: run 190009) */
+		{ "/persist/", "mnt/vendor/persist/" }, { "/persist", "mnt/vendor/persist" }, { "/system/vendor/", "vendor/" },
+		{ "/", "" },
+	};
+	char clean[200];
+	size_t n = 0;
+
+	for (const char *c = given; *c != 0 && n < sizeof(clean) - 1; c++) {
+		if (*c == '/' && n > 0 && clean[n - 1] == '/') {
+			continue;
+		}
+		clean[n++] = *c;
+	}
+	while (n > 1 && clean[n - 1] == '/') {
+		n--;
+	}
+	clean[n] = 0;
+	for (unsigned i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+		size_t l = strlen(map[i].from);
+
+		if (strncmp(clean, map[i].from, l) == 0) {
+			snprintf(out, size, "%s%s", map[i].to, clean + l);
+			return;
+		}
+	}
+	snprintf(out, size, "%s", clean);
+}
+
+static int
+sns_find(const char *path)
+{
+	size_t l = strlen(path);
+
+	for (unsigned i = 0; i < sns_files; i++) {
+		if (sns_file[i].path_length == l && memcmp(sns_file[i].path, path, l) == 0) {
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+static bool
+sns_is_dir(const char *path)
+{
+	size_t l = strlen(path);
+
+	for (unsigned i = 0; i < sns_files; i++) {
+		if (sns_file[i].path_length > l + 1 && memcmp(sns_file[i].path, path, l) == 0 && sns_file[i].path[l] == '/') {
+			return true;
+		}
+	}
+	return l == 0;
+}
+
+static int
+sns_slot(void)
+{
+	for (int i = 0; i < SNS_OPEN; i++) {
+		if (!sns_open[i].used) {
+			bzero(&sns_open[i], sizeof(sns_open[i]));
+			sns_open[i].used = true;
+			return i;
+		}
+	}
+	return -1;
+}
+
+/* The request's input buffers, from the packed form next2 brings them in (hexagonrpcd's inbuf_decode). */
+static unsigned
+frpc_unpack(const uint8_t *blob, uint32_t length, unsigned want, struct frpc_buf *bufs)
+{
+	uint32_t at = 0;
+	unsigned got = 0;
+
+	while (got < want && at + 4 <= length) {
+		uint32_t size;
+
+		memcpy(&size, blob + at, 4);
+		at += 4;
+		at = (at + 7) & ~7u;
+		if (size > length - (at < length ? at : length)) {
+			break;
+		}
+		bufs[got].p = (void *)(uintptr_t)(blob + at);
+		bufs[got].length = size;
+		got++;
+		at += size;
+	}
+	return got;
+}
+
+/* The answer's output buffers, packed for the next next2 (hexagonrpcd's outbufs_encode). */
+static uint32_t
+frpc_pack(const struct frpc_buf *bufs, unsigned count, uint8_t *to, uint32_t room)
+{
+	uint32_t at = 0;
+
+	for (unsigned i = 0; i < count; i++) {
+		if (at + 4 > room) {
+			return 0;
+		}
+		memcpy(to + at, &bufs[i].length, 4);
+		at += 4;
+		while (at & 7) {
+			to[at++] = 0;
+		}
+		if (at + bufs[i].length > room) {
+			return 0;
+		}
+		memcpy(to + at, bufs[i].p, bufs[i].length);
+		at += bufs[i].length;
+	}
+	return at;
+}
+
+static uint32_t
+le_word(const struct frpc_buf *b, unsigned index)
+{
+	uint32_t v = 0;
+
+	if (b->length >= 4 * (index + 1)) {
+		memcpy(&v, (const uint8_t *)b->p + 4 * index, 4);
+	}
+	return v;
+}
+
+/* A string argument: NUL-terminated within its buffer, else "". */
+static const char *
+frpc_string(const struct frpc_buf *b)
+{
+	return b->length > 0 && ((const char *)b->p)[b->length - 1] == 0 ? (const char *)b->p : "";
+}
+
+/*
+ * One request of the SLPI's: its handle and sc, its input buffers; the output buffers' room is made here (the
+ * sizes the methods have: hexagonrpcd's interface definitions), filled, and counted into *outs. The result is
+ * what the SLPI is told (0 success, AEE_*).
+ */
+static uint8_t frpc_out_room[4][512];
+
+static uint32_t
+frpc_serve(uint32_t handle, uint32_t sc, struct frpc_buf *in, unsigned ins, struct frpc_buf *out, unsigned *outs)
+{
+	uint32_t method = sc >> 24 & 0x1f;
+	char path[200];
+	bool log = frpc_logged < frpc_log;
+
+	frpc_requests++;
+	*outs = 0;
+	if (method == 31 && ins > 0) {
+		method = le_word(&in[0], 0);
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		out[i].p = frpc_out_room[i];
+		out[i].length = 0;
+	}
+	if (handle == 0 && method == 0 && ins >= 2) {               /* remotectl open: in [namelen, errlen] name; out [handle, error] err */
+		static const char *const ours[3] = { "remotectl", "apps_std", "apps_mem" };
+		const char *name = frpc_string(&in[1]);
+		uint32_t found = ~0u, errlen = le_word(&in[0], 1);
+
+		for (uint32_t i = 0; i < 3; i++) {
+			if (strcmp(name, ours[i]) == 0) {
+				found = i;
+			}
+		}
+		out[0].length = 8;
+		((uint32_t *)frpc_out_room[0])[0] = found == ~0u ? 0 : found;
+		((uint32_t *)frpc_out_room[0])[1] = found == ~0u ? (uint32_t)-5 : 0;
+		out[1].length = errlen < sizeof(frpc_out_room[1]) ? errlen : sizeof(frpc_out_room[1]);
+		bzero(frpc_out_room[1], out[1].length);
+		*outs = 2;
+		if (log) {
+			frpc_logged++;
+			printf("slpi: fastrpc: the SLPI opens our \"%s\": %s\n", name, found == ~0u ? "NOT OURS" : "handle given");
+		}
+		return found == ~0u ? (uint32_t)-5 : 0;
+	}
+	if (handle == 0 && method == 1) {                           /* remotectl close: in [handle, errlen]; out [len] err */
+		uint32_t errlen = ins > 0 ? le_word(&in[0], 1) : 0;
+
+		out[0].length = 4;
+		((uint32_t *)frpc_out_room[0])[0] = 0;
+		out[1].length = errlen < sizeof(frpc_out_room[1]) ? errlen : sizeof(frpc_out_room[1]);
+		bzero(frpc_out_room[1], out[1].length);
+		*outs = 2;
+		return 0;
+	}
+	if (handle == 1) {
+		switch (method) {
+		case 2:                                         /* fflush */
+			return 0;
+		case 3: {                                       /* fclose */
+			uint32_t fd = le_word(&in[0], 0);
+
+			if (fd < SNS_OPEN) {
+				sns_open[fd].used = false;
+			}
+			return 0;
+		}
+		case 4: {                                       /* fread: in [fd, size]; out [written, eof] data */
+			uint32_t fd = le_word(&in[0], 0), want = le_word(&in[0], 1), have, n;
+			static uint8_t data[64 * 1024];
+
+			if (fd >= SNS_OPEN || !sns_open[fd].used) {
+				return AEE_EBADPARM;
+			}
+			if (sns_open[fd].dir) {                 /* (a directory fopen()ed, as hexagonfs allows: nothing in it to read) */
+				have = 0;
+				sns_open[fd].pos = 0;
+				sns_open[fd].file = 0;
+			} else {
+				have = sns_file[sns_open[fd].file].size - sns_open[fd].pos;
+			}
+			n = want < have ? want : have;
+			n = n < sizeof(data) ? n : sizeof(data);
+			if (n != 0) {
+				memcpy(data, sns_file[sns_open[fd].file].data + sns_open[fd].pos, n);
+			}
+			sns_open[fd].pos += n;
+			if (frpc_logged < frpc_log && (want > sizeof(data) || frpc_requests < 400)) {
+				frpc_logged++;
+				printf("slpi: fastrpc: fread(%u, %u): %u bytes%s\n", fd, want, n, want > sizeof(data) ? " (MORE ASKED THAN FITS)" : "");
+			}
+			out[0].length = 8;
+			((uint32_t *)frpc_out_room[0])[0] = n;
+			((uint32_t *)frpc_out_room[0])[1] = n < want;
+			out[1].p = data;
+			out[1].length = want < sizeof(data) ? want : sizeof(data);
+			*outs = 2;
+			return 0;
+		}
+		case 9: {                                       /* fseek: in [fd, pos, whence 0 set 1 cur 2 end] */
+			uint32_t fd = le_word(&in[0], 0), pos = le_word(&in[0], 1), whence = le_word(&in[0], 2);
+			int64_t to;
+
+			if (fd >= SNS_OPEN || !sns_open[fd].used || sns_open[fd].dir) {
+				return AEE_EBADPARM;
+			}
+			to = whence == 0 ? (int32_t)pos : whence == 1 ? (int64_t)sns_open[fd].pos + (int32_t)pos :
+			    (int64_t)sns_file[sns_open[fd].file].size + (int32_t)pos;
+			if (to < 0 || to > sns_file[sns_open[fd].file].size) {
+				return AEE_EFAILED;
+			}
+			sns_open[fd].pos = (uint32_t)to;
+			return 0;
+		}
+		case 19: {                                      /* fopen_with_env: in [4 lengths] env delim path mode; out [fd] */
+			const char *name = ins >= 4 ? frpc_string(&in[3]) : "", *mode = ins >= 5 ? frpc_string(&in[4]) : "r";
+			int file, fd;
+
+			sns_path(name, path, sizeof(path));
+			file = sns_find(path);
+			out[0].length = 4;
+			*outs = 1;
+			if (log) {
+				frpc_logged++;
+				printf("slpi: fastrpc: fopen(\"%s\", \"%s\"): %s\n", name, mode, mode[0] == 'w' || mode[0] == 'a' ?
+				    "not for writing" : file >= 0 ? "given" : sns_is_dir(path) ? "A DIRECTORY: refused" : "NO SUCH FILE");
+			}
+			if (mode[0] == 'w' || mode[0] == 'a') {
+				return AEE_EUNSUPPORTED;
+			}
+			if (file < 0) {                         /* (a directory too: run 190009's listener ended after one was given) */
+				frpc_files_missing++;
+				return AEE_EFAILED;
+			}
+			if ((fd = sns_slot()) < 0) {
+				return AEE_ENOMEMORY;
+			}
+			if (file < 0) {
+				sns_open[fd].dir = true;
+				snprintf(sns_open[fd].prefix, sizeof(sns_open[fd].prefix), "%s%s", path, path[0] ? "/" : "");
+			} else {
+				sns_open[fd].file = (unsigned)file;
+			}
+			((uint32_t *)frpc_out_room[0])[0] = (uint32_t)fd;
+			frpc_files_opened++;
+			return 0;
+		}
+		case 26: {                                      /* opendir: in [len] name; out [dir u64] */
+			const char *name = ins >= 2 ? frpc_string(&in[1]) : "";
+			int fd;
+
+			sns_path(name, path, sizeof(path));
+			out[0].length = 8;
+			*outs = 1;
+			if (log) {
+				frpc_logged++;
+				printf("slpi: fastrpc: opendir(\"%s\"): %s\n", name, sns_is_dir(path) ? "given" : "NO SUCH DIRECTORY");
+			}
+			if (!sns_is_dir(path) || (fd = sns_slot()) < 0) {
+				return AEE_EFAILED;
+			}
+			sns_open[fd].dir = true;
+			snprintf(sns_open[fd].prefix, sizeof(sns_open[fd].prefix), "%s%s", path, path[0] ? "/" : "");
+			((uint64_t *)frpc_out_room[0])[0] = (uint64_t)fd;
+			return 0;
+		}
+		case 27: {                                      /* closedir: in [dir u64] */
+			uint32_t fd = le_word(&in[0], 0);
+
+			if (fd < SNS_OPEN) {
+				sns_open[fd].used = false;
+			}
+			return 0;
+		}
+		case 28: {                                      /* readdir: in [dir u64]; out [inode, name[256], eof] */
+			uint32_t fd = le_word(&in[0], 0);
+			char *name = (char *)frpc_out_room[0] + 4;
+
+			out[0].length = 264;
+			*outs = 1;
+			bzero(frpc_out_room[0], 264);
+			if (fd >= SNS_OPEN || !sns_open[fd].used || !sns_open[fd].dir) {
+				return AEE_EBADPARM;
+			}
+			for (; sns_open[fd].file < sns_files; sns_open[fd].file++) {
+				size_t l = strlen(sns_open[fd].prefix), k;
+				unsigned e = sns_open[fd].file;
+				bool seen = false;
+
+				if (sns_file[e].path_length <= l || memcmp(sns_file[e].path, sns_open[fd].prefix, l) != 0) {
+					continue;
+				}
+				for (k = l; k < sns_file[e].path_length && sns_file[e].path[k] != '/'; k++) {
+				}
+				if (k - l >= 255) {
+					continue;
+				}
+				memcpy(name, sns_file[e].path + l, k - l);
+				name[k - l] = 0;
+				for (unsigned g = 0; g < sns_open[fd].givens; g++) {
+					seen |= strcmp(sns_open[fd].given[g], name) == 0;
+				}
+				if (seen) {
+					continue;
+				}
+				if (k < sns_file[e].path_length && sns_open[fd].givens < 8) {
+					snprintf(sns_open[fd].given[sns_open[fd].givens++], 64, "%s", name);   /* (a subdirectory: once) */
+				}
+				sns_open[fd].file++;
+				return 0;
+			}
+			name[0] = 0;
+			((uint32_t *)frpc_out_room[0])[65] = 1;          /* eof (at 260) */
+			return 0;
+		}
+		case 31: {                                      /* stat: in [31, len] name; out 96 bytes */
+			const char *name = ins >= 2 ? frpc_string(&in[1]) : "";
+			uint8_t *st = frpc_out_room[0];
+			int file;
+			uint32_t mode;
+			uint64_t size;
+
+			sns_path(name, path, sizeof(path));
+			file = sns_find(path);
+			out[0].length = 96;
+			*outs = 1;
+			bzero(st, 96);
+			if (log) {
+				frpc_logged++;
+				printf("slpi: fastrpc: stat(\"%s\"): %s\n", name, file >= 0 ? "a file" : sns_is_dir(path) ? "a directory" :
+				    "NO SUCH FILE");
+			}
+			if (file < 0 && !sns_is_dir(path)) {
+				return AEE_EFAILED;
+			}
+			mode = file >= 0 ? 0100444 : 040555;
+			size = file >= 0 ? sns_file[file].size : 4096;
+			memcpy(st + 24, &mode, 4);
+			memcpy(st + 32 + 8, &size, 8);          /* (tsz, dev, ino, mode, nlink, rdev, size) */
+			return 0;
+		}
+		default:
+			break;
+		}
+	}
+	if (log) {
+		frpc_logged++;
+		printf("slpi: fastrpc: NOT ANSWERED: handle %u method %u (sc %#x, %u buffers in)\n", handle, method, sc, ins);
+	}
+	return AEE_EUNSUPPORTED;
+}
+
+static volatile bool frpc_running;
+
+static void
+frpc_thread(__unused void *parameter, __unused wait_result_t result)
+{
+	uint32_t tgid = FRPC_TGID, words[4], handle = 0, error = 0, prev_ctx = 0, prev_result = 0xffffffffu;
+	char name[] = "adsp_default_listener", errbuf[256];
+	uint8_t request[256];
+	static uint8_t returned[72 * 1024];             /* (an fread's answer: run 185214's first one did not fit in 2 KB) */
+	uint32_t returned_length = 0;
+	struct frpc_buf b[4];
+	int r;
+
+	frpc_running = true;
+	/* attach to the sensors process (the kernel's call: pid 0) */
+	b[0] = (struct frpc_buf){ &tgid, 4 };
+	r = frpc_invoke(0, 1, FRPC_SC(0, 1, 0), b, 1, 0, 5000);
+	tell("slpi: fastrpc: attached to the sensors process: %d\n", r);
+	if (r != 0) {
+		goto done;
+	}
+	/* remotectl open "adsp_default_listener", and register it */
+	words[0] = sizeof(name);
+	words[1] = sizeof(errbuf);
+	b[0] = (struct frpc_buf){ words, 8 };
+	b[1] = (struct frpc_buf){ name, sizeof(name) };
+	b[2] = (struct frpc_buf){ &words[2], 8 };
+	b[3] = (struct frpc_buf){ errbuf, sizeof(errbuf) };
+	r = frpc_invoke(FRPC_TGID, 0, FRPC_SC(0, 2, 2), b, 2, 2, 5000);
+	handle = words[2];
+	error = words[3];
+	tell("slpi: fastrpc: adsp_default_listener opened: %d, handle %u, error %u\n", r, handle, error);
+	if (r != 0) {
+		goto done;
+	}
+	r = frpc_invoke(FRPC_TGID, handle, FRPC_SC(0, 0, 0), b, 0, 0, 5000);
+	tell("slpi: fastrpc: registered as the listener: %d\n", r);
+	r = frpc_invoke(FRPC_TGID, 3, FRPC_SC(3, 0, 0), b, 0, 0, 5000);
+	tell("slpi: fastrpc: adsp_listener init2: %d -- serving the SLPI's files from here on\n", r);
+	if (r != 0) {
+		goto done;
+	}
+	for (;;) {
+		struct frpc_buf in[8], out[4];
+		uint32_t q[4] = { prev_ctx, prev_result, returned_length, sizeof(request) }, got[4] = { 0, 0, 0, 0 };
+		unsigned ins, outs = 0;
+
+		b[0] = (struct frpc_buf){ q, 16 };
+		b[1] = (struct frpc_buf){ returned, returned_length };
+		b[2] = (struct frpc_buf){ got, 16 };
+		b[3] = (struct frpc_buf){ request, sizeof(request) };
+		r = frpc_invoke(FRPC_TGID, 3, FRPC_SC(4, 2, 2), b, 2, 2, 0);
+		if (r != 0) {
+			tell("slpi: fastrpc: next2: %d: the listener ends (%u requests served, %u files opened, %u not found)\n", r,
+			    frpc_requests, frpc_files_opened, frpc_files_missing);
+			break;
+		}
+		prev_ctx = got[0];
+		ins = frpc_unpack(request, got[3] < sizeof(request) ? got[3] : sizeof(request), got[2] >> 16 & 0xff, in);
+		prev_result = frpc_serve(got[1], got[2], in, ins, out, &outs);
+		returned_length = frpc_pack(out, outs, returned, sizeof(returned));
+	}
+done:
+	frpc_running = false;
+	thread_terminate(current_thread());
+}
+
+/* Once the SLPI is up: the buffer it reads our arguments from (one piece of physical memory), the files, the thread. */
+static void
+frpc_start(void)
+{
+	thread_t thread;
+
+	PE_parse_boot_argn("fastrpc_log", &frpc_log, sizeof(frpc_log));
+	if (!glink.channel[CHANNEL_APR].open) {
+		for (unsigned ms = 0; ms < 3000 && !glink.channel[CHANNEL_APR].open; ms += 10) {
+			sleep_ms(10);
+		}
+	}
+	if (!glink.channel[CHANNEL_APR].open) {
+		tell("slpi: fastrpc: the SLPI's FastRPC channel is not open: its files are not served\n");
+		return;
+	}
+	if (!sns_load()) {
+		return;
+	}
+	/*
+	 * Below 4 GB: the SLPI's addresses are 32 bits (Linux's FASTRPC_PHYS(); run 183256's buffer at 0x19a6ec000 went
+	 * unanswered), and the kernel has no memory of its own down there (run 183608). The end of the display's splash
+	 * region is nobody's: 36 MB from 0x9d400000 (dt: cont_splash_region), of which fb_flip's three frames take the
+	 * first 30. Boot-arg fastrpc_mem=0x... for another place. Mapped write-combined (uncached, unaligned copies
+	 * allowed); the cache operations below are then harmless.
+	 */
+	{
+		uint32_t phys = 0x9f600000u;
+
+		PE_parse_boot_argn("fastrpc_mem", &phys, sizeof(phys));
+		frpc_buffer = ml_io_map_wcomb(phys, FRPC_BUFFER);
+		if (frpc_buffer == 0) {
+			tell("slpi: fastrpc: %#x cannot be mapped for the arguments\n", phys);
+			return;
+		}
+		frpc_buffer_phys = phys;
+		bzero((void *)frpc_buffer, FRPC_BUFFER);
+		{
+			static const uint32_t hlos[1] = { 3 };
+
+			if (!frpc_assign(phys, FRPC_BUFFER, hlos, 1, frpc_vmids, 4) &&
+			    !frpc_assign(phys, FRPC_BUFFER, frpc_vmids, 4, frpc_vmids, 4)) {    /* (left shared by a run that did not end) */
+				tell("slpi: fastrpc: the hypervisor does not share %#x with the SLPI: its files are not served\n", phys);
+				frpc_buffer = 0;
+				return;
+			}
+			frpc_assigned = true;
+		}
+	}
+	if (kernel_thread_start(frpc_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+		printf("slpi: fastrpc: the arguments' buffer at %#llx; the file server starts\n", frpc_buffer_phys);
+	}
+}
+
+/* ---- step 11: the sensors (SEE: QMI service 400, protobuf inside) ------------------------------------- */
+
+/*
+ * Qualcomm's Sensors Execution Environment on the SLPI offers every sensor through one QMI service, 400 (Android's
+ * libssc / postmarketOS's libssc speak it). A request (QMI 0x20, TLV 1: a length of 16 bits, then the bytes) carries a
+ * protobuf sns_client_request_msg (sns_client.proto: the sensor's SUID, a message number, how it may wake us, and a
+ * sns_std_request whose payload is the message itself); what the sensors say comes back in indications (0x21, 0x22:
+ * TLV 1 the client's number, TLV 2 the bytes) as a sns_client_event_msg (the SUID, then events of a number, a time
+ * and a payload). The SUID service (SUID 0xabab...ab) is asked which sensor is "accel" (sns_suid_req, message 512;
+ * its answer, a sns_suid_event, comes as event 768); that sensor is then asked for samples (sns_std_sensor_config,
+ * message 513, 10 a second) and they come as event 1025 (sns_std_sensor_event: repeated float data, x y z in m/s^2).
+ * The last sample is kept for the system: kern.hakios.accel_x/_y/_z (mm/s^2), accel_samples. The floats are taken
+ * apart by hand (no floating point in the kernel).
+ */
+#define QMI_SEE                 400
+#define SEE_REQUEST             0x0020
+#define SUID_MSGID_REQ          512
+#define SUID_MSGID_EVENT        768
+#define SENSOR_MSGID_CONFIG     513
+#define SENSOR_MSGID_EVENT      1025
+#define STD_MSGID_ERROR_EVENT   130
+
+static struct hakios_qrtr_port *see_port;
+static uint32_t see_node, see_port_number;
+static uint16_t see_transaction = 1;
+static volatile bool see_asked_suid, see_asked_samples;
+static uint64_t accel_suid[2];
+static volatile bool accel_known;
+static uint32_t see_events, see_logged;
+static int accel_x, accel_y, accel_z, accel_samples;
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_INT(_kern_hakios, OID_AUTO, accel_x, CTLFLAG_RD | CTLFLAG_LOCKED, &accel_x, 0, "the accelerometer's x, mm/s^2");
+SYSCTL_INT(_kern_hakios, OID_AUTO, accel_y, CTLFLAG_RD | CTLFLAG_LOCKED, &accel_y, 0, "the accelerometer's y, mm/s^2");
+SYSCTL_INT(_kern_hakios, OID_AUTO, accel_z, CTLFLAG_RD | CTLFLAG_LOCKED, &accel_z, 0, "the accelerometer's z, mm/s^2");
+SYSCTL_INT(_kern_hakios, OID_AUTO, accel_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &accel_samples, 0, "samples so far");
+
+/* A TLV of a QMI message: its value and length, or NULL (as hakios.mpss.c's). */
+static const uint8_t *
+qmi_tlv(const uint8_t *m, size_t length, uint8_t type, uint16_t *size)
+{
+	for (size_t at = 7; at + 3 <= length;) {
+		uint16_t n = (uint16_t)(m[at + 1] | m[at + 2] << 8);
+
+		if (at + 3 + n > length) {
+			return NULL;
+		}
+		if (m[at] == type) {
+			*size = n;
+			return m + at + 3;
+		}
+		at += 3 + n;
+	}
+	return NULL;
+}
+
+/* protobuf, the little of it needed: varints, keys, fixed 32/64, length-delimited */
+struct pb {
+	uint8_t *at, *end;
+	bool overflow;
+};
+
+static void
+pb_byte(struct pb *b, uint8_t v)
+{
+	if (b->at < b->end) {
+		*b->at++ = v;
+	} else {
+		b->overflow = true;
+	}
+}
+
+static void
+pb_varint(struct pb *b, uint64_t v)
+{
+	do {
+		pb_byte(b, (uint8_t)((v & 0x7f) | (v > 0x7f ? 0x80 : 0)));
+		v >>= 7;
+	} while (v != 0);
+}
+
+static void
+pb_key(struct pb *b, uint32_t field, uint32_t wire)
+{
+	pb_varint(b, (uint64_t)field << 3 | wire);
+}
+
+static void
+pb_fixed(struct pb *b, uint32_t field, uint64_t v, unsigned bytes)
+{
+	pb_key(b, field, bytes == 8 ? 1 : 5);
+	for (unsigned i = 0; i < bytes; i++) {
+		pb_byte(b, (uint8_t)(v >> (8 * i)));
+	}
+}
+
+static void
+pb_bytes(struct pb *b, uint32_t field, const void *data, size_t length)
+{
+	pb_key(b, field, 2);
+	pb_varint(b, length);
+	for (size_t i = 0; i < length; i++) {
+		pb_byte(b, ((const uint8_t *)data)[i]);
+	}
+}
+
+/* Reading: the next field of [*at, end): its number, wire type, and value (a varint or fixed one) or bytes. */
+struct pb_field {
+	uint32_t field, wire;
+	uint64_t value;
+	const uint8_t *data;
+	size_t length;
+};
+
+static bool
+pb_read_varint(const uint8_t **at, const uint8_t *end, uint64_t *v)
+{
+	*v = 0;
+	for (unsigned shift = 0; *at < end && shift < 64; shift += 7) {
+		uint8_t c = *(*at)++;
+
+		*v |= (uint64_t)(c & 0x7f) << shift;
+		if (!(c & 0x80)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+pb_next(const uint8_t **at, const uint8_t *end, struct pb_field *f)
+{
+	uint64_t key, v;
+
+	if (*at >= end || !pb_read_varint(at, end, &key)) {
+		return false;
+	}
+	f->field = (uint32_t)(key >> 3);
+	f->wire = key & 7;
+	f->data = NULL;
+	f->length = 0;
+	f->value = 0;
+	switch (f->wire) {
+	case 0:
+		return pb_read_varint(at, end, &f->value);
+	case 1:
+	case 5: {
+		unsigned n = f->wire == 1 ? 8 : 4;
+
+		if ((size_t)(end - *at) < n) {
+			return false;
+		}
+		for (unsigned i = 0; i < n; i++) {
+			f->value |= (uint64_t)(*at)[i] << (8 * i);
+		}
+		*at += n;
+		return true;
+	}
+	case 2:
+		if (!pb_read_varint(at, end, &v) || v > (uint64_t)(end - *at)) {
+			return false;
+		}
+		f->data = *at;
+		f->length = (size_t)v;
+		*at += v;
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* A float's bits times `scale`, rounded toward zero (as hakios.mpss.c's ieee32_scaled). */
+static int64_t
+float_scaled(uint32_t bits, uint64_t scale)
+{
+	int exponent = (int)((bits >> 23) & 0xff);
+	uint64_t mantissa = bits & 0x7fffff;
+	__uint128_t product;
+	int64_t v;
+
+	if (exponent == 0 || exponent == 0xff) {
+		return 0;
+	}
+	mantissa |= 1u << 23;
+	product = (__uint128_t)mantissa * scale;
+	exponent -= 150;
+	product = exponent >= 0 ? (exponent < 40 ? product << exponent : 0) : (-exponent < 128 ? product >> -exponent : 0);
+	v = (int64_t)(product > (__uint128_t)INT64_MAX ? INT64_MAX : (uint64_t)product);
+	return (bits >> 31) ? -v : v;
+}
+
+/* One request to the sensor `suid`: message `msg_id` with `payload` (already protobuf). */
+static void
+see_request(const uint64_t suid[2], uint32_t msg_id, const uint8_t *payload, size_t payload_length)
+{
+	uint8_t inner[256], suid_buffer[32], susp[8], request[200], qmi[7 + 3 + 2 + 256];
+	struct pb b, r, sb, sp;
+	size_t n;
+
+	sb = (struct pb){ suid_buffer, suid_buffer + sizeof(suid_buffer), false };
+	pb_fixed(&sb, 1, suid[0], 8);
+	pb_fixed(&sb, 2, suid[1], 8);
+	sp = (struct pb){ susp, susp + sizeof(susp), false };
+	pb_key(&sp, 1, 0); pb_varint(&sp, 1);          /* client processor: APSS */
+	pb_key(&sp, 2, 0); pb_varint(&sp, 0);          /* delivery: wake up */
+	r = (struct pb){ request, request + sizeof(request), false };
+	pb_bytes(&r, 2, payload, payload_length);
+	b = (struct pb){ inner, inner + sizeof(inner), false };
+	pb_bytes(&b, 1, suid_buffer, (size_t)(sb.at - suid_buffer));
+	pb_fixed(&b, 2, msg_id, 4);
+	pb_bytes(&b, 3, susp, (size_t)(sp.at - susp));
+	pb_bytes(&b, 4, request, (size_t)(r.at - request));
+	if (b.overflow || r.overflow || see_port == NULL || see_port_number == 0) {
+		return;
+	}
+	n = (size_t)(b.at - inner);
+	qmi[0] = 0; qmi[1] = see_transaction & 0xff; qmi[2] = see_transaction >> 8;
+	see_transaction++;
+	qmi[3] = SEE_REQUEST & 0xff; qmi[4] = SEE_REQUEST >> 8;
+	qmi[5] = (uint8_t)((3 + 2 + n) & 0xff); qmi[6] = (uint8_t)((3 + 2 + n) >> 8);
+	qmi[7] = 0x01; qmi[8] = (uint8_t)((2 + n) & 0xff); qmi[9] = (uint8_t)((2 + n) >> 8);
+	qmi[10] = (uint8_t)(n & 0xff); qmi[11] = (uint8_t)(n >> 8);
+	memcpy(qmi + 12, inner, n);
+	qrtr_send(see_port, see_node, see_port_number, qmi, 12 + n);
+}
+
+static void
+see_ask_suid(void)
+{
+	static const uint64_t lookup[2] = { 0xababababababababULL, 0xababababababababULL };
+	uint8_t req[32];
+	struct pb b = { req, req + sizeof(req), false };
+
+	pb_bytes(&b, 1, "accel", 5);                   /* data_type */
+	pb_key(&b, 2, 0); pb_varint(&b, 1);            /* register_updates */
+	see_request(lookup, SUID_MSGID_REQ, req, (size_t)(b.at - req));
+	printf("slpi: see: the SUID service asked which sensor is \"accel\"\n");
+}
+
+static void
+see_ask_samples(void)
+{
+	uint8_t req[8];
+	struct pb b = { req, req + sizeof(req), false };
+
+	pb_fixed(&b, 1, 0x41200000u, 4);               /* sample_rate: 10.0 */
+	see_request(accel_suid, SENSOR_MSGID_CONFIG, req, (size_t)(b.at - req));
+	printf("slpi: see: the accelerometer (SUID %016llx %016llx) asked for 10 samples a second\n", accel_suid[1], accel_suid[0]);
+}
+
+/* One event of a sns_client_event_msg: from the SUID service, or a sample, or an error. */
+static void
+see_event(const uint64_t suid[2], uint32_t msg_id, const uint8_t *p, size_t length)
+{
+	const uint8_t *at = p, *end = p + length;
+	struct pb_field f;
+
+	see_events++;
+	if (msg_id == SUID_MSGID_EVENT) {
+		char type[32] = "";
+		unsigned suids = 0;
+
+		while (pb_next(&at, end, &f)) {
+			if (f.field == 1 && f.wire == 2) {
+				size_t n = f.length < sizeof(type) - 1 ? f.length : sizeof(type) - 1;
+
+				memcpy(type, f.data, n);
+				type[n] = 0;
+			} else if (f.field == 2 && f.wire == 2) {
+				const uint8_t *s = f.data, *e = f.data + f.length;
+				struct pb_field g;
+				uint64_t one[2] = { 0, 0 };
+
+				while (pb_next(&s, e, &g)) {
+					if ((g.field == 1 || g.field == 2) && g.wire == 1) {
+						one[g.field - 1] = g.value;
+					}
+				}
+				printf("slpi: see: \"%s\" is SUID %016llx %016llx\n", type, one[1], one[0]);
+				if (suids++ == 0 && !accel_known && strcmp(type, "accel") == 0) {
+					accel_suid[0] = one[0];
+					accel_suid[1] = one[1];
+					accel_known = true;
+				}
+			}
+		}
+		if (suids == 0) {
+			tell("slpi: see: NO SENSOR IS \"%s\" (yet: the SUID service tells again when one comes)\n", type);
+		}
+		return;
+	}
+	if (msg_id == SENSOR_MSGID_EVENT) {
+		int64_t v[3] = { 0, 0, 0 };
+		unsigned n = 0;
+		uint64_t status = 0;
+
+		while (pb_next(&at, end, &f)) {
+			if (f.field == 1 && f.wire == 5 && n < 3) {
+				v[n++] = float_scaled((uint32_t)f.value, 1000);
+			} else if (f.field == 1 && f.wire == 2) {          /* (packed) */
+				for (size_t i = 0; i + 4 <= f.length && n < 3; i += 4) {
+					v[n++] = float_scaled((uint32_t)(f.data[i] | f.data[i + 1] << 8 | f.data[i + 2] << 16 |
+					    (uint32_t)f.data[i + 3] << 24), 1000);
+				}
+			} else if (f.field == 2 && f.wire == 0) {
+				status = f.value;
+			}
+		}
+		accel_x = (int)v[0];
+		accel_y = (int)v[1];
+		accel_z = (int)v[2];
+		if (accel_samples++ < 5 || (accel_samples % 100) == 0) {
+			tell("slpi: see: ACCELEROMETER sample %d: x %lld, y %lld, z %lld mm/s^2 (status %llu)\n", accel_samples, v[0], v[1],
+			    v[2], status);
+		}
+		return;
+	}
+	if (see_logged++ < 20) {
+		printf("slpi: see: event %u from SUID %016llx %016llx, %zu bytes%s\n", msg_id, suid[1], suid[0], length,
+		    msg_id == STD_MSGID_ERROR_EVENT ? " (an error)" : "");
+	}
+}
+
+static void
+see_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data, *v;
+	uint16_t message, size;
+
+	if (length < 7) {
+		return;
+	}
+	message = (uint16_t)(m[3] | m[4] << 8);
+	if (m[0] == 2) {                                        /* an answer */
+		uint16_t result = 0xffff, error = 0xffff;
+
+		if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
+			result = (uint16_t)(v[0] | v[1] << 8);
+			error = (uint16_t)(v[2] | v[3] << 8);
+		}
+		printf("slpi: see: request answered (message %#x): result %u, error %u\n", message, result, error);
+		return;
+	}
+	/* an indication: the event message is TLV 2 (a length of 16 bits, then the bytes) */
+	if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 2) {
+		uint16_t n = (uint16_t)(v[0] | v[1] << 8);
+		const uint8_t *at = v + 2, *end = v + 2 + (n <= size - 2 ? n : size - 2);
+		struct pb_field f;
+		uint64_t suid[2] = { 0, 0 };
+
+		while (pb_next(&at, end, &f)) {
+			if (f.field == 1 && f.wire == 2) {
+				const uint8_t *s = f.data, *e = f.data + f.length;
+				struct pb_field g;
+
+				while (pb_next(&s, e, &g)) {
+					if ((g.field == 1 || g.field == 2) && g.wire == 1) {
+						suid[g.field - 1] = g.value;
+					}
+				}
+			} else if (f.field == 2 && f.wire == 2) {
+				const uint8_t *s = f.data, *e = f.data + f.length;
+				struct pb_field g;
+				uint32_t msg_id = 0;
+				const uint8_t *payload = NULL;
+				size_t payload_length = 0;
+
+				while (pb_next(&s, e, &g)) {
+					if (g.field == 1) {
+						msg_id = (uint32_t)g.value;
+					} else if (g.field == 3 && g.wire == 2) {
+						payload = g.data;
+						payload_length = g.length;
+					}
+				}
+				see_event(suid, msg_id, payload != NULL ? payload : s, payload_length);
+			}
+		}
+	} else if (see_logged++ < 20) {
+		printf("slpi: see: indication %#x of %zu bytes without TLV 2\n", message, length);
+	}
+}
+
+static void
+see_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance, uint32_t node,
+    uint32_t port)
+{
+	if (service != QMI_SEE) {
+		return;
+	}
+	if (arrived) {
+		see_node = node;
+		see_port_number = port;
+	} else if (node == see_node && port == see_port_number) {
+		see_node = see_port_number = 0;
+	}
+}
+
+/* On the DSP's thread once it is up: the client opened, the accelerometer looked up, its samples asked for. */
+static void
+see_run(void)
+{
+	uint64_t began = now_us();
+
+	see_port = qrtr_open(see_receive, see_server, NULL);
+	if (see_port == NULL || qrtr_lookup(see_port, QMI_SEE, 0, 0) != 0) {
+		tell("slpi: see: no port for the sensors' service\n");
+		return;
+	}
+	while (now_us() - began < 60000000ull && !see_asked_samples) {
+		if (see_port_number != 0 && !see_asked_suid) {
+			see_asked_suid = true;
+			see_ask_suid();
+		}
+		if (accel_known && !see_asked_samples) {
+			see_asked_samples = true;
+			see_ask_samples();
+		}
+		sleep_ms(100);
+	}
+	tell("slpi: see: after %llu ms: the service %s, the accelerometer %s; %u events so far\n", (now_us() - began) / 1000,
+	    see_port_number ? "there" : "NOT THERE", accel_known ? "found" : "NOT FOUND", see_events);
+}
+
 static void
 whole_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -3687,13 +4925,13 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		services += qrtr_servers[i].there;
 	}
 	if (step == STEPS && dsp_started) {
-		tell("slpi: THE AUDIO DSP IS UP AND LINKED, its audio services up (APR), %llu ms after the kernel began on it (the "
-		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
-		hakios_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, hakios.sound.c) */
-		hakios_mic_dsp_up();           /* (boot-arg mic=N: the microphones' path, hakios.mic.c) */
-		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
+		tell("slpi: THE SENSORS DSP IS UP AND LINKED, %llu ms after the kernel began on it (the root's waited for included): "
+		    "node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
+		frpc_start();
+		sleep_ms(3000);         /* (the registry read before the sensors are looked up; the SUID service tells later ones too) */
+		see_run();
 	} else {
-		tell("slpi: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
+		tell("slpi: THE SENSORS DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);
 	}
 	thread_terminate(current_thread());
@@ -3776,11 +5014,11 @@ hakios_slpi_init(void)
 		listen_seconds = 1;
 		new_from = STEPS + 1;
 		if (kernel_thread_start(whole_thread, NULL, &thread) != KERN_SUCCESS) {
-			printf("slpi: no thread: the audio DSP is not brought up\n");
+			printf("slpi: no thread: the sensors DSP is not brought up\n");
 			return;
 		}
 		thread_deallocate(thread);
-		tell("slpi: the audio DSP is being brought up beside the system's start (adsp=1)\n");
+		tell("slpi: the sensors DSP is being brought up beside the system's start (adsp=1)\n");
 		return;
 	}
 	if (last_step > STEPS) {

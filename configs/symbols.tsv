@@ -53,8 +53,8 @@ APFS_WRITE_PATH	arg	apfs_write_path	Storage and APFS	k	hakios.apfs_check.c	the f
 APPLOG	arg	applog	CPU, memory and boot	k	(patch)	
 APPLOG_NAME	arg	applog_name	CPU, memory and boot	k	(patch)	
 AUTOUNLOCK	arg	autounlock	User space	u	inject_sb.c	
-BATTERY	arg	battery	Audio and battery	kl	hakios.adsp.c,hakios.battery.c,loader.c	
-BATTMGR	arg	battmgr	Audio and battery	k	hakios.adsp.c	every property once, for the log (which number is which on this phone's firmware)
+BATTERY	arg	battery	Audio and battery	kl	hakios.adsp.c,hakios.battery.c,hakios.slpi.c,loader.c	
+BATTMGR	arg	battmgr	Audio and battery	k	hakios.adsp.c,hakios.slpi.c	every property once, for the log (which number is which on this phone's firmware)
 BQ27541	arg	bq27541	User space	k	hakios.bq27541.c	leaves it alone.
 BQ27541_EVERY	arg	bq27541_every	User space	k	hakios.bq27541.c	
 BT	arg	bt	User space	k	hakios.bt.c	
@@ -114,6 +114,8 @@ DDR	arg	ddr	CPU, memory and boot	k	hakios.cpufreq.c	the memory's bus clock manag
 DDR_REST	arg	ddr_rest	CPU, memory and boot	k	hakios.cpufreq.c	
 DDR_VOTE	arg	ddr_vote	CPU, memory and boot	k	hakios.cpufreq.c	
 DISPLAY_PROBE	arg	display_probe	GPU and display	k	hakios.adreno.c	before any step: read what the firmware left the display controller doing (display_probe() below; two clocks are turned on, nothing else written)
+FASTRPC_LOG	arg	fastrpc_log	User space	k	hakios.slpi.c	
+FASTRPC_MEM	hex	fastrpc_mem	User space	k	hakios.slpi.c	
 FB_BEAM	arg	fb_beam	GPU and display	k	MiniIOMobileFramebuffer.cpp	frames written to the panel's memory whenever their beat comes, as before
 FB_BEAT	arg	fb_beat	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_CA_HZ	arg	fb_ca_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	the refresh rate told to CoreAnimation (IOMFBDisplayRefresh) when it is not to be fb_hz's
@@ -278,15 +280,27 @@ ROOT_APFS	arg	root_apfs	User space	u	init.c	the root is to be the Darwin root vo
 SERIAL	arg	serial	Loader	l	loader.c	
 SLIDER	arg	slider	User space	k	hakios.slider.c	a look, reading only: the three pins' setup and levels at the start, then every 50 ms, and each change said with its time
 SLIM	arg	slim	User space	k	hakios.slim.c	the QMI part alone; slim=2: the NGD as well; slim=3: the codec's clock and reset too
+SLPI	arg	slpi	User space	k	hakios.slpi.c	
+SLPI_AFTER	arg	slpi_after	User space	k	hakios.slpi.c	
+SLPI_AGAIN	arg	slpi_again	User space	k	hakios.slpi.c	
+SLPI_APR_WAIT	arg	slpi_apr_wait	User space	k	hakios.slpi.c	
+SLPI_KEEP	arg	slpi_keep	User space	k	hakios.slpi.c	
+SLPI_LISTEN	arg	slpi_listen	User space	k	hakios.slpi.c	
+SLPI_NEW	arg	slpi_new	User space	k	hakios.slpi.c	
+SLPI_PAUSE	arg	slpi_pause	User space	k	hakios.slpi.c	
+SLPI_QUIET	arg	slpi_quiet	User space	k	hakios.slpi.c	
+SLPI_RETURN	arg	slpi_return	User space	k	hakios.slpi.c	
+SLPI_STEP	arg	slpi_step	User space	k	hakios.slpi.c	
+SLPI_WAIT	arg	slpi_wait	User space	k	hakios.slpi.c	
 SMALL_CORES	arg	small_cores	CPU, memory and boot	k	(patch)	
 SMALL_CORES_AFTER	arg	small_cores_after	CPU, memory and boot	k	GenericARMPE.cpp	
 SOC_ADSP_CX	hex	soc_adsp_cx	Audio and battery	k	hakios.adsp.c	
 SOC_ADSP_MEM	hex	soc_adsp_mem	Audio and battery	k	hakios.adsp.c	
 SOC_ADSP_MEM_SIZE	hex	soc_adsp_mem_size	Audio and battery	k	hakios.adsp.c	
-SOC_AOSS	hex	soc_aoss	Audio and battery	k	hakios.adsp.c	
-SOC_APCS_IPC	hex	soc_apcs_ipc	Cellular	k	hakios.adsp.c,hakios.mpss.c	
+SOC_AOSS	hex	soc_aoss	Audio and battery	k	hakios.adsp.c,hakios.slpi.c	
+SOC_APCS_IPC	hex	soc_apcs_ipc	Cellular	k	hakios.adsp.c,hakios.mpss.c,hakios.slpi.c	
 SOC_AUDIO_STREAM	hex	soc_audio_stream	Audio and battery	k	hakios.sound.c	
-SOC_CMD_DB	hex	soc_cmd_db	GPU and display	k	hakios.adreno.c,hakios.adsp.c,hakios.cpufreq.c,hakios.mpss.c	
+SOC_CMD_DB	hex	soc_cmd_db	GPU and display	k	hakios.adreno.c,hakios.adsp.c,hakios.cpufreq.c,hakios.mpss.c,hakios.slpi.c	
 SOC_DISPLAY	hex	soc_display	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 SOC_GPU	hex	soc_gpu	GPU and display	k	hakios.adreno.c	
 SOC_GSI_BASE	hex	soc_gsi_base	Cellular	k	hakios.ipa.c	
@@ -301,8 +315,10 @@ SOC_MPSS_MEM	hex	soc_mpss_mem	Cellular	k	hakios.mpss.c
 SOC_MPSS_MEM_SIZE	hex	soc_mpss_mem_size	Cellular	k	hakios.mpss.c	
 SOC_PAS_IPA	arg	soc_pas_ipa	Cellular	k	hakios.mpss.c	
 SOC_PAS_MPSS	arg	soc_pas_mpss	Cellular	k	hakios.mpss.c	
-SOC_RSC	hex	soc_rsc	Audio and battery	k	hakios.adsp.c,hakios.cpufreq.c	
-SOC_SMEM	hex	soc_smem	Cellular	k	hakios.adsp.c,hakios.mpss.c,hakios.socinfo.c	where SMEM is (also the modem driver's argument; 0x80900000 on the reference phone)
+SOC_RSC	hex	soc_rsc	Audio and battery	k	hakios.adsp.c,hakios.cpufreq.c,hakios.slpi.c	
+SOC_SLPI_MEM	hex	soc_slpi_mem	User space	k	hakios.slpi.c	
+SOC_SLPI_MEM_SIZE	hex	soc_slpi_mem_size	User space	k	hakios.slpi.c	
+SOC_SMEM	hex	soc_smem	Cellular	k	hakios.adsp.c,hakios.mpss.c,hakios.slpi.c,hakios.socinfo.c	where SMEM is (also the modem driver's argument; 0x80900000 on the reference phone)
 SOC_SMEM_SIZE	hex	soc_smem_size	Chip, thermal and PMIC	k	hakios.socinfo.c	
 SOC_SOUND_BITS	hex	soc_sound_bits	Audio and battery	k	hakios.sound.c	
 SOC_SOUND_CLOCK	hex	soc_sound_clock	Audio and battery	k	hakios.sound.c	

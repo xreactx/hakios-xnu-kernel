@@ -2,7 +2,7 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **437 arguments**: 366 read by the kernel, 15 by the loader, 68 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **453 arguments**: 382 read by the kernel, 15 by the loader, 68 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
@@ -91,7 +91,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `rec_secs` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_REC_SECS` |  |
 | `rec_start` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_REC_START` |  |
 | `rec_step` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_REC_STEP` |  |
-| `soc_cmd_db` | K | `hakios.adreno.c`, `hakios.adsp.c`, `hakios.cpufreq.c`, `hakios.mpss.c` | `CONFIG_SOC_CMD_DB` |  |
+| `soc_cmd_db` | K | `hakios.adreno.c`, `hakios.adsp.c`, `hakios.cpufreq.c`, `hakios.mpss.c`, `hakios.slpi.c` | `CONFIG_SOC_CMD_DB` |  |
 | `soc_display` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_SOC_DISPLAY` |  |
 | `soc_gpu` | K | `hakios.adreno.c` | `CONFIG_SOC_GPU` |  |
 | `surf_clear` | K | `MiniIOSurface.cpp` | `CONFIG_SURF_CLEAR` |  |
@@ -205,7 +205,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `modem_stop` | K | `hakios.mpss.c` | `CONFIG_MODEM_STOP` |  |
 | `modem_wait` | K | `hakios.mpss.c` | `CONFIG_MODEM_WAIT` |  |
 | `modem_wda_off` | K | `hakios.mpss.c` | `CONFIG_MODEM_WDA_OFF` |  |
-| `soc_apcs_ipc` | K | `hakios.adsp.c`, `hakios.mpss.c` | `CONFIG_SOC_APCS_IPC` |  |
+| `soc_apcs_ipc` | K | `hakios.adsp.c`, `hakios.mpss.c`, `hakios.slpi.c` | `CONFIG_SOC_APCS_IPC` |  |
 | `soc_gsi_base` | K | `hakios.ipa.c` | `CONFIG_SOC_GSI_BASE` |  |
 | `soc_imem` | K | `hakios.mpss.c` | `CONFIG_SOC_IMEM` |  |
 | `soc_ipa_base` | K | `hakios.ipa.c` | `CONFIG_SOC_IPA_BASE` |  |
@@ -218,7 +218,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `soc_mpss_mem_size` | K | `hakios.mpss.c` | `CONFIG_SOC_MPSS_MEM_SIZE` |  |
 | `soc_pas_ipa` | K | `hakios.mpss.c` | `CONFIG_SOC_PAS_IPA` |  |
 | `soc_pas_mpss` | K | `hakios.mpss.c` | `CONFIG_SOC_PAS_MPSS` |  |
-| `soc_smem` | K | `hakios.adsp.c`, `hakios.mpss.c`, `hakios.socinfo.c` | `CONFIG_SOC_SMEM` |  |
+| `soc_smem` | K | `hakios.adsp.c`, `hakios.mpss.c`, `hakios.slpi.c`, `hakios.socinfo.c` | `CONFIG_SOC_SMEM` |  |
 
 ## Audio and battery (47)
 
@@ -235,11 +235,11 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `adsp_return` | K | `hakios.adsp.c` | `CONFIG_ADSP_RETURN` |  |
 | `adsp_step` | K | `hakios.adsp.c` | `CONFIG_ADSP_STEP` |  |
 | `adsp_wait` | K | `hakios.adsp.c` | `CONFIG_ADSP_WAIT` |  |
-| `battery` | KL | `hakios.adsp.c`, `hakios.battery.c`, `loader.c` | `CONFIG_BATTERY` |  |
+| `battery` | KL | `hakios.adsp.c`, `hakios.battery.c`, `hakios.slpi.c`, `loader.c` | `CONFIG_BATTERY` |  |
 | `battery_shared_pa` | K | `hakios.battery.c` |  | the loader (the address of its charger page) |
 | `battery_stop` | K | `hakios.battguard.c` | `CONFIG_BATTERY_STOP` |  |
 | `battery_stop_poll` | K | `hakios.battguard.c` | `CONFIG_BATTERY_STOP_POLL` |  |
-| `battmgr` | K | `hakios.adsp.c` | `CONFIG_BATTMGR` |  |
+| `battmgr` | K | `hakios.adsp.c`, `hakios.slpi.c` | `CONFIG_BATTMGR` |  |
 | `btslim_rate` | K | `hakios.mic.c`, `hakios.slim.c` | `CONFIG_BTSLIM_RATE` |  |
 | `mic` | K | `hakios.mic.c` | `CONFIG_MIC` |  |
 | `mic_adc` | K | `hakios.mic.c` | `CONFIG_MIC_ADC` |  |
@@ -255,9 +255,9 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `soc_adsp_cx` | K | `hakios.adsp.c` | `CONFIG_SOC_ADSP_CX` |  |
 | `soc_adsp_mem` | K | `hakios.adsp.c` | `CONFIG_SOC_ADSP_MEM` |  |
 | `soc_adsp_mem_size` | K | `hakios.adsp.c` | `CONFIG_SOC_ADSP_MEM_SIZE` |  |
-| `soc_aoss` | K | `hakios.adsp.c` | `CONFIG_SOC_AOSS` |  |
+| `soc_aoss` | K | `hakios.adsp.c`, `hakios.slpi.c` | `CONFIG_SOC_AOSS` |  |
 | `soc_audio_stream` | K | `hakios.sound.c` | `CONFIG_SOC_AUDIO_STREAM` |  |
-| `soc_rsc` | K | `hakios.adsp.c`, `hakios.cpufreq.c` | `CONFIG_SOC_RSC` |  |
+| `soc_rsc` | K | `hakios.adsp.c`, `hakios.cpufreq.c`, `hakios.slpi.c` | `CONFIG_SOC_RSC` |  |
 | `soc_sound_bits` | K | `hakios.sound.c` | `CONFIG_SOC_SOUND_BITS` |  |
 | `soc_sound_clock` | K | `hakios.sound.c` | `CONFIG_SOC_SOUND_CLOCK` |  |
 | `soc_sound_port` | K | `hakios.sound.c` | `CONFIG_SOC_SOUND_PORT` |  |
@@ -442,7 +442,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ufs` | L | `loader.c` | `CONFIG_UFS` |  |
 | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
 
-## User space (73)
+## User space (89)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -474,6 +474,8 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `cam6t_settle` | K | `hakios.cam6t.c` | `CONFIG_CAM6T_SETTLE` |  |
 | `cam6t_xo` | K | `hakios.cam6t.c` | `CONFIG_CAM6T_XO` |  |
 | `cc_fade` | U | `inject_sb.c` | `CONFIG_CC_FADE` |  |
+| `fastrpc_log` | K | `hakios.slpi.c` | `CONFIG_FASTRPC_LOG` |  |
+| `fastrpc_mem` | K | `hakios.slpi.c` | `CONFIG_FASTRPC_MEM` |  |
 | `gl` | U | `inject.c`, `inject_sb.c` | `CONFIG_GL` |  |
 | `glcompile` | U | `inject.c` | `CONFIG_GLCOMPILE` |  |
 | `glno` | U | `inject.c` | `CONFIG_GLNO` |  |
@@ -504,6 +506,20 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `sb_delay` | U | `inject_sb.c` |  | xl (XL_SB_DELAY) |
 | `slider` | K | `hakios.slider.c` | `CONFIG_SLIDER` |  |
 | `slim` | K | `hakios.slim.c` | `CONFIG_SLIM` |  |
+| `slpi` | K | `hakios.slpi.c` | `CONFIG_SLPI` |  |
+| `slpi_after` | K | `hakios.slpi.c` | `CONFIG_SLPI_AFTER` |  |
+| `slpi_again` | K | `hakios.slpi.c` | `CONFIG_SLPI_AGAIN` |  |
+| `slpi_apr_wait` | K | `hakios.slpi.c` | `CONFIG_SLPI_APR_WAIT` |  |
+| `slpi_keep` | K | `hakios.slpi.c` | `CONFIG_SLPI_KEEP` |  |
+| `slpi_listen` | K | `hakios.slpi.c` | `CONFIG_SLPI_LISTEN` |  |
+| `slpi_new` | K | `hakios.slpi.c` | `CONFIG_SLPI_NEW` |  |
+| `slpi_pause` | K | `hakios.slpi.c` | `CONFIG_SLPI_PAUSE` |  |
+| `slpi_quiet` | K | `hakios.slpi.c` | `CONFIG_SLPI_QUIET` |  |
+| `slpi_return` | K | `hakios.slpi.c` | `CONFIG_SLPI_RETURN` |  |
+| `slpi_step` | K | `hakios.slpi.c` | `CONFIG_SLPI_STEP` |  |
+| `slpi_wait` | K | `hakios.slpi.c` | `CONFIG_SLPI_WAIT` |  |
+| `soc_slpi_mem` | K | `hakios.slpi.c` | `CONFIG_SOC_SLPI_MEM` |  |
+| `soc_slpi_mem_size` | K | `hakios.slpi.c` | `CONFIG_SOC_SLPI_MEM_SIZE` |  |
 | `soc_vtimer` | K | `gic_v3_irq.c` | `CONFIG_SOC_VTIMER` |  |
 | `switcher_wallpaper` | U | `inject_sb.c` | `CONFIG_SWITCHER_WALLPAPER` |  |
 | `synaptics` | K | `hakios.synaptics.c` | `CONFIG_SYNAPTICS` |  |

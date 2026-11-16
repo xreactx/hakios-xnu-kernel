@@ -123,6 +123,8 @@ ddr_rest	k
 ddr_vote	k
 display_probe	k
 epoch	k
+fastrpc_log	k
+fastrpc_mem	k
 fb_beam	k
 fb_beat	k
 fb_ca_hz	k
@@ -300,6 +302,18 @@ sb_delay	u
 serial	l
 slider	k
 slim	k
+slpi	k
+slpi_after	k
+slpi_again	k
+slpi_apr_wait	k
+slpi_keep	k
+slpi_listen	k
+slpi_new	k
+slpi_pause	k
+slpi_quiet	k
+slpi_return	k
+slpi_step	k
+slpi_wait	k
 small_cores	k
 small_cores_after	k
 soc_adsp_cx	k
@@ -324,6 +338,8 @@ soc_mpss_mem_size	k
 soc_pas_ipa	k
 soc_pas_mpss	k
 soc_rsc	k
+soc_slpi_mem	k
+soc_slpi_mem_size	k
 soc_smem	k
 soc_smem_size	k
 soc_sound_bits	k

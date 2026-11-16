@@ -631,6 +631,27 @@ fi
 if [ "${SENSORS-0}" != 0 ] && [ -f ../fw-sensors/slpi.mdt ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-sensors/slpi.mdt ../fw-sensors/slpi.b[0-9][0-9] root/fw/
+	# ... and the files its sensors process reads through FastRPC (hakios.slpi.c serves them from this one file):
+	# persist's sensors/ (the registry), /vendor/etc/sensors (the drivers' JSON, sns_reg_config; not the protos) and
+	# /sys/devices/soc0 (the SoC's identity, as the phone's Android has it: fw-sensors/soc0)
+	python3 - ../fw-sensors root/fw/sns.bundle <<'PY'
+import os, struct, sys
+src, out = sys.argv[1], sys.argv[2]
+files = []
+for top, prefix in (('persist/sensors', 'mnt/vendor/persist/sensors'), ('sensors', 'vendor/etc/sensors'), ('soc0', 'sys/devices/soc0')):
+    base = os.path.join(src, top)
+    for d, dirs, names in os.walk(base):
+        dirs[:] = sorted(x for x in dirs if x not in ('proto', 'scripts'))
+        for n in sorted(names):
+            rel = os.path.relpath(os.path.join(d, n), base)
+            files.append((prefix + '/' + rel, open(os.path.join(d, n), 'rb').read()))
+with open(out, 'wb') as f:
+    f.write(b'SNSB' + struct.pack('<I', len(files)))
+    for path, data in files:
+        p = path.encode()
+        f.write(struct.pack('<H', len(p)) + p + struct.pack('<I', len(data)) + data)
+print(f'build.sh: fw/sns.bundle: {len(files)} files of the sensors DSP, {os.path.getsize(out)} bytes')
+PY
 fi
 # Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
 # device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone
