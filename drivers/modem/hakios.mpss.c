@@ -7310,33 +7310,253 @@ step_nas(void)
 /* ---- SMS: the modem's wireless messaging service (QMI WMS, 5) ------------------------------------ */
 
 /*
- * Boot-arg sms_to=DIGITS (international, without "+": 1 and the US number): once the modem is registered, one text is
- * sent to it through WMS's Raw Send (0x20: TLV 1 = format 6, GSM/WCDMA point to point, then a length of 16 bits and the
- * SMS-SUBMIT PDU: the SMSC left to the SIM's (0), no validity period, the address international, GSM 7-bit text). The
- * answer (TLV 1 the message's reference, 0x10 the cause, 0x11 its class, 0x12 the network's cause) is logged. The first
- * step to messages; nothing is received yet.
+ * Receiving (on by default, sms=0 off): once WMS is found, its routes are set (0x32: every class but 2, the SIM's own,
+ * "transfer and ack": the modem acknowledges to the network and hands the PDU over, nothing stored) and new-message
+ * events asked for (Set Event Report 0x01, TLV 0x10 = 1). Each text then arrives as an Event Report indication: TLV 0x11
+ * (the transferred PDU) or, for one the modem stored anyway, TLV 0x10 (storage, index), read with Raw Read (0x22). The
+ * SMS-DELIVER PDU is decoded (sender, GSM 7-bit or UCS-2 text, the part number of a long one) and logged; the count and
+ * the last one are in sysctls (kern.hakios.sms_received, sms_from, sms_text) for userland.
+ *
+ * Sending (boot-arg sms_to=DIGITS: international, without "+"): once the modem is registered, one text is sent through
+ * Raw Send (0x20: TLV 1 = format 6, GSM/WCDMA point to point, then a length of 16 bits and the SMS-SUBMIT PDU: the SMSC
+ * left to the SIM's (0), no validity period, the address international, GSM 7-bit text). Run 225813 delivered it.
  */
 #define QMI_WMS                 5
+#define WMS_SET_EVENT_REPORT    0x0001
 #define WMS_RAW_SEND            0x0020
+#define WMS_RAW_READ            0x0022
+#define WMS_SET_ROUTES          0x0032
 #define SMS_TEXT                "Hello from HakiOS on a OnePlus 6T"
 
 static struct hakios_qrtr_port *wms_port;
 static uint32_t wms_node, wms_port_number;
 static volatile int sms_state;                  /* 0 nothing to do or not yet, 1 asked, 2 answered */
+static volatile int wms_setup;                  /* 0 not yet, 1 routes and events asked */
 static char sms_to[24];
+static int sms_received;
+static char sms_from[24];
+static char sms_text[324];
+
+SYSCTL_INT(_kern_hakios, OID_AUTO, sms_received, CTLFLAG_RD | CTLFLAG_LOCKED, &sms_received, 0, "texts received");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, sms_from, CTLFLAG_RD | CTLFLAG_LOCKED, sms_from, sizeof(sms_from), "the last text's sender");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, sms_text, CTLFLAG_RD | CTLFLAG_LOCKED, sms_text, sizeof(sms_text), "the last text");
+
+/* GSM 7-bit default alphabet to ASCII (what ASCII lacks: '?') */
+static const char gsm7[128] =
+    "@?$???????\n??\r???_?????????????? !\"#?%&'()*+,-./0123456789:;<=>?"
+    "?ABCDEFGHIJKLMNOPQRSTUVWXYZ??????abcdefghijklmnopqrstuvwxyz?????";
+
+static void
+sms_digits(const uint8_t *p, unsigned digits, uint8_t type, char *out, size_t size)
+{
+	unsigned o = 0;
+
+	if ((type & 0x70) == 0x50) {            /* alphanumeric: GSM 7-bit packed */
+		unsigned septets = digits * 4 / 7, bits = 0;
+		uint32_t acc = 0;
+		const uint8_t *q = p;
+
+		for (unsigned i = 0; i < septets && o + 1 < size;) {
+			if (bits < 7) {
+				acc |= (uint32_t)*q++ << bits;
+				bits += 8;
+			}
+			out[o++] = gsm7[acc & 0x7f];
+			acc >>= 7;
+			bits -= 7;
+			i++;
+		}
+		out[o] = 0;
+		return;
+	}
+	if ((type & 0x70) == 0x10 && o + 1 < size) {
+		out[o++] = '+';
+	}
+	for (unsigned i = 0; i < digits && o + 1 < size; i++) {
+		uint8_t d = (uint8_t)(i & 1 ? p[i / 2] >> 4 : p[i / 2] & 0xf);
+
+		out[o++] = d < 10 ? (char)('0' + d) : d == 10 ? '*' : d == 11 ? '#' : '?';
+	}
+	out[o] = 0;
+}
+
+static void
+sms_hex(const char *what, const uint8_t *p, unsigned n)
+{
+	char line[3 * 32 + 1];
+
+	for (unsigned at = 0; at < n && at < 192; at += 32) {
+		unsigned o = 0;
+
+		for (unsigned k = at; k < n && k < at + 32; k++) {
+			o += (unsigned)snprintf(line + o, sizeof(line) - o, "%02x ", p[k]);
+		}
+		tell("mpss: sms: %s +%u: %s\n", what, at, line);
+	}
+}
+
+/* An SMS-DELIVER PDU, as WMS gives it: no SMSC in front (that comes apart, TLV 0x15 of the event): logged, and kept for
+ * the sysctls. (Run 073839: 04 0b 91 81 80 58 89 80 f7 00 00 <time> 09 c8 32 9b fd 06 c5 64 32 -- "hello 123".) */
+static void
+sms_deliver(const uint8_t *p, unsigned n)
+{
+	unsigned i = 0, digits, udl, header = 0, part = 0, parts = 0, o = 0;
+	uint8_t first, type, dcs;
+	char from[24], text[324];
+
+	sms_hex("pdu", p, n);
+	if (n < 1) {
+		goto bad;
+	}
+	first = p[i++];
+	if ((first & 3) != 0) {
+		tell("mpss: sms: a message of type %u received (not a text: a report?)\n", first & 3);
+		return;
+	}
+	if (i + 2 > n) {
+		goto bad;
+	}
+	digits = p[i++];
+	type = p[i++];
+	if (i + (digits + 1) / 2 + 2 + 7 + 1 > n) {
+		goto bad;
+	}
+	sms_digits(p + i, digits, type, from, sizeof(from));
+	i += (digits + 1) / 2;
+	i++;                                    /* protocol */
+	dcs = p[i++];
+	i += 7;                                 /* the service centre's time stamp */
+	udl = p[i++];
+	if (first & 0x40) {                     /* a user data header: a long text's part number */
+		unsigned h = i + 1, end;
+
+		if (i >= n) {
+			goto bad;
+		}
+		header = 1u + p[i];
+		end = i + header;
+		while (h + 1 < end && end <= n) {
+			uint8_t id = p[h], length = p[h + 1];
+
+			if ((id == 0 && length == 3 && h + 4 < n) || (id == 8 && length == 4 && h + 5 < n)) {
+				parts = p[h + 2 + length - 2];
+				part = p[h + 2 + length - 1];
+			}
+			h += 2u + length;
+		}
+	}
+	if ((dcs & 0xcc) == 0x08 || (dcs & 0xf0) == 0x08) {     /* UCS-2: what is ASCII kept, the rest '?' */
+		for (unsigned k = i + header; k + 1 < i + udl && k + 1 < n && o + 1 < sizeof(text); k += 2) {
+			uint16_t c = (uint16_t)(p[k] << 8 | p[k + 1]);
+
+			text[o++] = c >= 0x20 && c < 0x7f ? (char)c : c == '\n' ? '\n' : '?';
+		}
+	} else if ((dcs & 0xcc) == 0x04) {      /* 8-bit data */
+		snprintf(text, sizeof(text), "(%u bytes of data)", udl);
+		o = (unsigned)strlen(text);
+	} else {                                /* GSM 7-bit, after the header's septets */
+		unsigned skip = (header * 8 + 6) / 7, bits = 0, s = 0;
+		uint32_t acc = 0;
+		const uint8_t *q = p + i;
+
+		for (; s < udl; s++) {
+			if (bits < 7) {
+				if (q >= p + n) {
+					break;
+				}
+				acc |= (uint32_t)*q++ << bits;
+				bits += 8;
+			}
+			if (s >= skip && o + 1 < sizeof(text)) {
+				text[o++] = gsm7[acc & 0x7f];
+			}
+			acc >>= 7;
+			bits -= 7;
+		}
+	}
+	text[o] = 0;
+	sms_received++;
+	strlcpy(sms_from, from, sizeof(sms_from));
+	strlcpy(sms_text, text, sizeof(sms_text));
+	if (parts > 1) {
+		tell("mpss: sms: A TEXT RECEIVED (%d) from %s, part %u of %u: \"%s\"\n", sms_received, from, part, parts, text);
+	} else {
+		tell("mpss: sms: A TEXT RECEIVED (%d) from %s: \"%s\"\n", sms_received, from, text);
+	}
+	return;
+bad:
+	tell("mpss: sms: a message of %u bytes received that does not parse\n", n);
+}
+
+static void
+wms_raw_read(uint8_t storage, uint32_t index)
+{
+	uint8_t q[7 + 3 + 5 + 3 + 1] = { QMI_REQUEST, 0x79, 0x00, WMS_RAW_READ & 0xff, WMS_RAW_READ >> 8, 12, 0,
+		0x01, 5, 0, storage, (uint8_t)index, (uint8_t)(index >> 8), (uint8_t)(index >> 16), (uint8_t)(index >> 24),
+		0x10, 1, 0, 1 };                /* (TLV 0x10: GSM/WCDMA) */
+
+	qrtr_send(wms_port, wms_node, wms_port_number, q, sizeof(q));
+}
 
 static void
 wms_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
 {
 	const uint8_t *m = data, *v;
-	uint16_t size, result = 0xffff, error = 0xffff;
+	uint16_t size, result = 0xffff, error = 0xffff, id;
 
-	if (length < 7 || m[0] != QMI_RESPONSE || (m[3] | m[4] << 8) != WMS_RAW_SEND) {
+	if (length < 7) {
 		return;
 	}
-	if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
+	id = (uint16_t)(m[3] | m[4] << 8);
+	if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4 && m[0] == QMI_RESPONSE) {
 		result = (uint16_t)(v[0] | v[1] << 8);
 		error = (uint16_t)(v[2] | v[3] << 8);
+	}
+	if (m[0] == QMI_INDICATION && id == WMS_SET_EVENT_REPORT) {
+		sms_hex("event", m, (unsigned)length);
+		if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 8) {
+			unsigned n = (unsigned)(v[6] | v[7] << 8);
+
+			if (8u + n <= size) {
+				sms_deliver(v + 8, n);
+			}
+		} else if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 5) {
+			uint32_t index = (uint32_t)(v[1] | v[2] << 8 | v[3] << 16 | (uint32_t)v[4] << 24);
+
+			tell("mpss: sms: a text stored by the modem (storage %u, index %u): read\n", v[0], index);
+			wms_raw_read(v[0], index);
+		} else {
+			tell("mpss: sms: an event of %u bytes, no message in it\n", (unsigned)length);
+		}
+		return;
+	}
+	if (m[0] != QMI_RESPONSE) {
+		return;
+	}
+	switch (id) {
+	case WMS_SET_ROUTES:
+		tell("mpss: sms: routes set (texts handed to us, acknowledged by the modem): result %u, error %u\n", result, error);
+		return;
+	case WMS_SET_EVENT_REPORT:
+		tell("mpss: sms: new-text events asked for: result %u, error %u%s\n", result, error,
+		    result == 0 ? " -- READY TO RECEIVE" : "");
+		return;
+	case WMS_RAW_READ:
+		sms_hex("read", m, (unsigned)length);
+		if (result == 0 && (v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 4) {
+			unsigned n = (unsigned)(v[2] | v[3] << 8);
+
+			if (4u + n <= size) {
+				sms_deliver(v + 4, n);
+			}
+		} else {
+			tell("mpss: sms: reading the stored text: result %u, error %u\n", result, error);
+		}
+		return;
+	case WMS_RAW_SEND:
+		break;
+	default:
+		return;
 	}
 	tell("mpss: sms: THE TEXT TO %s: result %u, error %u%s\n", sms_to, result, error, result == 0 ? " -- SENT" : "");
 	if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 2) {
@@ -7366,22 +7586,27 @@ wms_server(__unused void *context, bool arrived, uint32_t service, __unused uint
 		wms_port_number = port;
 	} else if (node == wms_node && port == wms_port_number) {
 		wms_node = wms_port_number = 0;
+		wms_setup = 0;
 	}
 }
 
 static void
 sms_open(void)
 {
-	/* (read as a string: PE_parse_boot_argn takes "18088598087" for a number and writes its binary -- run 225317 sent its
-	 * text to "G*6") */
-	if (wms_port != NULL || !PE_parse_boot_arg_str("sms_to", sms_to, sizeof(sms_to)) || sms_to[0] == 0) {
+	int on = 1;
+
+	if (wms_port != NULL || (PE_parse_boot_argn("sms", &on, sizeof(on)) && on == 0)) {
 		return;
 	}
-	for (const char *c = sms_to; *c != 0; c++) {
-		if (*c < '0' || *c > '9') {
-			tell("mpss: sms: sms_to=%s is not all digits: no text is sent\n", sms_to);
-			sms_to[0] = 0;
-			return;
+	/* (read as a string: PE_parse_boot_argn takes "18088598087" for a number and writes its binary -- run 225317 sent its
+	 * text to "G*6") */
+	if (PE_parse_boot_arg_str("sms_to", sms_to, sizeof(sms_to))) {
+		for (const char *c = sms_to; *c != 0; c++) {
+			if (*c < '0' || *c > '9') {
+				tell("mpss: sms: sms_to=%s is not all digits: no text is sent\n", sms_to);
+				sms_to[0] = 0;
+				break;
+			}
 		}
 	}
 	wms_port = qrtr_open(wms_receive, wms_server, NULL);
@@ -7390,7 +7615,7 @@ sms_open(void)
 	}
 }
 
-/* Once registered: the PDU made and sent, once. */
+/* Once WMS is there: routes and events, once; once registered: the PDU made and sent, once. */
 static void
 sms_advance(void)
 {
@@ -7398,7 +7623,30 @@ sms_advance(void)
 	unsigned n = 0, digits = (unsigned)strlen(sms_to), septets = (unsigned)strlen(SMS_TEXT), bits = 0, at = 7;
 	uint32_t acc = 0;
 
-	if (wms_port == NULL || wms_port_number == 0 || sms_state != 0 || !nas.state.registered || digits == 0 || digits > 20) {
+	if (wms_port == NULL || wms_port_number == 0) {
+		return;
+	}
+	if (wms_setup == 0) {
+		/* routes: point to point, classes 0 1 3 4 (4: none), no storage, transfer and ack; class 2 to the SIM, stored */
+		static const uint8_t classes[5][4] = { { 0, 0, 0xff, 3 }, { 0, 1, 0xff, 3 }, { 0, 2, 0, 1 }, { 0, 3, 0xff, 3 },
+		    { 0, 4, 0xff, 3 } };
+		uint8_t events[11] = { QMI_REQUEST, 0x7b, 0x00, WMS_SET_EVENT_REPORT & 0xff, WMS_SET_EVENT_REPORT >> 8, 4, 0,
+		    0x10, 1, 0, 1 };
+
+		q[0] = QMI_REQUEST; q[1] = 0x7a; q[2] = 0x00;
+		q[3] = WMS_SET_ROUTES & 0xff; q[4] = WMS_SET_ROUTES >> 8;
+		q[at++] = 0x01; q[at++] = 2 + sizeof(classes); q[at++] = 0;
+		q[at++] = 5; q[at++] = 0;
+		memcpy(q + at, classes, sizeof(classes));
+		at += sizeof(classes);
+		q[at++] = 0x10; q[at++] = 1; q[at++] = 0; q[at++] = 1;  /* transfer status reports to us too */
+		q[5] = (uint8_t)(at - 7); q[6] = 0;
+		wms_setup = 1;
+		qrtr_send(wms_port, wms_node, wms_port_number, q, at);
+		qrtr_send(wms_port, wms_node, wms_port_number, events, sizeof(events));
+		at = 7;
+	}
+	if (sms_state != 0 || !nas.state.registered || digits == 0 || digits > 20) {
 		return;
 	}
 	pdu[n++] = 0x00;                        /* the SMSC: the SIM's */
