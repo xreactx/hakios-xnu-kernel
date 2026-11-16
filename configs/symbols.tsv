@@ -296,6 +296,7 @@ SLPI_STEP	arg	slpi_step	User space	k	hakios.slpi.c
 SLPI_WAIT	arg	slpi_wait	User space	k	hakios.slpi.c	
 SMALL_CORES	arg	small_cores	CPU, memory and boot	k	(patch)	
 SMALL_CORES_AFTER	arg	small_cores_after	CPU, memory and boot	k	GenericARMPE.cpp	
+SMS_TO	arg	sms_to	Cellular	k	hakios.mpss.c	
 SOC_ADSP_CX	hex	soc_adsp_cx	Audio and battery	k	hakios.adsp.c	
 SOC_ADSP_MEM	hex	soc_adsp_mem	Audio and battery	k	hakios.adsp.c	
 SOC_ADSP_MEM_SIZE	hex	soc_adsp_mem_size	Audio and battery	k	hakios.adsp.c	

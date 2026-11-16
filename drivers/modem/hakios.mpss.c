@@ -6288,6 +6288,8 @@ radio_name(uint8_t radio)
 static void wds_advance(void);
 static void loc_open(void);
 static void loc_advance(void);
+static void sms_open(void);
+static void sms_advance(void);
 static volatile bool wds_registered;      /* NAS says the modem is registered (set by nas_changed) */
 static void probe_dump(const char *who, const uint8_t *m, size_t length);
 
@@ -7225,6 +7227,7 @@ step_nas(void)
 	}
 	wds_open();
 	loc_open();
+	sms_open();
 	began = now_us();
 	while (now_us() - began < wait_seconds * 1000000ull) {
 		if (online && !is_online && dms_port_number != 0 && now_us() - asked_online > 5000000ull) {
@@ -7264,6 +7267,7 @@ step_nas(void)
 		}
 		wds_advance();          /* bind / start / retry the data session on its own clock */
 		loc_advance();
+		sms_advance();
 		sleep_ms(1000);
 		if (nas.state.registered && nas.state.has_signal) {
 			if (!registered) {
@@ -7302,6 +7306,138 @@ step_nas(void)
 	return nas.connected;
 }
 
+
+/* ---- SMS: the modem's wireless messaging service (QMI WMS, 5) ------------------------------------ */
+
+/*
+ * Boot-arg sms_to=DIGITS (international, without "+": 1 and the US number): once the modem is registered, one text is
+ * sent to it through WMS's Raw Send (0x20: TLV 1 = format 6, GSM/WCDMA point to point, then a length of 16 bits and the
+ * SMS-SUBMIT PDU: the SMSC left to the SIM's (0), no validity period, the address international, GSM 7-bit text). The
+ * answer (TLV 1 the message's reference, 0x10 the cause, 0x11 its class, 0x12 the network's cause) is logged. The first
+ * step to messages; nothing is received yet.
+ */
+#define QMI_WMS                 5
+#define WMS_RAW_SEND            0x0020
+#define SMS_TEXT                "Hello from HakiOS on a OnePlus 6T"
+
+static struct hakios_qrtr_port *wms_port;
+static uint32_t wms_node, wms_port_number;
+static volatile int sms_state;                  /* 0 nothing to do or not yet, 1 asked, 2 answered */
+static char sms_to[24];
+
+static void
+wms_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data, *v;
+	uint16_t size, result = 0xffff, error = 0xffff;
+
+	if (length < 7 || m[0] != QMI_RESPONSE || (m[3] | m[4] << 8) != WMS_RAW_SEND) {
+		return;
+	}
+	if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
+		result = (uint16_t)(v[0] | v[1] << 8);
+		error = (uint16_t)(v[2] | v[3] << 8);
+	}
+	tell("mpss: sms: THE TEXT TO %s: result %u, error %u%s\n", sms_to, result, error, result == 0 ? " -- SENT" : "");
+	if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 2) {
+		tell("mpss: sms: its reference %u\n", v[0] | v[1] << 8);
+	}
+	if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 2) {
+		tell("mpss: sms: cause %u\n", v[0] | v[1] << 8);
+	}
+	if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 1) {
+		tell("mpss: sms: error class %u (0 temporary, 1 permanent)\n", v[0]);
+	}
+	if ((v = qmi_tlv(m, length, 0x12, &size)) != NULL && size >= 2) {
+		tell("mpss: sms: the network's cause %u (RP %u)\n", v[0], v[1]);
+	}
+	sms_state = 2;
+}
+
+static void
+wms_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance, uint32_t node,
+    uint32_t port)
+{
+	if (service != QMI_WMS) {
+		return;
+	}
+	if (arrived) {
+		wms_node = node;
+		wms_port_number = port;
+	} else if (node == wms_node && port == wms_port_number) {
+		wms_node = wms_port_number = 0;
+	}
+}
+
+static void
+sms_open(void)
+{
+	/* (read as a string: PE_parse_boot_argn takes "18088598087" for a number and writes its binary -- run 225317 sent its
+	 * text to "G*6") */
+	if (wms_port != NULL || !PE_parse_boot_arg_str("sms_to", sms_to, sizeof(sms_to)) || sms_to[0] == 0) {
+		return;
+	}
+	for (const char *c = sms_to; *c != 0; c++) {
+		if (*c < '0' || *c > '9') {
+			tell("mpss: sms: sms_to=%s is not all digits: no text is sent\n", sms_to);
+			sms_to[0] = 0;
+			return;
+		}
+	}
+	wms_port = qrtr_open(wms_receive, wms_server, NULL);
+	if (wms_port != NULL) {
+		qrtr_lookup(wms_port, QMI_WMS, 0, 0);
+	}
+}
+
+/* Once registered: the PDU made and sent, once. */
+static void
+sms_advance(void)
+{
+	uint8_t q[7 + 3 + 3 + 160], pdu[160];
+	unsigned n = 0, digits = (unsigned)strlen(sms_to), septets = (unsigned)strlen(SMS_TEXT), bits = 0, at = 7;
+	uint32_t acc = 0;
+
+	if (wms_port == NULL || wms_port_number == 0 || sms_state != 0 || !nas.state.registered || digits == 0 || digits > 20) {
+		return;
+	}
+	pdu[n++] = 0x00;                        /* the SMSC: the SIM's */
+	pdu[n++] = 0x01;                        /* SMS-SUBMIT, no validity period */
+	pdu[n++] = 0x00;                        /* message reference: the modem's */
+	pdu[n++] = (uint8_t)digits;
+	pdu[n++] = 0x91;                        /* international, ISDN */
+	for (unsigned i = 0; i < digits; i += 2) {
+		uint8_t lo = (uint8_t)(sms_to[i] - '0'), hi = i + 1 < digits ? (uint8_t)(sms_to[i + 1] - '0') : 0xf;
+
+		pdu[n++] = (uint8_t)(hi << 4 | lo);
+	}
+	pdu[n++] = 0x00;                        /* protocol */
+	pdu[n++] = 0x00;                        /* GSM 7-bit */
+	pdu[n++] = (uint8_t)septets;
+	for (unsigned i = 0; i < septets; i++) {        /* (these letters are their own GSM 7-bit codes) */
+		acc |= (uint32_t)(SMS_TEXT[i] & 0x7f) << bits;
+		bits += 7;
+		while (bits >= 8) {
+			pdu[n++] = (uint8_t)acc;
+			acc >>= 8;
+			bits -= 8;
+		}
+	}
+	if (bits > 0) {
+		pdu[n++] = (uint8_t)acc;
+	}
+	q[0] = QMI_REQUEST; q[1] = 0x77; q[2] = 0x00;
+	q[3] = WMS_RAW_SEND & 0xff; q[4] = WMS_RAW_SEND >> 8;
+	q[at++] = 0x01; q[at++] = (uint8_t)((3 + n) & 0xff); q[at++] = (uint8_t)((3 + n) >> 8);
+	q[at++] = 0x06;                         /* GSM/WCDMA point to point */
+	q[at++] = (uint8_t)(n & 0xff); q[at++] = (uint8_t)(n >> 8);
+	memcpy(q + at, pdu, n);
+	at += n;
+	q[5] = (uint8_t)((at - 7) & 0xff); q[6] = (uint8_t)((at - 7) >> 8);
+	sms_state = 1;
+	tell("mpss: sms: about to send a text of %u characters to %s (a PDU of %u bytes)\n", septets, sms_to, n);
+	qrtr_send(wms_port, wms_node, wms_port_number, q, at);
+}
 
 /* ---- GNSS: the modem's location service (QMI LOC, 0x10) ------------------------------------------- */
 
@@ -7674,6 +7810,7 @@ nas_thread(__unused void *parameter, __unused wait_result_t result)
 			nas_polls += hakios_nas_client_poll(&nas) == 0;
 		}
 		loc_advance();
+		sms_advance();
 		for (unsigned ms = 0; ms < 2000 && nas_wanted; ms += 100) {
 			sleep_ms(100);
 		}

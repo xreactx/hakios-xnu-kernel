@@ -318,6 +318,7 @@ slpi_step	k
 slpi_wait	k
 small_cores	k
 small_cores_after	k
+sms_to	k
 soc_adsp_cx	k
 soc_adsp_mem	k
 soc_adsp_mem_size	k
