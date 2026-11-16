@@ -13,7 +13,7 @@
  *   - its rails are CX and MX (dt: qcom,ssc@5c00000), raised while it boots and never given back
  *   - the always-on processor is told of it as "slpi"
  *   - there is no APR: the steps end with QRTR (step 10), where the services it offers are seen
- * Boot-args: slpi=1 (all of it, on a thread), slpi_step=N, slpi_keep, slpi_after=S, slpi_listen=S, as adsp_*.
+ * Boot-args: slpi=1 (all of it, on a thread: the default; slpi=0 off), slpi_step=N, slpi_keep, slpi_after=S, slpi_listen=S, as adsp_*.
  * What the SLPI then needs -- its configuration files, served over FastRPC as Android's sscrpcd does, and the
  * sensors' service (QMI 400, SEE) -- is for the steps after this one.
  */
@@ -4986,11 +4986,12 @@ soc_override(void)
 void
 hakios_slpi_init(void)
 {
-	uint32_t on = 0;
+	uint32_t on = 1;                /* (on by default on the 6T: the command line has no room for slpi=1; slpi=0 leaves it off) */
 	thread_t thread;
 
 	PE_parse_boot_argn("slpi_step", &last_step, sizeof(last_step));
-	if (last_step == 0 && (!PE_parse_boot_argn("slpi", &on, sizeof(on)) || on != 1)) {
+	PE_parse_boot_argn("slpi", &on, sizeof(on));
+	if (last_step == 0 && on != 1) {
 		return;
 	}
 	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {
