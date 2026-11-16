@@ -165,7 +165,7 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 # (with the 6T's GPS, LOCATIOND=1: Settings, Maps and locationd are told by MobileGestalt that there is one --
 # src/inject_loc.c, which in Settings opens the tweak loader in its turn)
 if [ "${LOCATIOND-0}" != 0 ]; then
-	INJECT=$(printf '%s\n' "$INJECT" | sed 's|^/redwood/lib/libhakios.tweaks.dylib Preferences$|/redwood/lib/libhakios.loc.dylib Preferences Maps locationd|')
+	INJECT=$(printf '%s\n' "$INJECT" | sed 's|^/redwood/lib/libhakios.tweaks.dylib Preferences$|/redwood/lib/libhakios.loc.dylib Preferences Maps locationd Compass|')
 fi
 mkdir -p obj
 

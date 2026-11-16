@@ -4543,7 +4543,7 @@ static struct see_sensor {
 static uint32_t see_events, see_logged;
 static int accel_x, accel_y, accel_z, accel_samples;
 static int gyro_x, gyro_y, gyro_z, gyro_samples, mag_x, mag_y, mag_z, mag_samples, light, light_samples, proximity = -1,
-    proximity_raw, proximity_samples, rv_x, rv_y, rv_z, rv_w, rv_accuracy, rv_samples;
+    proximity_raw, proximity_samples, rv_x, rv_y, rv_z, rv_w, rv_accuracy, rv_samples, rv_status = -1;
 
 SYSCTL_DECL(_kern_hakios);
 SYSCTL_INT(_kern_hakios, OID_AUTO, accel_x, CTLFLAG_RD | CTLFLAG_LOCKED, &accel_x, 0, "the accelerometer's x, mm/s^2");
@@ -4569,6 +4569,7 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, rv_z, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_z, 0, 
 SYSCTL_INT(_kern_hakios, OID_AUTO, rv_w, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_w, 0, "its w, x 10^6");
 SYSCTL_INT(_kern_hakios, OID_AUTO, rv_accuracy, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_accuracy, 0, "its accuracy (radians x 10^6, if given)");
 SYSCTL_INT(_kern_hakios, OID_AUTO, rv_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_samples, 0, "samples so far");
+SYSCTL_INT(_kern_hakios, OID_AUTO, rv_status, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_status, 0, "its calibration: 0 unreliable to 3 high");
 
 /* A TLV of a QMI message: its value and length, or NULL (as hakios.mpss.c's). */
 static const uint8_t *
@@ -4818,9 +4819,13 @@ see_other(unsigned k, uint32_t msg_id, const uint8_t *p, size_t length)
 	if (k == SEE_GEOMAG_RV && msg_id == SENSOR_MSGID_EVENT) {
 		int64_t q[5] = { 0, 0, 0, 0, 0 };
 		unsigned m = 0;
+		uint64_t status = 0;
+		static uint64_t last_status = ~0ull;
 
 		while (pb_next(&at, end, &f)) {
-			if (f.field == 1 && f.wire == 5 && m < 5) {
+			if (f.field == 2 && f.wire == 0) {
+				status = f.value;               /* (0 unreliable, 1 low, 2 medium, 3 high: the magnetometer's calibration) */
+			} else if (f.field == 1 && f.wire == 5 && m < 5) {
 				q[m++] = float_scaled((uint32_t)f.value, 1000000);
 			} else if (f.field == 1 && f.wire == 2) {
 				for (size_t i = 0; i + 4 <= f.length && m < 5; i += 4) {
@@ -4834,6 +4839,12 @@ see_other(unsigned k, uint32_t msg_id, const uint8_t *p, size_t length)
 		rv_z = (int)q[2];
 		rv_w = (int)q[3];
 		rv_accuracy = m > 4 ? (int)q[4] : -1;
+		rv_status = (int)status;
+		if (status != last_status) {
+			last_status = status;
+			tell("slpi: see: geomag_rv: CALIBRATION STATUS %llu (0 unreliable, 1 low, 2 medium, 3 high) at sample %d\n", status,
+			    rv_samples + 1);
+		}
 		if (rv_samples++ < 5 || (rv_samples % 100) == 0) {
 			tell("slpi: see: geomag_rv sample %d: %lld %lld %lld %lld (accuracy %lld; %u values) x 10^-6\n", rv_samples, q[0], q[1],
 			    q[2], q[3], q[4], m);
