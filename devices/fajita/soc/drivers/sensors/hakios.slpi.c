@@ -3658,7 +3658,12 @@ hakios_slpi_quiesce(void)
 }
 
 static uint64_t init_us;                /* when hakios_slpi_init() began */
-static uint32_t slpi_after = 25;
+/*
+ * (45, not the audio DSP's 25: the SLPI, the audio DSP and the modem all began their TrustZone sequences at the same
+ * moment with 25 -- run 203950, 66.02 s -- and the SLPI's authenticate-and-start never came back: TZ's XPU violation and
+ * the secure watchdog's barks, a crash dump. Started after the other two are up.)
+ */
+static uint32_t slpi_after = 45;
 
 static void
 run_steps(void)
@@ -4518,7 +4523,7 @@ static uint16_t see_transaction = 1;
  * (1025 sns_std_sensor_event, floats; 769 sns_proximity_event: near or far, the raw reading) are kept x 1000 in the
  * sysctls named by `name`: kern.hakios.<name>_x/_y/_z (or <name> alone for one value) and <name>_samples.
  */
-enum { SEE_ACCEL, SEE_GYRO, SEE_MAG, SEE_LIGHT, SEE_PROXIMITY, SEE_SENSORS };
+enum { SEE_ACCEL, SEE_GYRO, SEE_MAG, SEE_LIGHT, SEE_PROXIMITY, SEE_GEOMAG_RV, SEE_SENSORS };
 static struct see_sensor {
 	const char *type;
 	uint32_t config;                        /* 513 streaming, 514 on change */
@@ -4532,11 +4537,13 @@ static struct see_sensor {
 	[SEE_MAG] = { "mag", 513, 0x41200000u },
 	[SEE_LIGHT] = { "ambient_light", 514, 0 },
 	[SEE_PROXIMITY] = { "proximity", 514, 0 },
+	/* (the magnetometer and accelerometer fused and calibrated: a quaternion x y z w, North and up as Android's) */
+	[SEE_GEOMAG_RV] = { "geomag_rv", 513, 0x41200000u },
 };
 static uint32_t see_events, see_logged;
 static int accel_x, accel_y, accel_z, accel_samples;
 static int gyro_x, gyro_y, gyro_z, gyro_samples, mag_x, mag_y, mag_z, mag_samples, light, light_samples, proximity = -1,
-    proximity_raw, proximity_samples;
+    proximity_raw, proximity_samples, rv_x, rv_y, rv_z, rv_w, rv_accuracy, rv_samples;
 
 SYSCTL_DECL(_kern_hakios);
 SYSCTL_INT(_kern_hakios, OID_AUTO, accel_x, CTLFLAG_RD | CTLFLAG_LOCKED, &accel_x, 0, "the accelerometer's x, mm/s^2");
@@ -4556,6 +4563,12 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, light_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &
 SYSCTL_INT(_kern_hakios, OID_AUTO, proximity, CTLFLAG_RD | CTLFLAG_LOCKED, &proximity, 0, "1 near, 0 far, -1 not known yet");
 SYSCTL_INT(_kern_hakios, OID_AUTO, proximity_raw, CTLFLAG_RD | CTLFLAG_LOCKED, &proximity_raw, 0, "the proximity sensor's reading");
 SYSCTL_INT(_kern_hakios, OID_AUTO, proximity_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &proximity_samples, 0, "events so far");
+SYSCTL_INT(_kern_hakios, OID_AUTO, rv_x, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_x, 0, "the geomagnetic rotation vector's x, x 10^6");
+SYSCTL_INT(_kern_hakios, OID_AUTO, rv_y, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_y, 0, "its y, x 10^6");
+SYSCTL_INT(_kern_hakios, OID_AUTO, rv_z, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_z, 0, "its z, x 10^6");
+SYSCTL_INT(_kern_hakios, OID_AUTO, rv_w, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_w, 0, "its w, x 10^6");
+SYSCTL_INT(_kern_hakios, OID_AUTO, rv_accuracy, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_accuracy, 0, "its accuracy (radians x 10^6, if given)");
+SYSCTL_INT(_kern_hakios, OID_AUTO, rv_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_samples, 0, "samples so far");
 
 /* A TLV of a QMI message: its value and length, or NULL (as hakios.mpss.c's). */
 static const uint8_t *
@@ -4782,7 +4795,7 @@ see_other(unsigned k, uint32_t msg_id, const uint8_t *p, size_t length)
 	int64_t v[3] = { 0, 0, 0 };
 	unsigned n = 0;
 	int *x, *y, *z, *samples;
-	static const char *const units[SEE_SENSORS] = { "mm/s^2", "mrad/s", "nT", "mlux", "" };
+	static const char *const units[SEE_SENSORS] = { "mm/s^2", "mrad/s", "nT", "mlux", "", "" };
 
 	see_sensor[k].events++;
 	if (k == SEE_PROXIMITY && (msg_id == 769 || msg_id == 1031)) {
@@ -4799,6 +4812,31 @@ see_other(unsigned k, uint32_t msg_id, const uint8_t *p, size_t length)
 		proximity_raw = (int)raw;
 		if (proximity_samples++ < 20 || (proximity_samples % 50) == 0) {
 			tell("slpi: see: PROXIMITY %s (raw %llu), event %d\n", near ? "NEAR" : "far", raw, proximity_samples);
+		}
+		return;
+	}
+	if (k == SEE_GEOMAG_RV && msg_id == SENSOR_MSGID_EVENT) {
+		int64_t q[5] = { 0, 0, 0, 0, 0 };
+		unsigned m = 0;
+
+		while (pb_next(&at, end, &f)) {
+			if (f.field == 1 && f.wire == 5 && m < 5) {
+				q[m++] = float_scaled((uint32_t)f.value, 1000000);
+			} else if (f.field == 1 && f.wire == 2) {
+				for (size_t i = 0; i + 4 <= f.length && m < 5; i += 4) {
+					q[m++] = float_scaled((uint32_t)(f.data[i] | f.data[i + 1] << 8 | f.data[i + 2] << 16 |
+					    (uint32_t)f.data[i + 3] << 24), 1000000);
+				}
+			}
+		}
+		rv_x = (int)q[0];
+		rv_y = (int)q[1];
+		rv_z = (int)q[2];
+		rv_w = (int)q[3];
+		rv_accuracy = m > 4 ? (int)q[4] : -1;
+		if (rv_samples++ < 5 || (rv_samples % 100) == 0) {
+			tell("slpi: see: geomag_rv sample %d: %lld %lld %lld %lld (accuracy %lld; %u values) x 10^-6\n", rv_samples, q[0], q[1],
+			    q[2], q[3], q[4], m);
 		}
 		return;
 	}
@@ -5037,7 +5075,10 @@ see_run(void)
 	tell("slpi: see: after %llu ms: %s; found: %s%s%s%s%s\n", (now_us() - began) / 1000, see_port_number ? "the service there" :
 	    "THE SERVICE NOT THERE", see_sensor[SEE_ACCEL].known ? "accel " : "", see_sensor[SEE_GYRO].known ? "gyro " : "",
 	    see_sensor[SEE_MAG].known ? "mag " : "", see_sensor[SEE_LIGHT].known ? "ambient_light " : "",
-	    see_sensor[SEE_PROXIMITY].known ? "proximity" : "");
+	    see_sensor[SEE_PROXIMITY].known ? "proximity " : "");
+	if (see_sensor[SEE_GEOMAG_RV].known) {
+		tell("slpi: see: and geomag_rv\n");
+	}
 }
 
 static void
