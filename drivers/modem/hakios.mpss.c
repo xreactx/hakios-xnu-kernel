@@ -3731,7 +3731,7 @@ static thread_t link_thread_is;
 /* The name service's side: our servers, told of on hello and on lookup (the one there is: rmtfs, below). */
 static struct {
 	uint32_t service, instance, port;
-} our_servers[6];
+} our_servers[8];
 static uint32_t rmtfs_requests, rmtfs_reads, rmtfs_writes, rmtfs_sectors_read, rmtfs_sectors_written, rmtfs_refused;
 static uint32_t tftp_requests, tftp_served, tftp_refused, tftp_reclaimed, servreg_requests;
 
@@ -3833,6 +3833,11 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 			qrtr_servers[found].port = control->words[3];
 		}
 		lck_mtx_unlock(&qrtr_lock);
+		if (control->words[0] == 0x1001) {
+			extern void hakios_diag_cmd_server(uint32_t instance, uint32_t node, uint32_t port);
+
+			hakios_diag_cmd_server(control->words[1], control->words[2], control->words[3]);
+		}
 		if (control->words[0] == 69) {
 			hakios_wlfw10_start();          /* (the Wi-Fi firmware's service: hakios.wlfw10.c, with wifi10=N ... */
 			hakios_wifi6t_start();          /* ... or ath10k itself, hakios.wifi6t.c, with wifi6t=1) */
@@ -5141,6 +5146,219 @@ dcm_pdp_up(const uint8_t *address, unsigned n)
 }
 
 /*
+ * The modem's debug messages (f3=1), over QRTR as Android's diag driver takes them (drivers/char/diag/diagfwd_socket.c:
+ * service 0x1001, the application processor serving instance 0, control, and 2, data). Once the modem sends its feature
+ * mask, ours goes back (feature-mask support only: the modem then sends HDLC frames), real-time mode, and an F3 mask
+ * for SSID 51 (the IMS stack: qpDcm, qpdpl, the registration handler, SIP -- in qdsp6m.qdb). Each QSR4 message (0x99:
+ * its qdb index, a 32-bit value at 11, its arguments from 17, their count and size in byte 1) is logged as
+ * "mpss: f3: INDEX ARGS" for decoding on the host (tools: fw-ims/, ~/tools/f3log); full-text ones (0x79) as they are.
+ */
+#define DIAG_SERVICE            0x1001
+#define F3_SSID                 51
+static struct hakios_qrtr_port *diag_cntl_port, *diag_data_port;
+static uint8_t diag_frame[4096];
+static unsigned diag_frame_at, diag_logged;
+static bool diag_escape;
+
+static struct hakios_qrtr_port *diag_cmd_port;
+static uint32_t diag_cmd_node, diag_cmd_server_port;
+static bool diag_handshaken;
+static void diag_command(uint32_t node, uint32_t port, const uint8_t *p, unsigned n);
+
+static void
+diag_cmd_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	tell("mpss: diag: %zu bytes from the modem's command service (node %u port %u)\n", length, node, port);
+	sms_hex("diag cmd", data, (unsigned)(length < 64 ? length : 64));
+}
+
+/* A diag command, HDLC-framed (CRC-16/X.25, low byte first; 7e and 7d escaped), to the modem's command service. */
+static void
+diag_command(uint32_t node, uint32_t port, const uint8_t *p, unsigned n)
+{
+	uint8_t out[128];
+	unsigned o = 0;
+	uint16_t crc = 0xffff;
+
+	for (unsigned i = 0; i < n; i++) {
+		crc ^= p[i];
+		for (int b = 0; b < 8; b++) {
+			crc = crc & 1 ? (uint16_t)((crc >> 1) ^ 0x8408) : (uint16_t)(crc >> 1);
+		}
+	}
+	crc = (uint16_t)~crc;
+	for (unsigned i = 0; i < n + 2 && o + 3 < sizeof(out); i++) {
+		uint8_t c = i < n ? p[i] : i == n ? (uint8_t)crc : (uint8_t)(crc >> 8);
+
+		if (c == 0x7e || c == 0x7d) {
+			out[o++] = 0x7d;
+			c ^= 0x20;
+		}
+		out[o++] = c;
+	}
+	out[o++] = 0x7e;
+	qrtr_send(diag_cmd_port, node, port, out, o);
+}
+
+/* The modem's diag servers as they come (QRTR new server, service 0x1001): instance 1 is its command service. */
+void
+hakios_diag_cmd_server(uint32_t instance, uint32_t node, uint32_t port)
+{
+	tell("mpss: diag: the modem offers diag instance %u (node %u port %u)\n", instance, node, port);
+	if (instance == 1 && diag_cntl_port != NULL) {
+		/* a version request (opcode 0), then the run-time F3 mask for SSID 51 (0x7d, sub-command 4: first and last
+		 * SSID, two bytes of padding, a 32-bit mask each) -- the control message's mask is not taken, the command is */
+		static const uint8_t version[] = { 0x00 };
+		static const uint8_t f3[] = { 0x7d, 4, F3_SSID, 0, F3_SSID, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
+
+		if (diag_cmd_port == NULL) {
+			diag_cmd_port = qrtr_open(diag_cmd_receive, NULL, NULL);
+		}
+		if (diag_cmd_port != NULL) {
+			diag_cmd_node = node;
+			diag_cmd_server_port = port;
+			diag_command(node, port, version, sizeof(version));
+			if (diag_handshaken) {
+				diag_command(node, port, f3, sizeof(f3));
+				tell("mpss: diag: the F3 mask for SSID %u sent as a command\n", F3_SSID);
+			}
+		}
+	}
+}
+
+static void
+diag_cntl_send(uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	qrtr_send(diag_cntl_port, node, port, data, length);
+}
+
+static void
+diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	size_t at = 0;
+
+	while (at + 8 <= length) {
+		uint32_t id = (uint32_t)(m[at] | m[at + 1] << 8 | m[at + 2] << 16 | (uint32_t)m[at + 3] << 24);
+		uint32_t len = (uint32_t)(m[at + 4] | m[at + 5] << 8 | m[at + 6] << 16 | (uint32_t)m[at + 7] << 24);
+
+		if (diag_logged < 40) {
+			diag_logged++;
+			tell("mpss: diag: control %u (%u bytes) from node %u port %u\n", id, len, node, port);
+			sms_hex("diag control", m + at, (unsigned)(8 + len < length - at ? 8 + len : length - at));
+		}
+		if (id == 8) {          /* the modem's feature mask: ours, real time, and the F3 mask */
+			/* (as Android's: feature mask support 0, log on demand 2, mask centralization 11, sockets 13, DCI extended
+			 * header 14 -- not 6, the application processor's HDLC encoding, nor 15, diag ids) */
+			uint8_t feature[16] = { 8, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 0x07, 0x68, 0, 0 };   /* (+1: master sets common mask) */
+			uint8_t mode[8 + 36] = { 3, 0, 0, 0, 36, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };  /* (version 1, sleep vote, real time) */
+			/* (the whole range 0..134, as Android's driver sends it -- MSG_SSID_0 to MSG_SSID_0_LAST --, only 51 on) */
+			static uint8_t mask[19 + 135 * 4];
+			unsigned data_len = 11 + 135 * 4;
+
+			bzero(mask, sizeof(mask));
+			mask[0] = 11;
+			mask[4] = (uint8_t)data_len; mask[5] = (uint8_t)(data_len >> 8);
+			mask[8] = 1;            /* stream */
+			mask[9] = 3;            /* status: valid */
+			mask[11] = 0; mask[12] = 0;             /* first SSID */
+			mask[13] = 134; mask[14] = 0;           /* last */
+			mask[15] = 135;         /* the mask's size, in words */
+			memset(mask + 19 + F3_SSID * 4, 0xff, 4);
+
+			diag_cntl_send(node, port, feature, sizeof(feature));
+			diag_cntl_send(node, port, mode, sizeof(mode));
+			diag_cntl_send(node, port, mask, sizeof(mask));
+			{
+				/* buffering mode 0, streaming (linux-msm/diag sends it after the masks; the modem buffers otherwise) */
+				uint8_t buffering[8 + 6] = { 17, 0, 0, 0, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0 };
+
+				diag_cntl_send(node, port, buffering, sizeof(buffering));
+			}
+			tell("mpss: diag: our feature mask, real-time mode and the F3 mask for SSID %u sent\n", F3_SSID);
+			diag_handshaken = true;
+			if (diag_cmd_server_port != 0) {
+				static const uint8_t f3[] = { 0x7d, 4, F3_SSID, 0, F3_SSID, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
+
+				diag_command(diag_cmd_node, diag_cmd_server_port, f3, sizeof(f3));
+				tell("mpss: diag: the F3 mask for SSID %u sent as a command, after the handshake\n", F3_SSID);
+			}
+		}
+		if (len > length - at - 8) {
+			break;
+		}
+		at += 8 + len;
+	}
+}
+
+static void
+diag_packet(const uint8_t *p, unsigned n)
+{
+	if (n >= 17 && p[0] == 0x99) {
+		char line[160];
+		unsigned nargs = p[2] & 15, size = p[2] >> 4 ? p[2] >> 4 : 4, o;
+		uint32_t index = (uint32_t)(p[12] | p[13] << 8 | p[14] << 16 | (uint32_t)p[15] << 24);
+
+		/* (the payload after the opcode is QCSuper's: offsets there +1 here) */
+		o = (unsigned)snprintf(line, sizeof(line), "%u", index);
+		for (unsigned k = 0; k < nargs && 18 + (k + 1) * size <= n && o + 12 < sizeof(line); k++) {
+			uint32_t v = 0;
+
+			for (unsigned b = 0; b < size && b < 4; b++) {
+				v |= (uint32_t)p[18 + k * size + b] << (8 * b);
+			}
+			o += (unsigned)snprintf(line + o, sizeof(line) - o, " %x", v);
+		}
+		tell("mpss: f3: %s\n", line);
+	} else if (n > 24 && p[0] == 0x79) {
+		tell("mpss: f3 text: %.*s\n", (int)(n - 24 < 120 ? n - 24 : 120), (const char *)p + 24);
+	}
+}
+
+static void
+diag_data_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	static unsigned seen;
+
+	if (seen++ < 6) {
+		tell("mpss: diag: %zu bytes of data from node %u port %u\n", length, node, port);
+		sms_hex("diag data", m, (unsigned)(length < 96 ? length : 96));
+	}
+	if (length >= 5 && m[0] == 0x7e && m[1] == 1) {
+		/* non-HDLC frames: 7e 01 length(16) payload 7e, one after another */
+		size_t at = 0;
+
+		while (at + 5 <= length && m[at] == 0x7e && m[at + 1] == 1) {
+			unsigned n = (unsigned)(m[at + 2] | m[at + 3] << 8);
+
+			if (at + 4 + n + 1 > length) {
+				break;
+			}
+			diag_packet(m + at + 4, n);
+			at += 4 + n + 1;
+		}
+		return;
+	}
+	for (size_t i = 0; i < length; i++) {
+		uint8_t c = m[i];
+
+		if (c == 0x7e) {
+			if (diag_frame_at > 2) {
+				diag_packet(diag_frame, diag_frame_at - 2);     /* (less the CRC) */
+			}
+			diag_frame_at = 0;
+			diag_escape = false;
+		} else if (c == 0x7d) {
+			diag_escape = true;
+		} else if (diag_frame_at < sizeof(diag_frame)) {
+			diag_frame[diag_frame_at++] = diag_escape ? c ^ 0x20 : c;
+			diag_escape = false;
+		}
+	}
+}
+
+/*
  * IMS RTP (imsrtp=1): QMI service 40, served on Android by ims_rtp_daemon (its service object: 34 requests, 20
  * indications) -- the application processor's side of the calls' media. First: offered, every request logged and
  * answered "success", to see whether the modem's IMS waits for it.
@@ -5243,6 +5461,20 @@ rmtfs_start(void)
 				our_servers[4].port = dcm_port->number;
 				tell("mpss: dcm: the IMS data call manager is offered (service %u, port %u)\n", DCM_SERVICE,
 				    dcm_port->number);
+			}
+		}
+		if (diag_cntl_port == NULL && option("f3")) {
+			diag_cntl_port = qrtr_open(diag_cntl_receive, NULL, NULL);
+			diag_data_port = qrtr_open(diag_data_receive, NULL, NULL);
+			if (diag_cntl_port != NULL && diag_data_port != NULL) {
+				our_servers[6].service = DIAG_SERVICE;
+				our_servers[6].instance = 0;            /* control */
+				our_servers[6].port = diag_cntl_port->number;
+				our_servers[7].service = DIAG_SERVICE;
+				our_servers[7].instance = 2;            /* data */
+				our_servers[7].port = diag_data_port->number;
+				tell("mpss: diag: the modem's debug messages asked for (service %#x, ports %u and %u)\n", DIAG_SERVICE,
+				    diag_cntl_port->number, diag_data_port->number);
 			}
 		}
 		if (imsrtp_port == NULL && option("imsrtp")) {
