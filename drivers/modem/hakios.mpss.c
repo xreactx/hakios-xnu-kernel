@@ -3731,7 +3731,7 @@ static thread_t link_thread_is;
 /* The name service's side: our servers, told of on hello and on lookup (the one there is: rmtfs, below). */
 static struct {
 	uint32_t service, instance, port;
-} our_servers[5];
+} our_servers[6];
 static uint32_t rmtfs_requests, rmtfs_reads, rmtfs_writes, rmtfs_sectors_read, rmtfs_sectors_written, rmtfs_refused;
 static uint32_t tftp_requests, tftp_served, tftp_refused, tftp_reclaimed, servreg_requests;
 
@@ -5132,6 +5132,34 @@ dcm_pdp_up(const uint8_t *address, unsigned n)
 	qrtr_send(dcm_port, dcm_node, dcm_client_port, q, at);
 }
 
+/*
+ * IMS RTP (imsrtp=1): QMI service 40, served on Android by ims_rtp_daemon (its service object: 34 requests, 20
+ * indications) -- the application processor's side of the calls' media. First: offered, every request logged and
+ * answered "success", to see whether the modem's IMS waits for it.
+ */
+#define IMSRTP_SERVICE          40
+static struct hakios_qrtr_port *imsrtp_port;
+
+static void
+imsrtp_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	uint8_t r[7 + 7];
+
+	if (length < 7) {
+		return;
+	}
+	tell("mpss: imsrtp: request %#x (type %u, %u bytes) from node %u port %u\n", m[3] | m[4] << 8, m[0], (unsigned)length,
+	    node, port);
+	sms_hex("imsrtp in", m, (unsigned)length);
+	if (m[0] != QMI_REQUEST) {
+		return;
+	}
+	r[0] = QMI_RESPONSE; r[1] = m[1]; r[2] = m[2]; r[3] = m[3]; r[4] = m[4]; r[5] = 7; r[6] = 0;
+	r[7] = 0x02; r[8] = 4; r[9] = 0; r[10] = 0; r[11] = 0; r[12] = 0; r[13] = 0;
+	qrtr_send(imsrtp_port, node, port, r, sizeof(r));
+}
+
 static void
 dcm_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
 {
@@ -5200,6 +5228,16 @@ rmtfs_start(void)
 				our_servers[4].port = dcm_port->number;
 				tell("mpss: dcm: the IMS data call manager is offered (service %u, port %u)\n", DCM_SERVICE,
 				    dcm_port->number);
+			}
+		}
+		if (imsrtp_port == NULL && option("imsrtp")) {
+			imsrtp_port = qrtr_open(imsrtp_receive, NULL, NULL);
+			if (imsrtp_port != NULL) {
+				our_servers[5].service = IMSRTP_SERVICE;
+				our_servers[5].instance = 1;
+				our_servers[5].port = imsrtp_port->number;
+				tell("mpss: imsrtp: the IMS media service is offered (service %u, port %u)\n", IMSRTP_SERVICE,
+				    imsrtp_port->number);
 			}
 		}
 	}
