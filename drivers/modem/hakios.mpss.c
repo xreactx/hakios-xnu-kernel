@@ -5232,6 +5232,24 @@ diag_cntl_send(uint32_t node, uint32_t port, const void *data, size_t length)
 	qrtr_send(diag_cntl_port, node, port, data, length);
 }
 
+/* The F3 mask: the whole range 0..134, as Android's driver sends it (MSG_SSID_0 to MSG_SSID_0_LAST), only SSID 51 on. */
+static void
+diag_send_mask(uint32_t node, uint32_t port)
+{
+	static uint8_t mask[19 + 135 * 4];
+	unsigned data_len = 11 + 135 * 4;
+
+	bzero(mask, sizeof(mask));
+	mask[0] = 11;
+	mask[4] = (uint8_t)data_len; mask[5] = (uint8_t)(data_len >> 8);
+	mask[8] = 1;            /* stream */
+	mask[9] = 3;            /* status: valid */
+	mask[13] = 134;         /* first SSID 0, last 134 */
+	mask[15] = 135;         /* the mask's size, in words */
+	memset(mask + 19 + F3_SSID * 4, 0xff, 4);
+	diag_cntl_send(node, port, mask, sizeof(mask));
+}
+
 static void
 diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
 {
@@ -5250,25 +5268,12 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 		if (id == 8) {          /* the modem's feature mask: ours, real time, and the F3 mask */
 			/* (as Android's: feature mask support 0, log on demand 2, mask centralization 11, sockets 13, DCI extended
 			 * header 14 -- not 6, the application processor's HDLC encoding, nor 15, diag ids) */
-			uint8_t feature[16] = { 8, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 0x07, 0x68, 0, 0 };   /* (+1: master sets common mask) */
+			uint8_t feature[16] = { 8, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 0x07, 0xe8, 0, 0 };   /* (+1: master sets common mask; +15: diag ids) */
 			uint8_t mode[8 + 36] = { 3, 0, 0, 0, 36, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };  /* (version 1, sleep vote, real time) */
-			/* (the whole range 0..134, as Android's driver sends it -- MSG_SSID_0 to MSG_SSID_0_LAST --, only 51 on) */
-			static uint8_t mask[19 + 135 * 4];
-			unsigned data_len = 11 + 135 * 4;
-
-			bzero(mask, sizeof(mask));
-			mask[0] = 11;
-			mask[4] = (uint8_t)data_len; mask[5] = (uint8_t)(data_len >> 8);
-			mask[8] = 1;            /* stream */
-			mask[9] = 3;            /* status: valid */
-			mask[11] = 0; mask[12] = 0;             /* first SSID */
-			mask[13] = 134; mask[14] = 0;           /* last */
-			mask[15] = 135;         /* the mask's size, in words */
-			memset(mask + 19 + F3_SSID * 4, 0xff, 4);
 
 			diag_cntl_send(node, port, feature, sizeof(feature));
 			diag_cntl_send(node, port, mode, sizeof(mode));
-			diag_cntl_send(node, port, mask, sizeof(mask));
+			diag_send_mask(node, port);
 			{
 				/* buffering mode 0, streaming (linux-msm/diag sends it after the masks; the modem buffers otherwise) */
 				uint8_t buffering[8 + 6] = { 17, 0, 0, 0, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0 };
@@ -5283,6 +5288,37 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 				diag_command(diag_cmd_node, diag_cmd_server_port, f3, sizeof(f3));
 				tell("mpss: diag: the F3 mask for SSID %u sent as a command, after the handshake\n", F3_SSID);
 			}
+		}
+		if (id == 33 && len >= 8 && at + 8 + len <= length) {
+			/* the diag-ID handshake (linux-msm/diag's diag_cntl_process_diag_id): the process name back, with id 2
+			 * (the application processor is 1); then real-time mode and buffering with the id, and the F3 mask */
+			const uint8_t *q = m + at + 8;
+			uint32_t version = (uint32_t)(q[0] | q[1] << 8 | q[2] << 16 | (uint32_t)q[3] << 24);
+			unsigned name_at = 8, name_len;
+			uint8_t reply[8 + 8 + 48];
+			uint8_t mode[8 + 37] = { 3, 0, 0, 0, 37, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
+			uint8_t buffering[8 + 7] = { 17, 0, 0, 0, 7, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0 };
+
+			if (version >= 2 && len >= 12) {
+				name_at = 12 + (unsigned)(q[8] | q[9] << 8 | q[10] << 16 | (uint32_t)q[11] << 24);
+			}
+			name_len = name_at < len ? (unsigned)strnlen((const char *)q + name_at, len - name_at) : 0;
+			if (name_len > 40) {
+				name_len = 40;
+			}
+			bzero(reply, sizeof(reply));
+			reply[0] = 33;
+			reply[4] = (uint8_t)(8 + name_len + 1);
+			reply[8] = 1;           /* version 1 */
+			reply[12] = 2;          /* the id */
+			memcpy(reply + 16, q + name_at, name_len);
+			mode[8 + 36] = 2;       /* (v2: the id last) */
+			diag_cntl_send(node, port, reply, 16 + name_len + 1);
+			diag_cntl_send(node, port, mode, sizeof(mode));
+			diag_cntl_send(node, port, buffering, sizeof(buffering));
+			tell("mpss: diag: diag id 2 given to \"%.*s\" (version %u); mode and buffering sent with it\n", (int)name_len,
+			    (const char *)q + name_at, version);
+			diag_send_mask(node, port);
 		}
 		if (len > length - at - 8) {
 			break;
