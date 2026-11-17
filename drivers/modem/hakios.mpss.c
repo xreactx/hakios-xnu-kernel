@@ -8813,13 +8813,19 @@ ims_pdn_advance(void)
 		return;
 	}
 	if (ims_pdn_step == 11 && now_us() - ims_pdn_tried_us > 10000000ull) {
-		/* (TLV 0x35, the call type: 1 embedded -- the device's own, as the modem's IMS stack's would be) */
-		uint8_t q[7 + 4 + 6 + 4] = { QMI_REQUEST, 0xc1, 0, WDS_START_NETWORK_INTERFACE & 0xff, WDS_START_NETWORK_INTERFACE >> 8,
-		    14, 0, 0x19, 1, 0, (uint8_t)ims_pdn_family, 0x14, 3, 0, 'i', 'm', 's', 0x35, 1, 0, 1 };
+		/*
+		 * As Android's imsdatadaemon starts it (diag capture f3reg, 17 November: dsi APP_TYPE=1, PROFILE_ID=2, IPv6; the
+		 * modem's interface then shows apn_type 2 on technology 0x8880): TLV 0x38 the APN type (2, IMS -- from
+		 * libqmiservices' WDS tables, a 32-bit value after the call type), 0x34 the extended technology (0x8880, EPC),
+		 * 0x31 the 3GPP profile (2). Without the APN type the modem's IMS stack never finds the call as its own.
+		 */
+		uint8_t q[7 + 4 + 6 + 5 + 4 + 7] = { QMI_REQUEST, 0xc1, 0, WDS_START_NETWORK_INTERFACE & 0xff,
+		    WDS_START_NETWORK_INTERFACE >> 8, 26, 0, 0x19, 1, 0, (uint8_t)ims_pdn_family, 0x14, 3, 0, 'i', 'm', 's',
+		    0x34, 2, 0, 0x80, 0x88, 0x31, 1, 0, 2, 0x38, 4, 0, 2, 0, 0, 0 };
 
 		ims_pdn_step = 2;
 		ims_pdn_tried_us = now_us();
-		tell("mpss: ims pdn: starting the connection to APN ims (IPv%d)\n", ims_pdn_family);
+		tell("mpss: ims pdn: starting the connection to APN ims (IPv%d, APN type IMS, EPC, profile 2)\n", ims_pdn_family);
 		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, q, sizeof(q));
 	}
 }
