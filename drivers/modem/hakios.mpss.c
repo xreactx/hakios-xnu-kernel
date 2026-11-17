@@ -7263,12 +7263,40 @@ nas2_receive(__unused void *context, __unused uint32_t node, __unused uint32_t p
 		if ((v = qmi_tlv(m, length, 0x14, &size)) != NULL && size >= 1) {
 			roaming = v[0];
 		}
-		if ((v = qmi_tlv(m, length, 0x1c, &size)) != NULL && size >= 4) {
+		uint32_t voice = ~0u;
+
+		/* (TLV 0x18 the service domain, 0x20 the voice domain: libqmi's Get System Selection Preference) */
+		if ((v = qmi_tlv(m, length, 0x18, &size)) != NULL && size >= 4) {
 			domain = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24);
 		}
+		if ((v = qmi_tlv(m, length, 0x20, &size)) != NULL && size >= 4) {
+			voice = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | v[3] << 24);
+		}
 		tell("mpss: nas: SYSTEM SELECTION: mode preference %#x (bits: 1 CDMA, 2 EVDO, 4 GSM, 8 UMTS, 0x10 LTE, 0x40 TD-SCDMA), network "
-		    "selection %u (0 automatic, 1 manual), emergency mode %u, roaming %u, service domain %#x (0 CS, 1 PS, 2 both)\n", mode, selection,
-		    emergency, roaming, domain);
+		    "selection %u (0 automatic, 1 manual), emergency mode %u, roaming %u, service domain %#x (0 CS, 1 PS, 2 both), VOICE DOMAIN "
+		    "%d (0 CS only, 1 PS only, 2 CS preferred, 3 PS preferred)\n", mode, selection, emergency, roaming, domain, (int)voice);
+		{
+			/* voice_domain=N: set once (Set System Selection Preference 0x33, TLV 0x23) when it differs */
+			static int asked;
+			int wanted = -1;
+
+			if (!asked && PE_parse_boot_argn("voice_domain", &wanted, sizeof(wanted)) && wanted >= 0 && wanted <= 3 &&
+			    (uint32_t)wanted != voice) {
+				uint8_t q[7 + 7] = { 0, 0x3a, 0, 0x33, 0, 7, 0, 0x23, 4, 0, (uint8_t)wanted, 0, 0, 0 };
+
+				asked = 1;
+				tell("mpss: nas: the voice domain set to %d\n", wanted);
+				qrtr_send(nas2_port, nas2_node, nas2_port_number, q, sizeof(q));
+			}
+		}
+	} else if ((m[3] | m[4] << 8) == 0x33) {
+		uint16_t r = 0xffff, e = 0xffff;
+
+		if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
+			r = (uint16_t)(v[0] | v[1] << 8);
+			e = (uint16_t)(v[2] | v[3] << 8);
+		}
+		tell("mpss: nas: the voice domain's setting: result %u, error %u\n", r, e);
 	} else if ((m[3] | m[4] << 8) == NAS_INITIATE_NETWORK_REGISTER) {
 		tell("mpss: nas: the modem answers INITIATE NETWORK REGISTER (automatic)\n");
 	} else if ((m[3] | m[4] << 8) == NAS_GET_SYSTEM_INFO) {
