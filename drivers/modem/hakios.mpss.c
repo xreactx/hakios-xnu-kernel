@@ -5157,6 +5157,8 @@ dcm_pdp_up(const uint8_t *address, unsigned n)
 #define F3_SSID                 51
 static struct hakios_qrtr_port *diag_cntl_port, *diag_data_port;
 static uint8_t diag_frame[4096];
+static unsigned diag_f3_count;
+static bool diag_f3_all;
 static unsigned diag_frame_at, diag_logged;
 static bool diag_escape;
 
@@ -5239,6 +5241,13 @@ diag_send_mask(uint32_t node, uint32_t port)
 	static uint8_t mask[19 + 135 * 4];
 	unsigned data_len = 11 + 135 * 4;
 
+	if (option("f3_all")) {
+		/* (all enabled, one word for the range: as linux-msm/diag sends after a tool's "set all") */
+		uint8_t all[19 + 4] = { 11, 0, 0, 0, 11 + 4, 0, 0, 0, 1, 2, 0, 0, 0, 134, 0, 1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
+
+		diag_cntl_send(node, port, all, sizeof(all));
+		return;
+	}
 	bzero(mask, sizeof(mask));
 	mask[0] = 11;
 	mask[4] = (uint8_t)data_len; mask[5] = (uint8_t)(data_len >> 8);
@@ -5268,7 +5277,16 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 		if (id == 8) {          /* the modem's feature mask: ours, real time, and the F3 mask */
 			/* (as Android's: feature mask support 0, log on demand 2, mask centralization 11, sockets 13, DCI extended
 			 * header 14 -- not 6, the application processor's HDLC encoding, nor 15, diag ids) */
-			uint8_t feature[16] = { 8, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 0x07, 0xe8, 0, 0 };   /* (+1: master sets common mask; +15: diag ids) */
+			uint8_t feature[16] = { 8, 0, 0, 0, 8, 0, 0, 0, 4, 0, 0, 0, 0x07, 0x68, 0, 0 };   /* (+1: master sets common mask) */
+
+			if (option("f3_id")) {
+				feature[13] |= 0x80;            /* (15: diag ids, with f3_id=1) */
+			}
+			if (option("f3_android")) {
+				/* exactly Android's driver (diag_send_feature_mask_update): 0, 2, 4, 6, 9, 11, 13, 14, 15 */
+				feature[12] = 0x55;
+				feature[13] = 0xea;
+			}
 			uint8_t mode[8 + 36] = { 3, 0, 0, 0, 36, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };  /* (version 1, sleep vote, real time) */
 
 			diag_cntl_send(node, port, feature, sizeof(feature));
@@ -5345,7 +5363,10 @@ diag_packet(const uint8_t *p, unsigned n)
 			}
 			o += (unsigned)snprintf(line + o, sizeof(line) - o, " %x", v);
 		}
-		tell("mpss: f3: %s\n", line);
+		diag_f3_count++;
+		if (!diag_f3_all || diag_f3_count <= 20 || diag_f3_count % 1000 == 0) {
+			tell("mpss: f3: %s (%u)\n", line, diag_f3_count);
+		}
 	} else if (n > 24 && p[0] == 0x79) {
 		tell("mpss: f3 text: %.*s\n", (int)(n - 24 < 120 ? n - 24 : 120), (const char *)p + 24);
 	}
@@ -5500,6 +5521,7 @@ rmtfs_start(void)
 			}
 		}
 		if (diag_cntl_port == NULL && option("f3")) {
+			diag_f3_all = option("f3_all");
 			diag_cntl_port = qrtr_open(diag_cntl_receive, NULL, NULL);
 			diag_data_port = qrtr_open(diag_data_receive, NULL, NULL);
 			if (diag_cntl_port != NULL && diag_data_port != NULL) {
@@ -8855,8 +8877,8 @@ imss_advance(void)
 static struct hakios_qrtr_port *ims_pdn_port;
 static uint32_t ims_pdn_node, ims_pdn_port_number;
 static volatile int ims_pdn_step;               /* 0, 1 family asked, 2 start asked, 3 up */
-static uint64_t ims_pdn_tried_us;
-static int ims_pdn_wanted, ims_pdn_family = 6;
+static uint64_t ims_pdn_tried_us, ims_pdn_address_at;
+static int ims_pdn_wanted, ims_pdn_family = 6, ims_pdn_address_tries;
 
 /*
  * The modem link-local link (with dcm=1): a WDS client of its own, bound to mux 3, a session with the extended
@@ -8868,6 +8890,8 @@ static uint32_t ll_node, ll_port_number;
 static volatile int ll_step;                    /* 0, 1 bind asked, 21 bound, 22 family asked, 11 to start, 2 started asked, 3 up */
 static uint64_t ll_tried_us;
 extern int hakios_ims_bridge;
+extern uint8_t hakios_ims_prefix[8];
+extern volatile int hakios_ims_prefix_known;
 
 static void
 ll_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
@@ -8996,7 +9020,26 @@ ims_pdn_receive(__unused void *context, __unused uint32_t node, __unused uint32_
 		return;
 	}
 	if (id == WDS_GET_CURRENT_SETTINGS) {
-		if ((v = qmi_tlv(m, length, 0x25, &size)) != NULL && size >= 16) {
+		if ((v = qmi_tlv(m, length, 0x25, &size)) != NULL && size >= 16 && v[0] == 0xfe && (v[1] & 0xc0) == 0x80 &&
+		    hakios_ims_prefix_known) {
+			/* the global address as Android's stack forms it: the advertised prefix and the modem's identifier */
+			uint8_t global[16];
+
+			memcpy(global, hakios_ims_prefix, 8);
+			memcpy(global + 8, v + 8, 8);
+			ims_pdn_address_tries = 99;
+			tell("mpss: ims pdn: the global address made from the advertised prefix and the modem's identifier\n");
+			dcm_pdp_up(global, 16);
+		} else if ((v = qmi_tlv(m, length, 0x25, &size)) != NULL && size >= 16 && v[0] == 0xfe && (v[1] & 0xc0) == 0x80 &&
+		    ims_pdn_address_tries < 15) {
+			/* only the link-local address yet: Android tells the modem once the global one is there (some 4 s) */
+			ims_pdn_address_tries++;
+			ims_pdn_address_at = now_us();
+			if (ims_pdn_address_tries == 1) {
+				tell("mpss: ims pdn: only a link-local address yet; asked again every second for the global one\n");
+			}
+		} else if ((v = qmi_tlv(m, length, 0x25, &size)) != NULL && size >= 16) {
+			ims_pdn_address_tries = 99;
 			dcm_pdp_up(v, 16);
 		} else if ((v = qmi_tlv(m, length, 0x1e, &size)) != NULL && size >= 4) {
 			uint8_t a[4] = { v[3], v[2], v[1], v[0] };
@@ -9062,6 +9105,13 @@ ims_pdn_advance(void)
 {
 	if (ims_pdn_port == NULL || ims_pdn_port_number == 0 || !nas.state.registered || !ims_pdn_wanted) {
 		return;
+	}
+	if (ims_pdn_step == 3 && ims_pdn_address_tries > 0 && ims_pdn_address_tries < 15 && now_us() - ims_pdn_address_at > 1000000ull) {
+		uint8_t ask[14] = { QMI_REQUEST, 0xc3, 0, WDS_GET_CURRENT_SETTINGS & 0xff, WDS_GET_CURRENT_SETTINGS >> 8, 7, 0, 0x10,
+		    4, 0, 0x00, 0x01, 0, 0 };
+
+		ims_pdn_address_at = now_us();
+		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, ask, sizeof(ask));
 	}
 	if (ims_pdn_step == 0) {
 		/* bound first, as the data session's client is (a client never bound is told 70, invalid operation: run 182236) */

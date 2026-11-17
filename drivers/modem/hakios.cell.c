@@ -425,6 +425,37 @@ ping_advance(void)
 int hakios_ims_bridge;
 static uint64_t ims_bridged[2], ims_bridge_dropped;
 
+/*
+ * The IMS connection's prefix, from the network's router advertisements on it (ICMPv6 134, its prefix information
+ * option, 3): Android's network stack forms the connection's global address from it and the interface identifier the
+ * modem gives (WDS current settings has only the link-local one), and imsdatadaemon tells the modem that address.
+ */
+uint8_t hakios_ims_prefix[8];
+volatile int hakios_ims_prefix_known;
+
+static void
+ims_router_advertisement(const uint8_t *p, size_t length)
+{
+	size_t at = 40 + 16;            /* (after the IPv6 header and the RA's own 16 bytes) */
+
+	while (at + 8 <= length) {
+		unsigned type = p[at], len = p[at + 1] * 8u;
+
+		if (len == 0 || at + len > length) {
+			break;
+		}
+		if (type == 3 && len >= 32) {
+			memcpy(hakios_ims_prefix, p + at + 16, 8);
+			if (!hakios_ims_prefix_known) {
+				printf("cell: ims: the IMS connection's prefix %02x%02x:%02x%02x:%02x%02x:%02x%02x::/%u (router advertisement)\n",
+				    p[at + 16], p[at + 17], p[at + 18], p[at + 19], p[at + 20], p[at + 21], p[at + 22], p[at + 23], p[at + 2]);
+			}
+			hakios_ims_prefix_known = 1;
+		}
+		at += len;
+	}
+}
+
 static void
 ims_bridge(uint8_t mux, const uint8_t *packet, size_t length)
 {
@@ -464,6 +495,9 @@ cell_receive(uint8_t mux, const uint8_t *packet, size_t length)
 	uint8_t frame[HAKIOS_NET_FRAME_MAX];
 	uint32_t version = length > 0 ? packet[0] >> 4 : 0;
 
+	if (mux == IMS_PDN_MUX && length > 40 + 16 && packet[0] >> 4 == 6 && packet[6] == 58 && packet[40] == 134) {
+		ims_router_advertisement(packet, length);
+	}
 	if (mux == IMS_PDN_MUX || mux == IMS_LL_MUX) {
 		if (hakios_ims_bridge) {
 			ims_bridge(mux, packet, length);
