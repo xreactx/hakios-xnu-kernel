@@ -9143,6 +9143,13 @@ ims_pdn_advance(void)
 
 		ims_pdn_step = 2;
 		ims_pdn_tried_us = now_us();
+		if (option("ims_untyped")) {
+			/* (the earlier form: family and APN only -- to tell what the APN type changes) */
+			q[5] = 10;
+			tell("mpss: ims pdn: starting the connection to APN ims (IPv%d, untyped)\n", ims_pdn_family);
+			qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, q, 7 + 10);
+			return;
+		}
 		tell("mpss: ims pdn: starting the connection to APN ims (IPv%d, APN type IMS, EPC, profile 2)\n", ims_pdn_family);
 		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, q, sizeof(q));
 	}
