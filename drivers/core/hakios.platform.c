@@ -63,11 +63,39 @@ LCK_MTX_DECLARE(hakios_smmu_lock, &hakios_platform_lock_group);
  */
 LCK_MTX_DECLARE(hakios_tz_lock, &hakios_platform_lock_group);
 
+/*
+ * A DSP's start, whole: TrustZone's calls for one image (its header, where it goes, authenticate and start) are a
+ * sequence, and another subsystem's call in the middle of it -- the modem handing its regions over through the
+ * hypervisor between the audio DSP's header and its placing -- crashed the phone too (dump 191151), the calls one at a
+ * time as they were. hakios_pas_begin() makes the caller's sequence exclusive: anyone else's TrustZone call waits for
+ * hakios_pas_end(); the owner's own calls go through.
+ */
+LCK_MTX_DECLARE(hakios_pas_lock, &hakios_platform_lock_group);
+static thread_t hakios_pas_owner, hakios_pas_call;
+
+void
+hakios_pas_begin(void)
+{
+	lck_mtx_lock(&hakios_pas_lock);
+	hakios_pas_owner = current_thread();
+}
+
+void
+hakios_pas_end(void)
+{
+	hakios_pas_owner = NULL;
+	lck_mtx_unlock(&hakios_pas_lock);
+}
+
 bool
 hakios_tz_enter(void)
 {
 	if (!ml_get_interrupts_enabled()) {
 		return false;
+	}
+	if (hakios_pas_owner != current_thread()) {
+		lck_mtx_lock(&hakios_pas_lock);         /* (held for this one call: no one's sequence is under way) */
+		hakios_pas_call = current_thread();
 	}
 	lck_mtx_lock(&hakios_tz_lock);
 	return true;
@@ -78,6 +106,10 @@ hakios_tz_leave(bool held)
 {
 	if (held) {
 		lck_mtx_unlock(&hakios_tz_lock);
+		if (hakios_pas_call == current_thread()) {
+			hakios_pas_call = NULL;
+			lck_mtx_unlock(&hakios_pas_lock);
+		}
 	}
 }
 

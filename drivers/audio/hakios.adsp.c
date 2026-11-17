@@ -3635,6 +3635,11 @@ static bool (*const steps[STEPS])(void) = {
 	step_qrtr, step_apr,
 };
 
+extern void hakios_pas_begin(void);
+extern void hakios_pas_end(void);
+#define PAS_FIRST_STEP          4               /* step_header: TrustZone takes the header ... */
+#define PAS_LAST_STEP           7               /* ... to step_start: it authenticates and starts the image */
+
 static bool keep;                       /* the DSP and the link stay up while the system runs (adsp_keep, adsp=1) */
 
 static void
@@ -3694,6 +3699,7 @@ static void
 run_steps(void)
 {
 	uint32_t done = 0;
+	bool pas_held = false;
 
 	for (step = 1; step <= last_step; step++) {
 		if (step == 3 && apcs_ipc != 0 && now_us() - init_us < adsp_after * 1000000ull) {
@@ -3703,12 +3709,23 @@ run_steps(void)
 			    left / 1000000, left / 1000 % 1000);
 			sleep_ms((uint32_t)(left / 1000));
 		}
+		if (step == PAS_FIRST_STEP && !pas_held) {
+			hakios_pas_begin();     /* (header to start: no one else's TrustZone call in between) */
+			pas_held = true;
+		}
 		if (!steps[step - 1]()) {
 			printf("adsp: step %u: FAILED; the steps after it are not attempted\n", step);
 			break;
 		}
+		if (step == PAS_LAST_STEP && pas_held) {
+			hakios_pas_end();
+			pas_held = false;
+		}
 		printf("adsp: step %u: done\n", step);
 		done = step;
+	}
+	if (pas_held) {
+		hakios_pas_end();
 	}
 	step = done;
 	new_from = STEPS + 1;

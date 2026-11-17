@@ -3731,7 +3731,7 @@ static thread_t link_thread_is;
 /* The name service's side: our servers, told of on hello and on lookup (the one there is: rmtfs, below). */
 static struct {
 	uint32_t service, instance, port;
-} our_servers[4];
+} our_servers[5];
 static uint32_t rmtfs_requests, rmtfs_reads, rmtfs_writes, rmtfs_sectors_read, rmtfs_sectors_written, rmtfs_refused;
 static uint32_t tftp_requests, tftp_served, tftp_refused, tftp_reclaimed, servreg_requests;
 
@@ -3870,8 +3870,8 @@ qrtr_control(const struct qrtr_header *header, const struct qrtr_control *contro
 			}
 		}
 		qrtr_announce(header->from_node, 0, true);
-		if (qrtr_lookups++ < 16) {
-			printf("mpss: qrtr: the modem looks for service %u (%#x), instance %u: %u of ours\n", control->words[0],
+		if (qrtr_lookups++ < 32) {
+			tell("mpss: qrtr: the modem looks for service %u (%#x), instance %u: %u of ours\n", control->words[0],
 			    control->words[0], control->words[1], matches);
 		}
 		break;
@@ -5038,6 +5038,125 @@ static bool ipa_qmi_start(void);
 static void ipa_qmi_stop(void);
 static struct hakios_qrtr_port *ipa_host_port;
 
+/*
+ * IMS DCM (dcm=1): the "data call manager" service the modem's IMS stack is a client of, served on Android by
+ * Qualcomm's imsdatadaemon (QMI service 770 = 0x302, IDL version 1: 17 requests, 0x20-0x34, and 7 indications; found
+ * in its service object, fw-ims/). The IMS stack asks the application processor through it to bring up the IMS
+ * connection and for its addresses; without it IMS never registers. First: every request logged, answered "success".
+ */
+#define DCM_SERVICE             770
+static struct hakios_qrtr_port *dcm_port;
+static unsigned dcm_requests;
+static void sms_hex(const char *what, const uint8_t *p, unsigned n);
+
+/*
+ * PDP activate (0x20), read from imsdatadaemon's code: the request's TLV 1 is {APN (a string with a byte of length),
+ * APN type, RAT type, IP family (1: IPv6), DS profile} and TLV 0x10 a cookie (pdp_req_seq_no); the answer is success
+ * with TLV 0x10 = the PDP id (a byte). Once the connection is up, indication 0x20: result, TLV 1 the PDP id, TLV 0x10
+ * the cookie, TLV 0x11 {IP family, the address as text}; TLV 0x12 (a cause) only when it failed.
+ */
+static uint32_t dcm_node, dcm_client_port;
+static volatile int dcm_pending;                /* a PDP activate waits for the IMS connection */
+static uint32_t dcm_cookie;
+static int dcm_cookie_valid, dcm_family = 1;
+static void ims_pdn_go(int family);
+
+static void
+dcm_pdp_activate(uint32_t node, uint32_t port, const uint8_t *m, unsigned length)
+{
+	const uint8_t *v;
+	uint16_t size;
+	uint8_t r[7 + 7 + 4];
+	char apn[64] = "";
+
+	if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 1 && 1u + v[0] + 16 <= size) {
+		unsigned n = v[0] < sizeof(apn) - 1 ? v[0] : sizeof(apn) - 1;
+		const uint8_t *f = v + 1 + v[0];
+
+		memcpy(apn, v + 1, n);
+		apn[n] = 0;
+		dcm_family = (int)(f[8] | f[9] << 8 | f[10] << 16 | (uint32_t)f[11] << 24);
+		tell("mpss: dcm: PDP ACTIVATE for APN \"%s\": APN type %u, RAT %u, IP family %d, profile %u\n", apn,
+		    f[0] | f[1] << 8, f[4] | f[5] << 8, dcm_family, f[12] | f[13] << 8);
+	}
+	dcm_cookie_valid = 0;
+	if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 4) {
+		dcm_cookie = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | (uint32_t)v[3] << 24);
+		dcm_cookie_valid = 1;
+	}
+	dcm_node = node;
+	dcm_client_port = port;
+	r[0] = QMI_RESPONSE; r[1] = m[1]; r[2] = m[2]; r[3] = m[3]; r[4] = m[4]; r[5] = 11; r[6] = 0;
+	r[7] = 0x02; r[8] = 4; r[9] = 0; r[10] = 0; r[11] = 0; r[12] = 0; r[13] = 0;
+	r[14] = 0x10; r[15] = 1; r[16] = 0; r[17] = 1;  /* PDP id 1 */
+	qrtr_send(dcm_port, node, port, r, sizeof(r));
+	dcm_pending = 1;
+	ims_pdn_go(dcm_family == 1 ? 6 : 4);
+}
+
+/* The IMS connection is up with this address (16 bytes for IPv6, 4 for IPv4): the indication. */
+static void
+dcm_pdp_up(const uint8_t *address, unsigned n)
+{
+	uint8_t q[7 + 7 + 4 + 7 + 3 + 4 + 1 + 48];
+	char text[48];
+	unsigned at = 7, t = 0, family = n == 16 ? 1 : 0;
+
+	if (!dcm_pending || dcm_port == NULL) {
+		return;
+	}
+	dcm_pending = 0;
+	if (n == 16) {
+		for (unsigned i = 0; i < 16; i += 2) {
+			t += (unsigned)snprintf(text + t, sizeof(text) - t, i ? ":%x" : "%x", address[i] << 8 | address[i + 1]);
+		}
+	} else {
+		snprintf(text, sizeof(text), "%u.%u.%u.%u", address[0], address[1], address[2], address[3]);
+	}
+	t = (unsigned)strlen(text);
+	q[0] = 4; q[1] = 0; q[2] = 0; q[3] = 0x20; q[4] = 0;      /* (an indication: QMI_INDICATION is defined further down) */
+	q[at++] = 0x02; q[at++] = 4; q[at++] = 0; q[at++] = 0; q[at++] = 0; q[at++] = 0; q[at++] = 0;
+	q[at++] = 0x01; q[at++] = 1; q[at++] = 0; q[at++] = 1;
+	if (dcm_cookie_valid) {
+		q[at++] = 0x10; q[at++] = 4; q[at++] = 0;
+		q[at++] = (uint8_t)dcm_cookie; q[at++] = (uint8_t)(dcm_cookie >> 8); q[at++] = (uint8_t)(dcm_cookie >> 16);
+		q[at++] = (uint8_t)(dcm_cookie >> 24);
+	}
+	q[at++] = 0x11; q[at++] = (uint8_t)(5 + t); q[at++] = 0;
+	q[at++] = (uint8_t)family; q[at++] = 0; q[at++] = 0; q[at++] = 0;
+	q[at++] = (uint8_t)t;
+	memcpy(q + at, text, t);
+	at += t;
+	q[5] = (uint8_t)(at - 7); q[6] = 0;
+	tell("mpss: dcm: PDP ACTIVATED told to the modem: PDP 1, cookie %u, address %s (family %u)\n", dcm_cookie, text, family);
+	qrtr_send(dcm_port, dcm_node, dcm_client_port, q, at);
+}
+
+static void
+dcm_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data;
+	uint8_t r[7 + 7];
+
+	if (length < 7) {
+		return;
+	}
+	dcm_requests++;
+	tell("mpss: dcm: request %#x (type %u, transaction %u, %u bytes) from node %u port %u\n", m[3] | m[4] << 8, m[0],
+	    m[1] | m[2] << 8, (unsigned)length, node, port);
+	sms_hex("dcm in", m, (unsigned)length);
+	if (m[0] != QMI_REQUEST) {
+		return;
+	}
+	if ((m[3] | m[4] << 8) == 0x20) {
+		dcm_pdp_activate(node, port, m, (unsigned)length);
+		return;
+	}
+	r[0] = QMI_RESPONSE; r[1] = m[1]; r[2] = m[2]; r[3] = m[3]; r[4] = m[4]; r[5] = 7; r[6] = 0;
+	r[7] = 0x02; r[8] = 4; r[9] = 0; r[10] = 0; r[11] = 0; r[12] = 0; r[13] = 0;
+	qrtr_send(dcm_port, node, port, r, sizeof(r));
+}
+
 /* The port, and the service on it; the partitions are read in step 2, the buffer shared in step 7. */
 static bool
 rmtfs_start(void)
@@ -5072,6 +5191,16 @@ rmtfs_start(void)
 			our_servers[3].service = 0x31;          /* the IPA's host service (below) */
 			our_servers[3].instance = 0x101;
 			our_servers[3].port = ipa_host_port->number;
+		}
+		if (dcm_port == NULL && option("dcm")) {
+			dcm_port = qrtr_open(dcm_receive, NULL, NULL);
+			if (dcm_port != NULL) {
+				our_servers[4].service = DCM_SERVICE;
+				our_servers[4].instance = 1;    /* (IDL version 1, instance 0) */
+				our_servers[4].port = dcm_port->number;
+				tell("mpss: dcm: the IMS data call manager is offered (service %u, port %u)\n", DCM_SERVICE,
+				    dcm_port->number);
+			}
 		}
 	}
 	return true;
@@ -8381,6 +8510,20 @@ static uint64_t ims_pdn_tried_us;
 static int ims_pdn_wanted, ims_pdn_family = 6;
 
 static void
+ims_pdn_go(int family)
+{
+	ims_pdn_family = family;
+	ims_pdn_wanted = 1;
+	if (ims_pdn_step == 3) {
+		/* already up: its settings asked again, for the indication */
+		uint8_t ask[14] = { QMI_REQUEST, 0xc3, 0, WDS_GET_CURRENT_SETTINGS & 0xff, WDS_GET_CURRENT_SETTINGS >> 8, 7, 0, 0x10,
+		    4, 0, 0x00, 0x01, 0, 0 };
+
+		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, ask, sizeof(ask));
+	}
+}
+
+static void
 ims_pdn_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
 {
 	const uint8_t *m = data, *v;
@@ -8404,12 +8547,30 @@ ims_pdn_receive(__unused void *context, __unused uint32_t node, __unused uint32_
 		ims_pdn_step = 11;
 		return;
 	}
+	if (id == WDS_GET_CURRENT_SETTINGS) {
+		if ((v = qmi_tlv(m, length, 0x25, &size)) != NULL && size >= 16) {
+			dcm_pdp_up(v, 16);
+		} else if ((v = qmi_tlv(m, length, 0x1e, &size)) != NULL && size >= 4) {
+			uint8_t a[4] = { v[3], v[2], v[1], v[0] };
+
+			dcm_pdp_up(a, 4);
+		} else {
+			tell("mpss: ims pdn: its settings: result %u, error %u, no address\n", result, error);
+			sms_hex("ims pdn settings", m, (unsigned)length);
+		}
+		return;
+	}
 	if (id != WDS_START_NETWORK_INTERFACE) {
 		return;
 	}
 	if (result == 0) {
+		/* (TLV 0x10 of the settings asked: 0x100, the IP address) */
+		uint8_t ask[14] = { QMI_REQUEST, 0xc3, 0, WDS_GET_CURRENT_SETTINGS & 0xff, WDS_GET_CURRENT_SETTINGS >> 8, 7, 0, 0x10,
+		    4, 0, 0x00, 0x01, 0, 0 };
+
 		tell("mpss: ims pdn: THE IMS CONNECTION IS UP (APN ims, IPv%d)\n", ims_pdn_family);
 		ims_pdn_step = 3;
+		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, ask, sizeof(ask));
 		return;
 	}
 	{
@@ -8447,7 +8608,7 @@ ims_pdn_server(__unused void *context, bool arrived, uint32_t service, __unused 
 static void
 ims_pdn_advance(void)
 {
-	if (ims_pdn_port == NULL || ims_pdn_port_number == 0 || !nas.state.registered) {
+	if (ims_pdn_port == NULL || ims_pdn_port_number == 0 || !nas.state.registered || !ims_pdn_wanted) {
 		return;
 	}
 	if (ims_pdn_step == 0) {
@@ -8512,8 +8673,8 @@ voice_open(void)
 	}
 	PE_parse_boot_argn("volte", &volte_wanted, sizeof(volte_wanted));
 	PE_parse_boot_argn("ims_pdn", &ims_pdn_wanted, sizeof(ims_pdn_wanted));
-	if (ims_pdn_wanted) {
-		ims_pdn_family = ims_pdn_wanted == 4 ? 4 : 6;  /* (ims_pdn=4: IPv4) */
+	if (ims_pdn_wanted || option("dcm")) {
+		ims_pdn_family = ims_pdn_wanted == 4 ? 4 : 6;  /* (ims_pdn=4: IPv4; with dcm=1 the modem asks for it) */
 		ims_pdn_port = qrtr_open(ims_pdn_receive, ims_pdn_server, NULL);
 		if (ims_pdn_port != NULL) {
 			qrtr_lookup(ims_pdn_port, QMI_WDS, 0, 0);
