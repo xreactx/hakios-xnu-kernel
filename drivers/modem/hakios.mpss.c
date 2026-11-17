@@ -5100,7 +5100,8 @@ dcm_pdp_up(const uint8_t *address, unsigned n)
 {
 	uint8_t q[7 + 7 + 4 + 7 + 3 + 4 + 1 + 48];
 	char text[48];
-	unsigned at = 7, t = 0, family = n == 16 ? 1 : 0;
+	/* (the address's family is the daemon's own, not the request's: 1 IPv4, 2 IPv6 -- its handler maps 0 -> 1, 1 -> 2) */
+	unsigned at = 7, t = 0, family = n == 16 ? 2 : 1;
 
 	if (!dcm_pending || dcm_port == NULL) {
 		return;
@@ -5130,6 +5131,13 @@ dcm_pdp_up(const uint8_t *address, unsigned n)
 	q[5] = (uint8_t)(at - 7); q[6] = 0;
 	tell("mpss: dcm: PDP ACTIVATED told to the modem: PDP 1, cookie %u, address %s (family %u)\n", dcm_cookie, text, family);
 	qrtr_send(dcm_port, dcm_node, dcm_client_port, q, at);
+	{
+		/* the app state the modem registered for (0x2e): indication 0x2f, TLV 0x10 = 0 ("criteria met", imsdatadaemon) */
+		uint8_t a[7 + 7] = { 4, 0, 0, 0x2f, 0, 7, 0, 0x10, 4, 0, 0, 0, 0, 0 };
+
+		tell("mpss: dcm: app state 0 (criteria met) told to the modem\n");
+		qrtr_send(dcm_port, dcm_node, dcm_client_port, a, sizeof(a));
+	}
 }
 
 /*
@@ -5178,6 +5186,13 @@ dcm_receive(__unused void *context, uint32_t node, uint32_t port, const void *da
 	}
 	if ((m[3] | m[4] << 8) == 0x20) {
 		dcm_pdp_activate(node, port, m, (unsigned)length);
+		return;
+	}
+	if ((m[3] | m[4] << 8) == 0x2e) {
+		/* register app state: success, TLV 0x10 the current state (0, criteria met) */
+		uint8_t a[7 + 7 + 7] = { QMI_RESPONSE, m[1], m[2], 0x2e, 0, 14, 0, 0x02, 4, 0, 0, 0, 0, 0, 0x10, 4, 0, 0, 0, 0, 0 };
+
+		qrtr_send(dcm_port, node, port, a, sizeof(a));
 		return;
 	}
 	r[0] = QMI_RESPONSE; r[1] = m[1]; r[2] = m[2]; r[3] = m[3]; r[4] = m[4]; r[5] = 7; r[6] = 0;
@@ -8547,6 +8562,105 @@ static volatile int ims_pdn_step;               /* 0, 1 family asked, 2 start as
 static uint64_t ims_pdn_tried_us;
 static int ims_pdn_wanted, ims_pdn_family = 6;
 
+/*
+ * The modem link-local link (with dcm=1): a WDS client of its own, bound to mux 3, a session with the extended
+ * technology preference "modem link-local" (0x8888, TLV 0x34), IPv6, no APN -- Android's imsdatadaemon opens one
+ * (DCM_MODEM_LL), and the modem's IMS stack talks through it. hakios.cell.c bridges it to the IMS connection.
+ */
+static struct hakios_qrtr_port *ll_port;
+static uint32_t ll_node, ll_port_number;
+static volatile int ll_step;                    /* 0, 1 bind asked, 21 bound, 22 family asked, 11 to start, 2 started asked, 3 up */
+static uint64_t ll_tried_us;
+extern int hakios_ims_bridge;
+
+static void
+ll_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data, *v;
+	uint16_t size, result = 0xffff, error = 0xffff, id;
+
+	if (length < 7 || m[0] != QMI_RESPONSE) {
+		return;
+	}
+	id = (uint16_t)(m[3] | m[4] << 8);
+	if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
+		result = (uint16_t)(v[0] | v[1] << 8);
+		error = (uint16_t)(v[2] | v[3] << 8);
+	}
+	if (id == WDS_BIND_MUX_DATA_PORT) {
+		tell("mpss: modem ll: the client bound to mux 3: result %u, error %u\n", result, error);
+		ll_step = 21;
+	} else if (id == WDS_SET_IP_FAMILY) {
+		ll_step = 11;
+	} else if (id == WDS_START_NETWORK_INTERFACE) {
+		if (result == 0) {
+			tell("mpss: modem ll: THE MODEM LINK-LOCAL LINK IS UP (mux 3)%s\n",
+			    ims_pdn_step == 3 ? "; the IMS bridge is up" : "");
+			ll_step = 3;
+			if (ims_pdn_step == 3) {
+				hakios_ims_bridge = 1;
+			}
+		} else {
+			int reason = -1, vtype = -1, vreason = -1;
+
+			if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 2) {
+				reason = v[0] | v[1] << 8;
+			}
+			if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 4) {
+				vtype = v[0] | v[1] << 8;
+				vreason = v[2] | v[3] << 8;
+			}
+			tell("mpss: modem ll: refused: result %u, error %u, end reason %d, verbose %d/%d (retried in 10 s)\n", result,
+			    error, reason, vtype, vreason);
+			ll_step = 11;
+			ll_tried_us = now_us();
+		}
+	}
+}
+
+static void
+ll_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance,
+    uint32_t node, uint32_t port)
+{
+	if (service != QMI_WDS) {
+		return;
+	}
+	if (arrived && ll_port_number == 0) {
+		ll_node = node;
+		ll_port_number = port;
+	} else if (!arrived && node == ll_node && port == ll_port_number) {
+		ll_node = ll_port_number = 0;
+	}
+}
+
+static void
+ll_advance(void)
+{
+	if (ll_port == NULL || ll_port_number == 0 || !nas.state.registered) {
+		return;
+	}
+	if (ll_step == 0) {
+		uint8_t bind[7 + 11 + 4] = { QMI_REQUEST, 0xd2, 0, WDS_BIND_MUX_DATA_PORT & 0xff, WDS_BIND_MUX_DATA_PORT >> 8, 15, 0,
+		    0x10, 8, 0, DATA_ENDPOINT_EMBEDDED, 0, 0, 0, DATA_ENDPOINT_INTERFACE, 0, 0, 0, 0x11, 1, 0, 3 };
+
+		ll_step = 1;
+		qrtr_send(ll_port, ll_node, ll_port_number, bind, sizeof(bind));
+	} else if (ll_step == 21) {
+		uint8_t q[11] = { QMI_REQUEST, 0xd0, 0, WDS_SET_IP_FAMILY & 0xff, WDS_SET_IP_FAMILY >> 8, 4, 0, 0x01, 1, 0, 6 };
+
+		ll_step = 22;
+		qrtr_send(ll_port, ll_node, ll_port_number, q, sizeof(q));
+	} else if (ll_step == 11 && now_us() - ll_tried_us > 10000000ull) {
+		uint8_t q[7 + 4 + 5] = { QMI_REQUEST, 0xd1, 0, WDS_START_NETWORK_INTERFACE & 0xff, WDS_START_NETWORK_INTERFACE >> 8,
+		    9, 0, 0x19, 1, 0, 6, 0x34, 2, 0, 0x88, 0x88 };
+
+		ll_step = 2;
+		ll_tried_us = now_us();
+		tell("mpss: modem ll: starting the modem link-local link (extended technology 0x8888, IPv6)\n");
+		qrtr_send(ll_port, ll_node, ll_port_number, q, sizeof(q));
+	}
+}
+
 static void
 ims_pdn_go(int family)
 {
@@ -8606,8 +8720,12 @@ ims_pdn_receive(__unused void *context, __unused uint32_t node, __unused uint32_
 		uint8_t ask[14] = { QMI_REQUEST, 0xc3, 0, WDS_GET_CURRENT_SETTINGS & 0xff, WDS_GET_CURRENT_SETTINGS >> 8, 7, 0, 0x10,
 		    4, 0, 0x00, 0x01, 0, 0 };
 
-		tell("mpss: ims pdn: THE IMS CONNECTION IS UP (APN ims, IPv%d)\n", ims_pdn_family);
+		tell("mpss: ims pdn: THE IMS CONNECTION IS UP (APN ims, IPv%d)%s\n", ims_pdn_family,
+		    ll_step == 3 ? "; the IMS bridge is up" : "");
 		ims_pdn_step = 3;
+		if (ll_step == 3) {
+			hakios_ims_bridge = 1;
+		}
 		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, ask, sizeof(ask));
 		return;
 	}
@@ -8711,6 +8829,12 @@ voice_open(void)
 	}
 	PE_parse_boot_argn("volte", &volte_wanted, sizeof(volte_wanted));
 	PE_parse_boot_argn("ims_pdn", &ims_pdn_wanted, sizeof(ims_pdn_wanted));
+	if (option("dcm") && !option("dcm_noll")) {
+		ll_port = qrtr_open(ll_receive, ll_server, NULL);
+		if (ll_port != NULL) {
+			qrtr_lookup(ll_port, QMI_WDS, 0, 0);
+		}
+	}
 	if (ims_pdn_wanted || option("dcm")) {
 		ims_pdn_family = ims_pdn_wanted == 4 ? 4 : 6;  /* (ims_pdn=4: IPv4; with dcm=1 the modem asks for it) */
 		ims_pdn_port = qrtr_open(ims_pdn_receive, ims_pdn_server, NULL);
@@ -8739,6 +8863,7 @@ voice_advance(void)
 	imsa_advance();
 	imss_advance();
 	ims_pdn_advance();
+	ll_advance();
 	pdc_advance();
 	if (voice_port == NULL || voice_port_number == 0) {
 		return;

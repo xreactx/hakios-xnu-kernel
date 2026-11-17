@@ -414,12 +414,64 @@ ping_advance(void)
 	}
 }
 
+/*
+ * The IMS bridge (hakios.mpss.c, dcm=1): the modem's IMS stack sends its SIP from the IMS connection's address but by
+ * the "modem link-local" link (QMAP mux 3), and on Android the application processor forwards between that and the IMS
+ * connection itself (mux 2), which is the application processor's. Here: unicast IPv6 from one goes out the other;
+ * link-local and multicast stay where they are. hakios_ims_bridge is set once both links are up.
+ */
+#define IMS_PDN_MUX             2
+#define IMS_LL_MUX              3
+int hakios_ims_bridge;
+static uint64_t ims_bridged[2], ims_bridge_dropped;
+
+static void
+ims_bridge(uint8_t mux, const uint8_t *packet, size_t length)
+{
+	const uint8_t *src = packet + 8, *dst = packet + 24;
+	int to_network = mux == IMS_LL_MUX;
+	uint8_t out = to_network ? IMS_PDN_MUX : IMS_LL_MUX;
+
+	if (length < 40 || packet[0] >> 4 != 6 || dst[0] == 0xff || (dst[0] == 0xfe && (dst[1] & 0xc0) == 0x80) ||
+	    (src[0] == 0xfe && (src[1] & 0xc0) == 0x80)) {
+		if (ims_bridge_dropped++ < 8) {
+			printf("cell: ims bridge: %zu bytes on mux %u kept (IPv%u, to %02x%02x::, next header %u)\n", length, mux,
+			    length ? packet[0] >> 4 : 0, length >= 40 ? dst[0] : 0, length >= 40 ? dst[1] : 0, length >= 40 ? packet[6] : 0);
+		}
+		return;
+	}
+	if (ims_bridged[to_network]++ < 12) {
+		unsigned sport = 0, dport = 0;
+
+		if ((packet[6] == 6 || packet[6] == 17) && length >= 44) {
+			sport = (unsigned)(packet[40] << 8 | packet[41]);
+			dport = (unsigned)(packet[42] << 8 | packet[43]);
+		}
+		printf("cell: IMS BRIDGE: %zu bytes %s, %s %u -> %u (%02x%02x:%02x%02x:..:%02x%02x -> %02x%02x:%02x%02x:..:%02x%02x)\n",
+		    length, to_network ? "modem -> network" : "network -> modem", packet[6] == 6 ? "TCP" : packet[6] == 17 ? "UDP" :
+		    packet[6] == 58 ? "ICMPv6" : "proto", sport, dport, src[0], src[1], src[2], src[3], src[14], src[15], dst[0], dst[1],
+		    dst[2], dst[3], dst[14], dst[15]);
+	}
+	if (!hakios_ipa_transmit(out, packet, length)) {
+		ims_bridge_dropped++;
+	}
+}
+
 /* A packet from the modem: an Ethernet frame from the router made around it. */
 static void
 cell_receive(uint8_t mux, const uint8_t *packet, size_t length)
 {
 	uint8_t frame[HAKIOS_NET_FRAME_MAX];
 	uint32_t version = length > 0 ? packet[0] >> 4 : 0;
+
+	if (mux == IMS_PDN_MUX || mux == IMS_LL_MUX) {
+		if (hakios_ims_bridge) {
+			ims_bridge(mux, packet, length);
+		} else if (ims_bridge_dropped++ < 8) {
+			printf("cell: %zu bytes on mux %u before the IMS bridge is up: dropped\n", length, mux);
+		}
+		return;
+	}
 
 	if (length < 20 || length + 14 > sizeof(frame) || (version != 4 && version != 6)) {
 		cell_count.dropped_in++;
