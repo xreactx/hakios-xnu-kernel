@@ -5167,11 +5167,18 @@ static uint32_t diag_cmd_node, diag_cmd_server_port, diag_cntl_node, diag_cntl_c
 static bool diag_handshaken;
 static void diag_command(uint32_t node, uint32_t port, const uint8_t *p, unsigned n);
 
+static void diag_data_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length);
+
 static void
 diag_cmd_receive(__unused void *context, uint32_t node, uint32_t port, const void *data, size_t length)
 {
-	tell("mpss: diag: %zu bytes from the modem's command service (node %u port %u)\n", length, node, port);
-	sms_hex("diag cmd", data, (unsigned)(length < 64 ? length : 64));
+	static unsigned seen;
+
+	if (seen++ < 6) {
+		tell("mpss: diag: %zu bytes from the modem's command service (node %u port %u)\n", length, node, port);
+		sms_hex("diag cmd", data, (unsigned)(length < 64 ? length : 64));
+	}
+	diag_data_receive(NULL, node, port, data, length);      /* (the same frames: answers, with feature 4) */
 }
 
 /* A diag command, HDLC-framed (CRC-16/X.25, low byte first; 7e and 7d escaped), to the modem's command service. */
@@ -5315,6 +5322,9 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 
 			if (option("f3_id")) {
 				feature[13] |= 0x80;            /* (15: diag ids, with f3_id=1) */
+			}
+			if (option("f3_rsp")) {
+				feature[12] |= 0x10;            /* (4: request/response support: answers on the command channel) */
 			}
 			if (option("f3_raw")) {
 				feature[12] |= 0x40;            /* (6: the application processor's HDLC encoding: non-HDLC both ways) */
@@ -7576,7 +7586,8 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 				}
 				/* a USIM (or SIM) in logical slot 1 that is READY, or only "detected" (cycle 37: the card sits in slot 1 with its
 				 * application detected and never initialized, as no provisioning session names it): either is provisioned below */
-				if (slot == 0 && card == 1 && (state == 7 || state == 1) && (type == 2 || type == 1) && aid <= 32 && at + 7 + aid <= size) {
+				if ((slot == 0 || (option("modem_sim_switch_off") && ready_aid[0] == 0)) && card == 1 && (state == 7 || state == 1) &&
+				    (type == 2 || type == 1) && aid <= 32 && at + 7 + aid <= size) {
 					ready_aid[0] = (uint8_t)aid;
 					memcpy(ready_aid + 1, v + at + 7, aid);
 				}
@@ -7604,14 +7615,16 @@ uim_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 			pr[n++] = 0; pr[n++] = 0;       /* the length, below */
 			pr[n++] = 0x01; pr[n++] = 2; pr[n++] = 0; pr[n++] = 0; pr[n++] = 1;   /* primary GW, activate */
 			pr[n++] = 0x10; pr[n++] = (uint8_t)(2 + ready_aid[0]); pr[n++] = 0;
-			pr[n++] = 1;                    /* logical slot 1 */
+			/* logical slot 1 -- or, with the slots left as they are (modem_sim_switch_off), the card's own: Android
+			 * keeps the Lyca card in slot 2 and its IMS instance is that slot's (diag capture f3reg: SLOT_ID=2) */
+			pr[n++] = option("modem_sim_switch_off") && sim_slot_ready > 1 ? (uint8_t)sim_slot_ready : 1;
 			pr[n++] = ready_aid[0];
 			memcpy(pr + n, ready_aid + 1, ready_aid[0]);
 			n += ready_aid[0];
 			pr[5] = (uint8_t)(n - 7); pr[6] = (uint8_t)((n - 7) >> 8);
 			sim_provisioned = true;
-			tell("mpss: uim: THE USIM OF SLOT 1 IS MADE THE PRIMARY GW APPLICATION (AID of %u bytes; its state is looked at again)\n",
-			    ready_aid[0]);
+			tell("mpss: uim: THE USIM OF SLOT %u IS MADE THE PRIMARY GW APPLICATION (AID of %u bytes; its state is looked at again)\n",
+			    pr[15], ready_aid[0]);
 			qrtr_send(uim_port, uim_node, uim_port_number, pr, n);
 		}
 		if (first_card != 1 && sim_slot_ready > 1 && !sim_slot_switched && !option("modem_sim_switch_off") && uim_port != NULL) {
