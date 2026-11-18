@@ -7478,6 +7478,26 @@ wds_open(void)
  * and every second from step_nas's loop. From the link's thread.
  */
 #define WDS_RETRY_US    6000000ull
+/*
+ * The client bound to a subscription (WDS 0xAF, TLV 1: 1 primary, 2 secondary; data_sub=N, 0 for none). Android keeps
+ * the card of physical slot 2 as subscription 2 and the modem its default data subscription; ours is made the primary
+ * (logical slot 1), so a client left to the default asked the empty one: every start "no service" (CM 2001, run 175321).
+ */
+#define WDS_BIND_SUBSCRIPTION   0x00af
+static void
+wds_bind_subscription(struct hakios_qrtr_port *port, uint32_t node, uint32_t number, uint8_t transaction)
+{
+	uint32_t sub = 1;
+	uint8_t q[7 + 7] = { QMI_REQUEST, transaction, 0, WDS_BIND_SUBSCRIPTION & 0xff, WDS_BIND_SUBSCRIPTION >> 8, 7, 0, 0x01, 4, 0 };
+
+	PE_parse_boot_argn("data_sub", &sub, sizeof(sub));
+	if (sub == 0) {
+		return;
+	}
+	q[10] = (uint8_t)sub;
+	qrtr_send(port, node, number, q, sizeof(q));
+}
+
 static void
 wds_advance(void)
 {
@@ -7506,6 +7526,7 @@ wds_advance(void)
 		wds_bind_sent = true;
 		wds_last_try = now_us();
 		tell("mpss: wds: about to bind the client to mux %u of the embedded port (the IPA)\n", DATA_MUX);
+		wds_bind_subscription(wds_port, wds_node, wds_port_number, 0x45);
 		qrtr_send(wds_port, wds_node, wds_port_number, bind, sizeof(bind));
 		return;
 	}
@@ -9311,6 +9332,10 @@ ims_pdn_receive(__unused void *context, __unused uint32_t node, __unused uint32_
 		result = (uint16_t)(v[0] | v[1] << 8);
 		error = (uint16_t)(v[2] | v[3] << 8);
 	}
+	if (id == 0x00af) {
+		tell("mpss: ims pdn: the client bound to its subscription: result %u, error %u\n", result, error);
+		return;
+	}
 	if (id == WDS_BIND_MUX_DATA_PORT) {
 		tell("mpss: ims pdn: the client bound to mux %u: result %u, error %u\n", DATA_MUX + 1, result, error);
 		ims_pdn_step = 21;
@@ -9427,6 +9452,7 @@ ims_pdn_advance(void)
 		    0x10, 8, 0, DATA_ENDPOINT_EMBEDDED, 0, 0, 0, DATA_ENDPOINT_INTERFACE, 0, 0, 0, 0x11, 1, 0, DATA_MUX + 1 };
 
 		ims_pdn_step = 1;
+		wds_bind_subscription(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, 0xc4);
 		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, bind, sizeof(bind));
 		return;
 	}
@@ -9473,12 +9499,20 @@ ims_pdn_advance(void)
 			 * (as dsi_netctrl's route lookup shows it on Android: "tpref 0 xt_t_pref 0", by profile, not APN type: the
 			 * modem bridges its own EPC call -- the one that answers 236, call already present -- to this 3GPP one)
 			 */
-			uint8_t r[7 + 4 + 6 + 4] = { QMI_REQUEST, 0xc1, 0, WDS_START_NETWORK_INTERFACE & 0xff,
-			    WDS_START_NETWORK_INTERFACE >> 8, 14, 0, 0x19, 1, 0, (uint8_t)ims_pdn_family, 0x14, 3, 0, 'i', 'm', 's',
-			    0x31, 1, 0, 2 };
+			/* (ims_tech=0x8004 default: UMTS/3GPP, the interface Android's modem lays its EPC one on -- "Iface 0x8880:2
+			 * registered for UP/DOWN ev on iface 0x8004:2"; with none it went for no service, CM 2001, run 174119) */
+			uint32_t tech = 0x8004;
+			uint8_t r[7 + 4 + 6 + 4 + 5] = { QMI_REQUEST, 0xc1, 0, WDS_START_NETWORK_INTERFACE & 0xff,
+			    WDS_START_NETWORK_INTERFACE >> 8, 19, 0, 0x19, 1, 0, (uint8_t)ims_pdn_family, 0x14, 3, 0, 'i', 'm', 's',
+			    0x31, 1, 0, 2, 0x34, 2, 0, 0, 0 };
 
-			tell("mpss: ims pdn: starting the connection to APN ims (IPv%d, profile 2, no technology)\n", ims_pdn_family);
-			qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, r, sizeof(r));
+			PE_parse_boot_argn("ims_tech", &tech, sizeof(tech));
+			r[24] = (uint8_t)tech; r[25] = (uint8_t)(tech >> 8);
+			tell("mpss: ims pdn: starting the connection to APN ims (IPv%d, profile 2, technology %#x)\n", ims_pdn_family, tech);
+			if (tech == 0) {
+				r[5] = 14;      /* (ims_tech=0: no technology at all) */
+			}
+			qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, r, tech ? sizeof(r) : sizeof(r) - 5);
 			return;
 		}
 		tell("mpss: ims pdn: starting the connection to APN ims (IPv%d, APN type IMS, EPC, profile 2)\n", ims_pdn_family);
