@@ -9110,6 +9110,7 @@ static uint64_t ll_tried_us;
 extern int hakios_ims_bridge;
 extern uint8_t hakios_ims_prefix[8];
 extern volatile int hakios_ims_prefix_known;
+extern int hakios_ims_solicit(const uint8_t link_local[16]);
 
 static void
 ll_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
@@ -9358,12 +9359,17 @@ ims_pdn_receive(__unused void *context, __unused uint32_t node, __unused uint32_
 			tell("mpss: ims pdn: the global address made from the advertised prefix and the modem's identifier\n");
 			dcm_pdp_up(global, 16);
 		} else if ((v = qmi_tlv(m, length, 0x25, &size)) != NULL && size >= 16 && v[0] == 0xfe && (v[1] & 0xc0) == 0x80 &&
-		    ims_pdn_address_tries < 15) {
+		    ims_pdn_address_tries < 40) {
 			/* only the link-local address yet: Android tells the modem once the global one is there (some 4 s) */
 			ims_pdn_address_tries++;
 			ims_pdn_address_at = now_us();
 			if (ims_pdn_address_tries == 1) {
 				tell("mpss: ims pdn: only a link-local address yet; asked again every second for the global one\n");
+			}
+			if (ims_pdn_address_tries % 3 == 1) {
+				int sent = hakios_ims_solicit(v);
+
+				tell("mpss: ims pdn: a router solicitation on the IMS connection: %s\n", sent ? "sent" : "NOT TAKEN");
 			}
 		} else if ((v = qmi_tlv(m, length, 0x25, &size)) != NULL && size >= 16) {
 			ims_pdn_address_tries = 99;
@@ -9467,7 +9473,7 @@ ims_pdn_advance(void)
 	if (!nas.state.registered || !ims_pdn_wanted) {
 		return;
 	}
-	if (ims_pdn_step == 3 && ims_pdn_address_tries > 0 && ims_pdn_address_tries < 15 && now_us() - ims_pdn_address_at > 1000000ull) {
+	if (ims_pdn_step == 3 && ims_pdn_address_tries > 0 && ims_pdn_address_tries < 40 && now_us() - ims_pdn_address_at > 1000000ull) {
 		uint8_t ask[14] = { QMI_REQUEST, 0xc3, 0, WDS_GET_CURRENT_SETTINGS & 0xff, WDS_GET_CURRENT_SETTINGS >> 8, 7, 0, 0x10,
 		    4, 0, 0x00, 0x01, 0, 0 };
 

@@ -437,6 +437,19 @@ static void
 ims_router_advertisement(const uint8_t *p, size_t length)
 {
 	size_t at = 40 + 16;            /* (after the IPv6 header and the RA's own 16 bytes) */
+	static unsigned dumped;
+
+	if (dumped++ < 2) {
+		for (size_t i = 0; i < length && i < 128; i += 32) {
+			char line[3 * 32 + 1];
+			unsigned o = 0;
+
+			for (size_t j = i; j < length && j < i + 32; j++) {
+				o += (unsigned)snprintf(line + o, sizeof(line) - o, "%02x ", p[j]);
+			}
+			printf("cell: ims: router advertisement +%zu: %s\n", i, line);
+		}
+	}
 
 	while (at + 8 <= length) {
 		unsigned type = p[at], len = p[at + 1] * 8u;
@@ -444,7 +457,7 @@ ims_router_advertisement(const uint8_t *p, size_t length)
 		if (len == 0 || at + len > length) {
 			break;
 		}
-		if (type == 3 && len >= 32) {
+		if (type == 3 && len >= 32 && !(p[at + 16] == 0xfe && (p[at + 17] & 0xc0) == 0x80)) {
 			memcpy(hakios_ims_prefix, p + at + 16, 8);
 			if (!hakios_ims_prefix_known) {
 				printf("cell: ims: the IMS connection's prefix %02x%02x:%02x%02x:%02x%02x:%02x%02x::/%u (router advertisement)\n",
@@ -454,6 +467,35 @@ ims_router_advertisement(const uint8_t *p, size_t length)
 		}
 		at += len;
 	}
+}
+
+/*
+ * A router solicitation on the IMS connection (from its link-local address to all routers): the network's
+ * advertisement, with the connection's prefix, may wait for one (none came on its own: run 181019).
+ */
+int hakios_ims_solicit(const uint8_t link_local[16]);
+int
+hakios_ims_solicit(const uint8_t link_local[16])
+{
+	uint8_t rs[40 + 8] = { 0x60, 0, 0, 0, 0, 8, 58, 255 };
+	uint32_t sum = 0;
+
+	memcpy(rs + 8, link_local, 16);
+	rs[24] = 0xff; rs[25] = 0x02; rs[39] = 0x02;    /* ff02::2 */
+	rs[40] = 133;
+	for (int i = 8; i < 40; i += 2) {
+		sum += (uint32_t)(rs[i] << 8 | rs[i + 1]);
+	}
+	sum += 8 + 58;
+	for (int i = 40; i < 48; i += 2) {
+		sum += (uint32_t)(rs[i] << 8 | rs[i + 1]);
+	}
+	while (sum >> 16) {
+		sum = (sum & 0xffff) + (sum >> 16);
+	}
+	sum = ~sum & 0xffff;
+	rs[42] = (uint8_t)(sum >> 8); rs[43] = (uint8_t)sum;
+	return hakios_ipa_transmit(IMS_PDN_MUX, rs, sizeof(rs)) ? 1 : 0;
 }
 
 static void
