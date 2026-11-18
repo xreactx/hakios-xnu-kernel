@@ -5183,6 +5183,7 @@ static struct hakios_qrtr_port *diag_cmd_port;
 static uint32_t diag_cmd_node, diag_cmd_server_port, diag_cntl_node, diag_cntl_client_port;
 static bool diag_handshaken;
 static volatile bool diag_ranges_known;
+static unsigned diag_retries;
 static void diag_command(uint32_t node, uint32_t port, const uint8_t *p, unsigned n);
 
 static void diag_data_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length);
@@ -5252,9 +5253,24 @@ hakios_diag_cmd_server(uint32_t instance, uint32_t node, uint32_t port)
 		if (diag_cmd_port != NULL) {
 			diag_cmd_node = node;
 			diag_cmd_server_port = port;
+			if (option("f3_ranges_first")) {
+				/* (the one answered command: the SSID ranges -- the control mask is then sent for the right range) */
+				static const uint8_t ranges[] = { 0x7d, 1 };
+
+				diag_command(node, port, ranges, sizeof(ranges));
+				diag_ranges_known = true;       /* (no retries; set again when the answer comes) */
+				diag_ranges_known = false;
+				diag_retries = 6;
+				tell("mpss: diag: the SSID ranges asked for as the first command\n");
+			} else
 			if (option("f3_first")) {
 				/* (the modem answers one command a boot: let it be the mask -- 0x7d 4, SSID 51..51, every level) */
-				static const uint8_t mask[] = { 0x7d, 4, F3_SSID, 0, F3_SSID, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
+				static uint8_t mask[] = { 0x7d, 4, F3_SSID, 0, F3_SSID, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
+				uint32_t ssid = F3_SSID;
+
+				PE_parse_boot_argn("f3_ssid", &ssid, sizeof(ssid));     /* (another SSID: 5, the call manager, logs steadily) */
+				mask[2] = mask[4] = (uint8_t)ssid;
+				mask[3] = mask[5] = (uint8_t)(ssid >> 8);
 				static const uint8_t all[] = { 0x7d, 5, 0, 0, 0xff, 0xff, 0xff, 0xff };   /* (sub 5: every SSID, f3_all) */
 
 				if (diag_f3_all) {
@@ -5436,7 +5452,6 @@ next:
 }
 
 static void diag_send_range_mask(uint16_t first, uint16_t last);
-static volatile bool diag_ranges_known;
 static unsigned diag_retries;
 static uint64_t diag_retry_at;
 
@@ -5500,7 +5515,7 @@ diag_packet(const uint8_t *p, unsigned n)
 			o += (unsigned)snprintf(line + o, sizeof(line) - o, " %x", v);
 		}
 		diag_f3_count++;
-		if (!diag_f3_all || diag_f3_count <= 20 || diag_f3_count % 1000 == 0) {
+		if (diag_f3_count <= 30 || diag_f3_count % 200 == 0) {
 			tell("mpss: f3: %s (%u)\n", line, diag_f3_count);
 		}
 	} else if (n >= 1 && p[0] == 0x00) {
