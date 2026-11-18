@@ -5182,6 +5182,14 @@ diag_command(uint32_t node, uint32_t port, const uint8_t *p, unsigned n)
 	unsigned o = 0;
 	uint16_t crc = 0xffff;
 
+	if (option("f3_raw") || option("f3_bare")) {
+		/* (f3_bare: bare commands without feature 6 advertised) once both sides have the application processor's HDLC encoding (feature 6) the command goes bare, as
+		 * linux-msm/diag's queue_push: framed as 7e 01 len ... 7e it came back as "bad command" with the frame for its
+		 * opcode (run 222813); the answers come framed so */
+		qrtr_send(diag_cmd_port, node, port, p, n);
+		return;
+	}
+
 	for (unsigned i = 0; i < n; i++) {
 		crc ^= p[i];
 		for (int b = 0; b < 8; b++) {
@@ -5308,6 +5316,9 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 			if (option("f3_id")) {
 				feature[13] |= 0x80;            /* (15: diag ids, with f3_id=1) */
 			}
+			if (option("f3_raw")) {
+				feature[12] |= 0x40;            /* (6: the application processor's HDLC encoding: non-HDLC both ways) */
+			}
 			if (option("f3_android")) {
 				/* exactly Android's driver (diag_send_feature_mask_update): 0, 2, 4, 6, 9, 11, 13, 14, 15 */
 				feature[12] = 0x55;
@@ -5316,6 +5327,14 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 			uint8_t mode[8 + 36] = { 3, 0, 0, 0, 36, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };  /* (version 1, sleep vote, real time) */
 
 			diag_cntl_send(node, port, feature, sizeof(feature));
+			if (option("f3_min")) {
+				/* (the feature mask alone: after the whole handshake the modem stopped answering commands, run 223322) */
+				diag_handshaken = true;
+				diag_cntl_node = node;
+				diag_cntl_client_port = port;
+				tell("mpss: diag: our feature mask alone sent (f3_min)\n");
+				goto next;
+			}
 			diag_cntl_send(node, port, mode, sizeof(mode));
 			diag_send_mask(node, port);
 			{
@@ -5368,6 +5387,7 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 			    (const char *)q + name_at, version);
 			diag_send_mask(node, port);
 		}
+next:
 		if (len > length - at - 8) {
 			break;
 		}
