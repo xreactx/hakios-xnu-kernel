@@ -3926,11 +3926,24 @@ qrtr_input(const uint8_t *data, uint32_t length)
 	if (header.type == QRTR_RESUME_TX) {
 		return;                                 /* (we never ask for one: GLINK's intents hold us back already) */
 	}
+	if (option("f3") && header.type == QRTR_DATA && (header.from_port == 33 || header.from_port == 31 || header.from_port == 30)) {
+		static unsigned traced;
+
+		if (traced++ < 24) {
+			tell("mpss: qrtr: diag traffic: %u bytes from node %u port %u to our port %u, confirm %u\n", header.size,
+			    header.from_node, header.from_port, header.to_port, header.confirm);
+		}
+	}
 	if (header.confirm) {
 		/* the sender counts what it has sent to this port, and waits for this before it sends many more */
 		struct qrtr_control resume = { .command = QRTR_RESUME_TX, .words = { header.to_node, header.to_port } };
+		int sent = qrtr_out_packet(QRTR_RESUME_TX, header.to_port, header.from_node, header.from_port, &resume, sizeof(resume));
+		static unsigned resumes;
 
-		qrtr_out_packet(QRTR_RESUME_TX, header.to_port, header.from_node, header.from_port, &resume, sizeof(resume));
+		if (option("f3") && resumes++ < 12) {
+			tell("mpss: qrtr: RESUME_TX to node %u port %u (from our port %u): %d\n", header.from_node, header.from_port,
+			    header.to_port, sent);
+		}
 	}
 	if (header.to_port == QRTR_CONTROL || header.type == QRTR_HELLO || header.type == QRTR_BYE ||
 	    header.type == QRTR_NEW_SERVER || header.type == QRTR_DEL_SERVER || header.type == QRTR_NEW_LOOKUP) {
@@ -3950,9 +3963,13 @@ qrtr_input(const uint8_t *data, uint32_t length)
 	lck_mtx_unlock(&qrtr_lock);
 	if (receive != NULL) {
 		receive(context, header.from_node, header.from_port, data + at, header.size);
-	} else if (qrtr_in <= 64) {
-		printf("mpss: qrtr: a datagram of %u bytes from node %u port %u to our port %u: nobody here listens there\n", header.size,
-		    header.from_node, header.from_port, header.to_port);
+	} else if (qrtr_in <= 64 || option("f3")) {
+		static unsigned strays;
+
+		if (strays++ < 16) {
+			tell("mpss: qrtr: a datagram of %u bytes from node %u port %u to our port %u: nobody here listens there\n",
+			    header.size, header.from_node, header.from_port, header.to_port);
+		}
 	}
 }
 
@@ -5165,6 +5182,7 @@ static bool diag_escape;
 static struct hakios_qrtr_port *diag_cmd_port;
 static uint32_t diag_cmd_node, diag_cmd_server_port, diag_cntl_node, diag_cntl_client_port;
 static bool diag_handshaken;
+static volatile bool diag_ranges_known;
 static void diag_command(uint32_t node, uint32_t port, const uint8_t *p, unsigned n);
 
 static void diag_data_receive(void *context, uint32_t node, uint32_t port, const void *data, size_t length);
@@ -5234,6 +5252,18 @@ hakios_diag_cmd_server(uint32_t instance, uint32_t node, uint32_t port)
 		if (diag_cmd_port != NULL) {
 			diag_cmd_node = node;
 			diag_cmd_server_port = port;
+			if (option("f3_first")) {
+				/* (the modem answers one command a boot: let it be the mask -- 0x7d 4, SSID 51..51, every level) */
+				static const uint8_t mask[] = { 0x7d, 4, F3_SSID, 0, F3_SSID, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
+				static const uint8_t all[] = { 0x7d, 5, 0, 0, 0xff, 0xff, 0xff, 0xff };   /* (sub 5: every SSID, f3_all) */
+
+				if (diag_f3_all) {
+					diag_command(node, port, all, sizeof(all));
+				} else
+				diag_command(node, port, mask, sizeof(mask));
+				diag_ranges_known = true;       /* (no retries) */
+				tell("mpss: diag: the F3 mask for SSID %u sent as the first command\n", F3_SSID);
+			} else
 			diag_command(node, port, version, sizeof(version));
 			if (diag_handshaken) {
 				static const uint8_t ranges[] = { 0x7d, 1 };
