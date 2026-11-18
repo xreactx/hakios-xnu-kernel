@@ -5488,6 +5488,15 @@ diag_packet(const uint8_t *p, unsigned n)
 			if (i < 12) {
 				tell("mpss: diag:   range %u: %u..%u\n", i, first, last);
 			}
+			if (option("f3_allranges") && diag_cntl_client_port != 0) {
+				/* (every range "all enabled", one word -- what Android's driver sent the modem when QCSuper enabled
+				 * everything over USB) */
+				uint8_t all[19 + 4] = { 11, 0, 0, 0, 15, 0, 0, 0, 1, 2, 0, (uint8_t)first, (uint8_t)(first >> 8),
+				    (uint8_t)last, (uint8_t)(last >> 8), 1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
+
+				diag_cntl_send(diag_cntl_node, diag_cntl_client_port, all, sizeof(all));
+				sent = true;
+			} else
 			if (!sent && first <= F3_SSID && F3_SSID <= last) {
 				diag_send_range_mask(first, last);
 				sent = true;
