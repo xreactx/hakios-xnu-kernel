@@ -5088,7 +5088,7 @@ dcm_pdp_activate(uint32_t node, uint32_t port, const uint8_t *m, unsigned length
 {
 	const uint8_t *v;
 	uint16_t size;
-	uint8_t r[7 + 7 + 4];
+	uint8_t r[7 + 7 + 4 + 7 + 7];
 	char apn[64] = "";
 
 	if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 1 && 1u + v[0] + 16 <= size) {
@@ -5108,10 +5108,29 @@ dcm_pdp_activate(uint32_t node, uint32_t port, const uint8_t *m, unsigned length
 	}
 	dcm_node = node;
 	dcm_client_port = port;
-	r[0] = QMI_RESPONSE; r[1] = m[1]; r[2] = m[2]; r[3] = m[3]; r[4] = m[4]; r[5] = 11; r[6] = 0;
-	r[7] = 0x02; r[8] = 4; r[9] = 0; r[10] = 0; r[11] = 0; r[12] = 0; r[13] = 0;
-	r[14] = 0x10; r[15] = 1; r[16] = 0; r[17] = 1;  /* PDP id 1 */
-	qrtr_send(dcm_port, node, port, r, sizeof(r));
+	/*
+	 * The answer (imsdatadaemon's IDL: result, 0x10 the PDP id, 0x11 the cookie back, 0x12 the request's 0x13, its
+	 * subscription): the modem matches the cookie ("qpDcmProcessQCCIPdpActRspEvent StoredSeqNo=100 InSeqNo=100",
+	 * Android's diag) before it takes the PDP id -- without it it cancelled at once (0x21 for its own id, 100).
+	 */
+	unsigned o = 7;
+
+	r[0] = QMI_RESPONSE; r[1] = m[1]; r[2] = m[2]; r[3] = m[3]; r[4] = m[4];
+	r[o++] = 0x02; r[o++] = 4; r[o++] = 0; r[o++] = 0; r[o++] = 0; r[o++] = 0; r[o++] = 0;
+	r[o++] = 0x10; r[o++] = 1; r[o++] = 0; r[o++] = 1;      /* PDP id 1 */
+	if (dcm_cookie_valid && !option("dcm_old")) {
+		r[o++] = 0x11; r[o++] = 4; r[o++] = 0;
+		r[o++] = (uint8_t)dcm_cookie; r[o++] = (uint8_t)(dcm_cookie >> 8); r[o++] = (uint8_t)(dcm_cookie >> 16);
+		r[o++] = (uint8_t)(dcm_cookie >> 24);
+	}
+	if ((v = qmi_tlv(m, length, 0x13, &size)) != NULL && size >= 4 && !option("dcm_old")) {
+		r[o++] = 0x12; r[o++] = 4; r[o++] = 0;
+		memcpy(r + o, v, 4);
+		o += 4;
+	}
+	r[5] = (uint8_t)(o - 7); r[6] = 0;
+	tell("mpss: dcm: PDP activate answered: PDP 1, cookie %u%s\n", dcm_cookie, dcm_cookie_valid ? "" : " (none)");
+	qrtr_send(dcm_port, node, port, r, o);
 	dcm_pending = 1;
 	ims_pdn_go(dcm_family == 1 ? 6 : 4);
 }
@@ -5630,6 +5649,18 @@ dcm_receive(__unused void *context, uint32_t node, uint32_t port, const void *da
 		uint8_t a[7 + 7 + 7] = { QMI_RESPONSE, m[1], m[2], 0x2e, 0, 14, 0, 0x02, 4, 0, 0, 0, 0, 0, 0x10, 4, 0, 0, 0, 0, 0 };
 
 		qrtr_send(dcm_port, node, port, a, sizeof(a));
+		return;
+	}
+	if ((m[3] | m[4] << 8) == 0x21 || (m[3] | m[4] << 8) == 0x22) {
+		/* deactivate / get IP: result, 0x10 the PDP id (the request's TLV 1) */
+		const uint8_t *v;
+		uint16_t size;
+		uint8_t d[7 + 7 + 4] = { QMI_RESPONSE, m[1], m[2], m[3], m[4], 11, 0, 0x02, 4, 0, 0, 0, 0, 0, 0x10, 1, 0, 1 };
+
+		if ((v = qmi_tlv(m, (unsigned)length, 0x01, &size)) != NULL && size >= 1) {
+			d[17] = v[0];
+		}
+		qrtr_send(dcm_port, node, port, d, sizeof(d));
 		return;
 	}
 	r[0] = QMI_RESPONSE; r[1] = m[1]; r[2] = m[2]; r[3] = m[3]; r[4] = m[4]; r[5] = 7; r[6] = 0;
