@@ -5082,6 +5082,7 @@ static volatile int dcm_pending;                /* a PDP activate waits for the 
 static uint32_t dcm_cookie;
 static int dcm_cookie_valid, dcm_family = 1;
 static void ims_pdn_go(int family);
+static void ims_pdn_advance(void);
 
 static void
 dcm_pdp_activate(uint32_t node, uint32_t port, const uint8_t *m, unsigned length)
@@ -9283,6 +9284,10 @@ ims_pdn_go(int family)
 {
 	ims_pdn_family = family;
 	ims_pdn_wanted = 1;
+	if (ims_pdn_step == 11) {
+		ims_pdn_advance();      /* (at once: the modem waits under 2 s) */
+		return;
+	}
 	if (ims_pdn_step == 3) {
 		/* already up: its settings asked again, for the indication */
 		uint8_t ask[14] = { QMI_REQUEST, 0xc3, 0, WDS_GET_CURRENT_SETTINGS & 0xff, WDS_GET_CURRENT_SETTINGS >> 8, 7, 0, 0x10,
@@ -9400,16 +9405,22 @@ ims_pdn_server(__unused void *context, bool arrived, uint32_t service, __unused 
 static void
 ims_pdn_advance(void)
 {
-	if (ims_pdn_port == NULL || ims_pdn_port_number == 0 || !nas.state.registered || !ims_pdn_wanted) {
+	{
+		/* (what it waits for, each time that changes) */
+		static int said = -1;
+		int why = (ims_pdn_port == NULL) | (ims_pdn_port_number == 0) << 1 | (!nas.state.registered) << 2 | (!ims_pdn_wanted) << 3;
+
+		if (why != said && (ims_pdn_wanted || option("dcm"))) {
+			said = why;
+			tell("mpss: ims pdn: waiting for:%s%s%s%s%s (step %d)\n", why & 1 ? " a port" : "", why & 2 ? " the WDS server" : "",
+			    why & 4 ? " registration" : "", why & 8 ? " a request" : "", why ? "" : " nothing", ims_pdn_step);
+		}
+	}
+	if (ims_pdn_port == NULL || ims_pdn_port_number == 0 || !(ims_pdn_wanted || option("dcm"))) {
 		return;
 	}
-	if (ims_pdn_step == 3 && ims_pdn_address_tries > 0 && ims_pdn_address_tries < 15 && now_us() - ims_pdn_address_at > 1000000ull) {
-		uint8_t ask[14] = { QMI_REQUEST, 0xc3, 0, WDS_GET_CURRENT_SETTINGS & 0xff, WDS_GET_CURRENT_SETTINGS >> 8, 7, 0, 0x10,
-		    4, 0, 0x00, 0x01, 0, 0 };
-
-		ims_pdn_address_at = now_us();
-		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, ask, sizeof(ask));
-	}
+	/* (bound and its family set before registration: once the modem asks -- right as it registers -- only the start is left;
+	 * it gives up on its own call 1.7 s after asking, run 172058) */
 	if (ims_pdn_step == 0) {
 		/* bound first, as the data session's client is (a client never bound is told 70, invalid operation: run 182236) */
 		uint8_t bind[7 + 11 + 4] = { QMI_REQUEST, 0xc2, 0, WDS_BIND_MUX_DATA_PORT & 0xff, WDS_BIND_MUX_DATA_PORT >> 8, 15, 0,
@@ -9426,6 +9437,16 @@ ims_pdn_advance(void)
 		ims_pdn_step = 22;
 		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, q, sizeof(q));
 		return;
+	}
+	if (!nas.state.registered || !ims_pdn_wanted) {
+		return;
+	}
+	if (ims_pdn_step == 3 && ims_pdn_address_tries > 0 && ims_pdn_address_tries < 15 && now_us() - ims_pdn_address_at > 1000000ull) {
+		uint8_t ask[14] = { QMI_REQUEST, 0xc3, 0, WDS_GET_CURRENT_SETTINGS & 0xff, WDS_GET_CURRENT_SETTINGS >> 8, 7, 0, 0x10,
+		    4, 0, 0x00, 0x01, 0, 0 };
+
+		ims_pdn_address_at = now_us();
+		qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, ask, sizeof(ask));
 	}
 	if (ims_pdn_step == 11 && now_us() - ims_pdn_tried_us > 10000000ull) {
 		/*
@@ -9445,6 +9466,19 @@ ims_pdn_advance(void)
 			q[5] = 10;
 			tell("mpss: ims pdn: starting the connection to APN ims (IPv%d, untyped)\n", ims_pdn_family);
 			qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, q, 7 + 10);
+			return;
+		}
+		if (option("ims_plain")) {
+			/*
+			 * (as dsi_netctrl's route lookup shows it on Android: "tpref 0 xt_t_pref 0", by profile, not APN type: the
+			 * modem bridges its own EPC call -- the one that answers 236, call already present -- to this 3GPP one)
+			 */
+			uint8_t r[7 + 4 + 6 + 4] = { QMI_REQUEST, 0xc1, 0, WDS_START_NETWORK_INTERFACE & 0xff,
+			    WDS_START_NETWORK_INTERFACE >> 8, 14, 0, 0x19, 1, 0, (uint8_t)ims_pdn_family, 0x14, 3, 0, 'i', 'm', 's',
+			    0x31, 1, 0, 2 };
+
+			tell("mpss: ims pdn: starting the connection to APN ims (IPv%d, profile 2, no technology)\n", ims_pdn_family);
+			qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, r, sizeof(r));
 			return;
 		}
 		tell("mpss: ims pdn: starting the connection to APN ims (IPv%d, APN type IMS, EPC, profile 2)\n", ims_pdn_family);
