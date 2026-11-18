@@ -11,6 +11,7 @@
  *   the list       of the drivers this kernel was built with: sysctl kern.hakios.drivers, and a line in the boot log,
  *                  so that a run says what was in it (hakios.drivers.h is made by tools/hakios-config.py kernel).
  */
+#include <pexpert/pexpert.h>
 #include <kern/locks.h>
 #include <kern/startup.h>
 #include <machine/machine_routines.h>
@@ -80,9 +81,26 @@ hakios_pas_begin(void)
 	hakios_pas_owner = current_thread();
 }
 
+/*
+ * Optionally held a while after a DSP is started (boot-arg pas_settle=MS, off by default): with
+ * the starts made exclusive, the modem's MBA began authenticating the moment the audio DSP's start returned, while that
+ * DSP was still setting its memory up, and three runs of 17 November ended in XPU violations (dumps 205958, 210439,
+ * 213310: modem step 7, masters 0x88/0x9a/0x9f). Spread out as they were before the exclusivity, they never met.
+ */
+static uint32_t hakios_pas_settle_ms;            /* (0: did not help -- run 215537 crashed 4 s after the audio DSP had started) */
+
 void
 hakios_pas_end(void)
 {
+	static bool parsed;
+
+	if (!parsed) {
+		parsed = true;
+		PE_parse_boot_argn("pas_settle", &hakios_pas_settle_ms, sizeof(hakios_pas_settle_ms));
+	}
+	if (hakios_pas_settle_ms != 0) {
+		delay_for_interval(hakios_pas_settle_ms, 1000 * 1000);  /* (milliseconds) */
+	}
 	hakios_pas_owner = NULL;
 	lck_mtx_unlock(&hakios_pas_lock);
 }

@@ -5320,7 +5320,9 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 			diag_send_mask(node, port);
 			{
 				/* buffering mode 0, streaming (linux-msm/diag sends it after the masks; the modem buffers otherwise) */
-				uint8_t buffering[8 + 6] = { 17, 0, 0, 0, 6, 0, 0, 0, 1, 0, 0, 0, 0, 0 };
+				/* (stream 1: with stream 0 the modem asserts -- "diagbuf.c:2036:Assertion tx_mode_ptr != NULL failed",
+				 * its last words in run 213756) */
+				uint8_t buffering[8 + 6] = { 17, 0, 0, 0, 6, 0, 0, 0, 1, 0, 0, 0, 1, 0 };
 
 				diag_cntl_send(node, port, buffering, sizeof(buffering));
 			}
@@ -5343,7 +5345,7 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 			unsigned name_at = 8, name_len;
 			uint8_t reply[8 + 8 + 48];
 			uint8_t mode[8 + 37] = { 3, 0, 0, 0, 37, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
-			uint8_t buffering[8 + 7] = { 17, 0, 0, 0, 7, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0 };
+			uint8_t buffering[8 + 7] = { 17, 0, 0, 0, 7, 0, 0, 0, 2, 0, 0, 0, 2, 1, 0 };     /* (id 2, stream 1, streaming) */
 
 			if (version >= 2 && len >= 12) {
 				name_at = 12 + (unsigned)(q[8] | q[9] << 8 | q[10] << 16 | (uint32_t)q[11] << 24);
@@ -9057,6 +9059,107 @@ ll_advance(void)
 	}
 }
 
+/*
+ * The modem's 3GPP data profiles, read only (with dcm=1): WDS Get Profile List (0x2a, TLV 0x10 = 0, 3GPP) and Get
+ * Profile Settings (0x2b) of each -- the APN, PDP type, P-CSCF by PCO, IMCN flag, APN disabled, APN type mask: on
+ * Android the modem's own bring-up of the IMS connection uses profile 2.
+ */
+static struct hakios_qrtr_port *prof_port;
+static uint32_t prof_node, prof_port_number;
+static uint8_t prof_index[24];
+static unsigned prof_count, prof_next;
+static volatile int prof_step;
+
+static void
+prof_ask_settings(void)
+{
+	uint8_t q[7 + 5] = { QMI_REQUEST, 0xe1, 0, 0x2b, 0, 5, 0, 0x01, 2, 0, 0, 0 };
+
+	if (prof_next >= prof_count) {
+		prof_step = 3;
+		return;
+	}
+	q[11] = prof_index[prof_next];
+	qrtr_send(prof_port, prof_node, prof_port_number, q, sizeof(q));
+}
+
+static void
+prof_receive(__unused void *context, __unused uint32_t node, __unused uint32_t port, const void *data, size_t length)
+{
+	const uint8_t *m = data, *v;
+	uint16_t size, id, result = 0xffff, error = 0xffff;
+
+	if (length < 7 || m[0] != QMI_RESPONSE) {
+		return;
+	}
+	id = (uint16_t)(m[3] | m[4] << 8);
+	if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
+		result = (uint16_t)(v[0] | v[1] << 8);
+		error = (uint16_t)(v[2] | v[3] << 8);
+	}
+	if (id == 0x2a) {
+		prof_count = 0;
+		if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 1) {
+			unsigned k = 1;
+
+			for (unsigned i = 0; i < v[0] && k + 3 <= size && prof_count < 24; i++) {
+				prof_index[prof_count++] = v[k + 1];
+				k += 3 + v[k + 2];
+			}
+		}
+		tell("mpss: profiles: %u 3GPP profiles (result %u, error %u)\n", prof_count, result, error);
+		prof_next = 0;
+		prof_ask_settings();
+		return;
+	}
+	if (id == 0x2b) {
+		char apn[48] = "", name[32] = "";
+		int pdp = -1, pco = -1, imcn = -1, disabled = -1;
+		uint64_t mask = 0;
+
+		if ((v = qmi_tlv(m, length, 0x14, &size)) != NULL) {
+			memcpy(apn, v, size < sizeof(apn) - 1 ? size : sizeof(apn) - 1);
+		}
+		if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL) {
+			memcpy(name, v, size < sizeof(name) - 1 ? size : sizeof(name) - 1);
+		}
+		if ((v = qmi_tlv(m, length, 0x11, &size)) != NULL && size >= 1) pdp = v[0];
+		if ((v = qmi_tlv(m, length, 0x1f, &size)) != NULL && size >= 1) pco = v[0];
+		if ((v = qmi_tlv(m, length, 0x22, &size)) != NULL && size >= 1) imcn = v[0];
+		if ((v = qmi_tlv(m, length, 0x2f, &size)) != NULL && size >= 1) disabled = v[0];
+		if ((v = qmi_tlv(m, length, 0xdd, &size)) != NULL && size >= 8) {
+			for (int b = 7; b >= 0; b--) mask = mask << 8 | v[b];
+		}
+		tell("mpss: profiles: profile %u \"%s\": APN \"%s\", PDP type %d (0 v4, 2 v6, 3 v4v6), P-CSCF by PCO %d, IMCN %d, "
+		    "disabled %d, APN types %#llx (result %u, error %u)\n", prof_index[prof_next], name, apn, pdp, pco, imcn, disabled,
+		    mask, result, error);
+		prof_next++;
+		prof_ask_settings();
+	}
+}
+
+static void
+prof_server(__unused void *context, bool arrived, uint32_t service, __unused uint32_t version, __unused uint32_t instance,
+    uint32_t node, uint32_t port)
+{
+	if (service == QMI_WDS && arrived && prof_port_number == 0) {
+		prof_node = node;
+		prof_port_number = port;
+	}
+}
+
+static void
+prof_advance(void)
+{
+	uint8_t q[7 + 4] = { QMI_REQUEST, 0xe0, 0, 0x2a, 0, 4, 0, 0x10, 1, 0, 0 };
+
+	if (prof_port == NULL || prof_port_number == 0 || prof_step != 0 || !nas.state.registered) {
+		return;
+	}
+	prof_step = 1;
+	qrtr_send(prof_port, prof_node, prof_port_number, q, sizeof(q));
+}
+
 static void
 ims_pdn_go(int family)
 {
@@ -9264,6 +9367,12 @@ voice_open(void)
 	}
 	PE_parse_boot_argn("volte", &volte_wanted, sizeof(volte_wanted));
 	PE_parse_boot_argn("ims_pdn", &ims_pdn_wanted, sizeof(ims_pdn_wanted));
+	if (option("dcm") || option("profiles")) {
+		prof_port = qrtr_open(prof_receive, prof_server, NULL);
+		if (prof_port != NULL) {
+			qrtr_lookup(prof_port, QMI_WDS, 0, 0);
+		}
+	}
 	if (option("dcm") && !option("dcm_noll")) {
 		ll_port = qrtr_open(ll_receive, ll_server, NULL);
 		if (ll_port != NULL) {
@@ -9300,6 +9409,7 @@ voice_advance(void)
 	imss_advance();
 	ims_pdn_advance();
 	ll_advance();
+	prof_advance();
 	pdc_advance();
 	if (voice_port == NULL || voice_port_number == 0) {
 		return;
