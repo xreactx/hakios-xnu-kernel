@@ -5163,7 +5163,7 @@ static unsigned diag_frame_at, diag_logged;
 static bool diag_escape;
 
 static struct hakios_qrtr_port *diag_cmd_port;
-static uint32_t diag_cmd_node, diag_cmd_server_port;
+static uint32_t diag_cmd_node, diag_cmd_server_port, diag_cntl_node, diag_cntl_client_port;
 static bool diag_handshaken;
 static void diag_command(uint32_t node, uint32_t port, const uint8_t *p, unsigned n);
 
@@ -5221,8 +5221,10 @@ hakios_diag_cmd_server(uint32_t instance, uint32_t node, uint32_t port)
 			diag_cmd_server_port = port;
 			diag_command(node, port, version, sizeof(version));
 			if (diag_handshaken) {
-				diag_command(node, port, f3, sizeof(f3));
-				tell("mpss: diag: the F3 mask for SSID %u sent as a command\n", F3_SSID);
+				static const uint8_t ranges[] = { 0x7d, 1 };
+
+				diag_command(node, port, ranges, sizeof(ranges));
+				tell("mpss: diag: the modem's SSID ranges asked for (0x7d 1)\n");
 			}
 		}
 	}
@@ -5257,6 +5259,30 @@ diag_send_mask(uint32_t node, uint32_t port)
 	mask[15] = 135;         /* the mask's size, in words */
 	memset(mask + 19 + F3_SSID * 4, 0xff, 4);
 	diag_cntl_send(node, port, mask, sizeof(mask));
+}
+
+/* The F3 mask for exactly one of the modem's own ranges (it looks the range up by its first and last SSID: msg.c,
+ * "update_msg_mask not found"), only SSID 51 on. */
+static void
+diag_send_range_mask(uint16_t first, uint16_t last)
+{
+	static uint8_t mask[19 + 512 * 4];
+	unsigned words = (unsigned)(last - first + 1), data_len = 11 + words * 4;
+
+	if (words > 512 || diag_cntl_client_port == 0) {
+		return;
+	}
+	bzero(mask, 19 + words * 4);
+	mask[0] = 11;
+	mask[4] = (uint8_t)data_len; mask[5] = (uint8_t)(data_len >> 8);
+	mask[8] = 1;            /* stream */
+	mask[9] = 3;            /* valid */
+	mask[11] = (uint8_t)first; mask[12] = (uint8_t)(first >> 8);
+	mask[13] = (uint8_t)last; mask[14] = (uint8_t)(last >> 8);
+	mask[15] = (uint8_t)words; mask[16] = (uint8_t)(words >> 8);
+	memset(mask + 19 + (F3_SSID - first) * 4, 0xff, 4);
+	diag_cntl_send(diag_cntl_node, diag_cntl_client_port, mask, 19 + words * 4);
+	tell("mpss: diag: the F3 mask sent for the modem's range %u..%u (SSID %u on)\n", first, last, F3_SSID);
 }
 
 static void
@@ -5300,11 +5326,13 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 			}
 			tell("mpss: diag: our feature mask, real-time mode and the F3 mask for SSID %u sent\n", F3_SSID);
 			diag_handshaken = true;
+			diag_cntl_node = node;
+			diag_cntl_client_port = port;
 			if (diag_cmd_server_port != 0) {
-				static const uint8_t f3[] = { 0x7d, 4, F3_SSID, 0, F3_SSID, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
+				static const uint8_t ranges[] = { 0x7d, 1 };
 
-				diag_command(diag_cmd_node, diag_cmd_server_port, f3, sizeof(f3));
-				tell("mpss: diag: the F3 mask for SSID %u sent as a command, after the handshake\n", F3_SSID);
+				diag_command(diag_cmd_node, diag_cmd_server_port, ranges, sizeof(ranges));
+				tell("mpss: diag: the modem's SSID ranges asked for (0x7d 1)\n");
 			}
 		}
 		if (id == 33 && len >= 8 && at + 8 + len <= length) {
@@ -5345,9 +5373,34 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 	}
 }
 
+static void diag_send_range_mask(uint16_t first, uint16_t last);
+
 static void
 diag_packet(const uint8_t *p, unsigned n)
 {
+	if (n >= 8 && p[0] == 0x7d && p[1] == 1) {
+		/* the modem's SSID ranges: 7d 01, status, reserved, a 32-bit count, then (first, last) 16 bits each */
+		uint32_t count = (uint32_t)(p[4] | p[5] << 8 | p[6] << 16 | (uint32_t)p[7] << 24);
+		bool sent = false;
+
+		tell("mpss: diag: the modem has %u SSID ranges (status %u)\n", count, p[2]);
+		for (uint32_t i = 0; i < count && 8 + 4 * (i + 1) <= n; i++) {
+			uint16_t first = (uint16_t)(p[8 + 4 * i] | p[9 + 4 * i] << 8), last = (uint16_t)(p[10 + 4 * i] | p[11 + 4 * i] << 8);
+
+			if (i < 12) {
+				tell("mpss: diag:   range %u: %u..%u\n", i, first, last);
+			}
+			if (!sent && first <= F3_SSID && F3_SSID <= last) {
+				diag_send_range_mask(first, last);
+				sent = true;
+			}
+		}
+		return;
+	}
+	if (n >= 2 && p[0] == 0x7d) {
+		tell("mpss: diag: a 0x7d reply, sub-command %u, %u bytes\n", p[1], n);
+		return;
+	}
 	if (n >= 17 && p[0] == 0x99) {
 		char line[160];
 		unsigned nargs = p[2] & 15, size = p[2] >> 4 ? p[2] >> 4 : 4, o;
