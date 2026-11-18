@@ -5374,6 +5374,26 @@ diag_cntl_receive(__unused void *context, uint32_t node, uint32_t port, const vo
 }
 
 static void diag_send_range_mask(uint16_t first, uint16_t last);
+static volatile bool diag_ranges_known;
+static unsigned diag_retries;
+static uint64_t diag_retry_at;
+
+/* (from the modem thread's loop: the version and range requests again every 10 s until the ranges come, 6 times) */
+static void
+diag_advance(void)
+{
+	static const uint8_t version[] = { 0x00 }, ranges[] = { 0x7d, 1 };
+
+	if (diag_cmd_port == NULL || diag_cmd_server_port == 0 || !diag_handshaken || diag_ranges_known || diag_retries >= 6 ||
+	    now_us() - diag_retry_at < 10000000ull) {
+		return;
+	}
+	diag_retry_at = now_us();
+	diag_retries++;
+	diag_command(diag_cmd_node, diag_cmd_server_port, version, sizeof(version));
+	diag_command(diag_cmd_node, diag_cmd_server_port, ranges, sizeof(ranges));
+	tell("mpss: diag: version and ranges asked again (%u)\n", diag_retries);
+}
 
 static void
 diag_packet(const uint8_t *p, unsigned n)
@@ -5383,6 +5403,7 @@ diag_packet(const uint8_t *p, unsigned n)
 		uint32_t count = (uint32_t)(p[4] | p[5] << 8 | p[6] << 16 | (uint32_t)p[7] << 24);
 		bool sent = false;
 
+		diag_ranges_known = true;
 		tell("mpss: diag: the modem has %u SSID ranges (status %u)\n", count, p[2]);
 		for (uint32_t i = 0; i < count && 8 + 4 * (i + 1) <= n; i++) {
 			uint16_t first = (uint16_t)(p[8 + 4 * i] | p[9 + 4 * i] << 8), last = (uint16_t)(p[10 + 4 * i] | p[11 + 4 * i] << 8);
@@ -5420,6 +5441,8 @@ diag_packet(const uint8_t *p, unsigned n)
 		if (!diag_f3_all || diag_f3_count <= 20 || diag_f3_count % 1000 == 0) {
 			tell("mpss: f3: %s (%u)\n", line, diag_f3_count);
 		}
+	} else if (n >= 1 && p[0] == 0x00) {
+		tell("mpss: diag: the modem's version reply (%u bytes)\n", n);
 	} else if (n > 24 && p[0] == 0x79) {
 		tell("mpss: f3 text: %.*s\n", (int)(n - 24 < 120 ? n - 24 : 120), (const char *)p + 24);
 	}
@@ -9273,6 +9296,7 @@ voice_advance(void)
 	uint64_t now = now_us();
 
 	imsa_advance();
+	diag_advance();
 	imss_advance();
 	ims_pdn_advance();
 	ll_advance();
