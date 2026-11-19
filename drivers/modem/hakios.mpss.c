@@ -8475,6 +8475,10 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, call_state, CTLFLAG_RD | CTLFLAG_LOCKED, &cal
     "the last call's state: 0 none, 1 dialling, 2 incoming, 3 talking, 5 ringing there, 9 ended");
 SYSCTL_STRING(_kern_hakios, OID_AUTO, call_number, CTLFLAG_RD | CTLFLAG_LOCKED, call_number, sizeof(call_number),
     "the last call's other party");
+/* what the ringing screen (userland calld) asks: 1 answer the incoming call, 2 end (decline or hang up) the call */
+static int call_action;
+SYSCTL_INT(_kern_hakios, OID_AUTO, call_action, CTLFLAG_RW | CTLFLAG_LOCKED, &call_action, 0,
+    "1: answer the incoming call, 2: end the call (taken, then set back to 0)");
 
 static const char *
 call_state_name(uint8_t s)
@@ -9688,7 +9692,25 @@ voice_advance(void)
 		return;
 	}
 	if (call_id == 0 || call_state_raw == 9 || call_hung) {
+		call_action = 0;
 		return;
+	}
+	if (call_action == 1 && call_state_raw == 2 && !call_answered) {
+		call_action = 0;
+		call_answered = 1;
+		tell("mpss: call: answering call %u (the screen's Answer)\n", call_id);
+		voice_call_ask(VOICE_ANSWER_CALL, 0x83, call_id);
+		return;
+	}
+	if (call_action == 2) {
+		call_action = 0;
+		call_hung = 1;
+		tell("mpss: call: ending call %u (the screen's %s)\n", call_id, call_state_raw == 2 ? "Decline" : "End");
+		voice_call_ask(VOICE_END_CALL, 0x84, call_id);
+		return;
+	}
+	if (call_action != 0 && !(call_action == 1 && call_state_raw == 2)) {
+		call_action = 0;
 	}
 	if (call_state_raw == 2 && call_answer && !call_answered && now - call_since_us > 4000000ull) {
 		call_answered = 1;
@@ -9696,7 +9718,8 @@ voice_advance(void)
 		voice_call_ask(VOICE_ANSWER_CALL, 0x83, call_id);
 		return;
 	}
-	if ((call_state_raw == 3 && now - call_since_us > (uint64_t)call_secs * 1000000ull) ||
+	/* (the timed hang-up only for test calls: auto-answered with call_answer=1, or dialled with call_to) */
+	if ((call_state_raw == 3 && (call_answer || call_to[0] != 0) && now - call_since_us > (uint64_t)call_secs * 1000000ull) ||
 	    ((call_state_raw == 1 || call_state_raw == 5) && call_direction == 1 && now - call_since_us > 60000000ull)) {
 		call_hung = 1;
 		tell("mpss: call: hanging up call %u (%s for %llu s)\n", call_id, call_state_name(call_state_raw),

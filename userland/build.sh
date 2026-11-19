@@ -264,6 +264,10 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -o obj/smsd src/smsd.c &&
 			{ ${LDID:-ldid} -Ssrc/smsd.entitlements obj/smsd 2>/dev/null ||
 			  echo "build.sh: no ldid: smsd is unsigned, and SpringBoard will not show its alerts"; }
+		# the 6T's ringing screen (src/calld.c): an incoming call's Answer/Decline alert, with the same entitlement
+		$DYN -framework CoreFoundation -framework AudioToolbox -o obj/calld src/calld.c &&
+			{ ${LDID:-ldid} -Ssrc/calld.entitlements obj/calld 2>/dev/null ||
+			  echo "build.sh: no ldid: calld is unsigned, and SpringBoard will not show its alerts"; }
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
 		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/battery_test.c &&
 			{ ${LDID:-ldid} -Ssrc/battery_test.entitlements obj/battery_test 2>/dev/null ||
@@ -404,6 +408,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
 	[ -f obj/gnssd ] && cp obj/gnssd root/bin/
 	[ -f obj/smsd ] && cp obj/smsd root/bin/
+	[ -f obj/calld ] && cp obj/calld root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
 	[ -f obj/wifipw_test ] && cp obj/wifipw_test root/bin/
@@ -517,7 +522,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	# fairplayd among them).
 	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
 	[ "${LOCATIOND-0}" != 0 ] && cp com.hakios.gnssd.plist root/LaunchDaemons/
-	[ "${MODEM-0}" != 0 ] && cp com.hakios.smsd.plist root/LaunchDaemons/
+	[ "${MODEM-0}" != 0 ] && cp com.hakios.smsd.plist com.hakios.calld.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $DARWIN/rootfs.slt ] && VOLUME="--root-volume $DARWIN/rootfs.slt"
 	[ -n "$DARWIN_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $DARWIN/rootfs root/LaunchDaemons $DARWIN_JOBS
