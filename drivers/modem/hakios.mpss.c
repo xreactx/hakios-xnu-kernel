@@ -208,6 +208,7 @@ settle(void)
 	__asm__ volatile ("dsb sy");
 }
 
+extern void hakios_voice_call(bool talking) __attribute__((weak));     /* drivers/audio/hakios.mic.c, if built */
 static bool
 option(const char *name)
 {
@@ -8580,6 +8581,10 @@ voice_receive(__unused void *context, __unused uint32_t node, __unused uint32_t 
 				}
 				call_id = c[0];
 				call_state_raw = c[1];
+				if (hakios_voice_call != NULL) {
+					/* the call's audio through the audio DSP (hakios.mic.c) while it talks (3) or is on hold (4) */
+					hakios_voice_call(c[1] == 3 || c[1] == 4);
+				}
 				call_direction = c[3];
 				call_since_us = now_us();
 				call_state = c[1];

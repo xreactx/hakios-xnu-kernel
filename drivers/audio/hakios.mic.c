@@ -1890,6 +1890,8 @@ mic_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+static void voice_thread(void *argument, wait_result_t result);
+
 void
 hakios_mic_dsp_up(void)
 {
@@ -1911,6 +1913,14 @@ hakios_mic_dsp_up(void)
 		say("mic: mic_wcd=1: the 6T's handset microphone, AMIC4 of the WCD934x, through SLIMBUS_0_TX\n");
 	}
 	mic_secs = mic_secs < 1 ? 1 : mic_secs > 600 ? 600 : mic_secs;
+	{
+		uint32_t voice = 1;
+
+		PE_parse_boot_argn("voice", &voice, sizeof(voice));
+		if (voice && wcd && kernel_thread_start(voice_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		}
+	}
 	running = true;
 	if (kernel_thread_start(mic_thread, NULL, &thread) != KERN_SUCCESS) {
 		running = false;
@@ -2429,5 +2439,197 @@ hakios_mic_dsp_down(void)
 		lck_mtx_lock(&mic_lock);
 		undo();
 		lck_mtx_unlock(&mic_lock);
+	}
+}
+
+/* ---- a call's voice: the DSP's voice services (Linux's q6voice.c, voc_start_voice_call) -------------------------- */
+
+/*
+ * A VoLTE call's audio (18 November): the modem's vocoder packets meet the DSP's voice session, which the application
+ * processor sets up -- Android's audio HAL for the 6T uses "VoiceMMode1" (VSID 0x11C05000) on SLIM_0_RX (the earpiece)
+ * and SLIM_0_TX (AMIC4, "handset-mic"). As q6voice.c does for a call that is not VoIP: MVM and CVS sessions created as
+ * passive ones under the VSID's name, the MVM's dual control on, a CVP session (vocproc) on the two AFE ports with no
+ * topology (no calibration here), enabled, attached to the MVM, the voice started. Stopped, detached and destroyed when
+ * the call ends; the MVM and CVS sessions kept for the next call. The modem's driver says when a call talks
+ * (hakios_voice_call()); voice=0 leaves all this alone.
+ */
+#define APR_SVC_MVM                             0x09
+#define APR_SVC_CVS                             0x0a
+#define APR_SVC_CVP                             0x0b
+#define VOICE_PORT                              1               /* our port (Linux: the session's index) */
+#define VSS_IVERSION_CMD_GET                    0x00011378u
+#define VSS_IVERSION_RSP_GET                    0x00011379u
+#define VSS_IMVM_CMD_CREATE_PASSIVE_CONTROL_SESSION 0x000110ffu
+#define VSS_ISTREAM_CMD_CREATE_PASSIVE_CONTROL_SESSION 0x00011140u
+#define VSS_IMVM_CMD_SET_POLICY_DUAL_CONTROL    0x00011327u
+#define VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2 0x000112bfu
+#define VSS_IVOCPROC_CMD_ENABLE                 0x000100c6u
+#define VSS_IVOCPROC_CMD_DISABLE                0x000110e1u
+#define VSS_IMVM_CMD_ATTACH_VOCPROC             0x0001123eu
+#define VSS_IMVM_CMD_DETACH_VOCPROC             0x0001123fu
+#define VSS_IMVM_CMD_START_VOICE                0x00011190u
+#define VSS_IMVM_CMD_STOP_VOICE                 0x00011192u
+#define APRV2_IBASIC_CMD_DESTROY_SESSION        0x0001003cu
+#define VSS_IVOCPROC_TOPOLOGY_ID_NONE           0x00010f70u
+#define VSS_ICOMMON_CAL_NETWORK_ID_NONE         0x0001135eu
+#define VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING 0x00010f7cu
+
+static volatile bool voice_wanted;
+static bool voice_running, voice_mic_ours;
+static uint16_t voice_mvm, voice_cvs, voice_cvp;
+
+void
+hakios_voice_call(bool talking)
+{
+	voice_wanted = talking;
+}
+
+/* One voice command, to the session TO (0: create one); true when the DSP says done; *handle: the answer's port. */
+static bool
+voice_ask(const char *what, uint8_t service, uint16_t to, uint32_t opcode, const void *payload, uint32_t length,
+    uint16_t *handle)
+{
+	struct hakios_apr_answer answer;
+
+	bzero(&answer, sizeof(answer));
+	if (!hakios_adsp_apr_to(service, VOICE_PORT, to, 0, opcode, payload, length, APR_WAIT_MS, &answer)) {
+		say("voice: %s (opcode %#x): NO ANSWER\n", what, opcode);
+		return false;
+	}
+	if (opcode == VSS_IVERSION_CMD_GET && answer.opcode == VSS_IVERSION_RSP_GET) {
+		char text[33];
+
+		memcpy(text, answer.words, 32);
+		text[32] = 0;
+		say("voice: the DSP's voice software (CVD): version \"%s\"\n", text);
+		return true;
+	}
+	if (answer.opcode == APR_BASIC_RSP_RESULT && answer.words[0] == opcode) {
+		if (answer.words[1] != 0) {
+			say("voice: %s: REFUSED: %s\n", what, dsp_error(answer.words[1]));
+			return false;
+		}
+		if (handle != NULL) {
+			*handle = answer.from_port;
+		}
+		say("voice: %s: done%s\n", what, handle != NULL ? "" : "");
+		return true;
+	}
+	say("voice: %s: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", what, answer.opcode, answer.length,
+	    answer.words[0], answer.words[1]);
+	return false;
+}
+
+static void
+voice_stop(void)
+{
+	if (voice_mvm != 0) {
+		(void)voice_ask("the voice, stopped", APR_SVC_MVM, voice_mvm, VSS_IMVM_CMD_STOP_VOICE, NULL, 0, NULL);
+	}
+	if (voice_cvp != 0) {
+		if (voice_mvm != 0) {
+			(void)voice_ask("the vocproc, detached", APR_SVC_MVM, voice_mvm, VSS_IMVM_CMD_DETACH_VOCPROC, &voice_cvp,
+			    sizeof(voice_cvp), NULL);
+		}
+		(void)voice_ask("the vocproc, disabled", APR_SVC_CVP, voice_cvp, VSS_IVOCPROC_CMD_DISABLE, NULL, 0, NULL);
+		(void)voice_ask("the vocproc, destroyed", APR_SVC_CVP, voice_cvp, APRV2_IBASIC_CMD_DESTROY_SESSION, NULL, 0, NULL);
+		voice_cvp = 0;
+	}
+	if (voice_mic_ours) {
+		uint16_t stop[2] = { 0x4001, 0 };
+
+		hakios_slim_mic(false);
+		(void)command("voice: the port 0x4001, stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
+		mic_port_on = false;
+		voice_mic_ours = false;
+	}
+	hakios_slim_earpiece(false);
+	voice_running = false;
+	say("voice: THE CALL'S VOICE IS OFF\n");
+}
+
+static bool
+voice_start(void)
+{
+	static bool asked_version;
+	struct {
+		uint16_t direction, tx_port;
+		uint32_t tx_topology;
+		uint16_t rx_port;
+		uint32_t rx_topology, profile, mode;
+		uint16_t ec_port;
+		char name[20];
+	} __attribute__((packed)) cvp = { 2, 0x4001, VSS_IVOCPROC_TOPOLOGY_ID_NONE, 0x4000, VSS_IVOCPROC_TOPOLOGY_ID_NONE,
+		                           VSS_ICOMMON_CAL_NETWORK_ID_NONE, VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING, 0xffff, "" };
+	char name[20] = "11C05000";             /* VoiceMMode1's VSID, as q6voice.c names its sessions */
+	uint8_t dual = 1;
+
+	voice_running = true;
+	if (!asked_version) {
+		asked_version = true;
+		(void)voice_ask("the version", APR_SVC_MVM, 0, VSS_IVERSION_CMD_GET, NULL, 0, NULL);
+	}
+	/* the ports: the earpiece's (0x4000, started at boot with sound_receiver=1) and the handset microphone's */
+	if (!hakios_slim_codec_ready(0)) {
+		say("voice: the codec is not up: no voice\n");
+		return false;
+	}
+	if (!mic_port_on && wcd) {
+		if (!dsp_port_on() || !hakios_slim_mic(true)) {
+			say("voice: the handset microphone's port could not be started\n");
+		} else {
+			voice_mic_ours = true;
+		}
+	}
+	if (!hakios_slim_earpiece(true)) {
+		say("voice: the earpiece's path could not be set up\n");
+	}
+	if (voice_mvm == 0 && !voice_ask("the MVM session \"11C05000\", created", APR_SVC_MVM, 0,
+	    VSS_IMVM_CMD_CREATE_PASSIVE_CONTROL_SESSION, name, sizeof(name), &voice_mvm)) {
+		return false;
+	}
+	if (voice_cvs == 0 && !voice_ask("the CVS session \"11C05000\", created", APR_SVC_CVS, 0,
+	    VSS_ISTREAM_CMD_CREATE_PASSIVE_CONTROL_SESSION, name, sizeof(name), &voice_cvs)) {
+		return false;
+	}
+	say("voice: MVM handle %u, CVS handle %u\n", voice_mvm, voice_cvs);
+	if (!voice_ask("dual control, on", APR_SVC_MVM, voice_mvm, VSS_IMVM_CMD_SET_POLICY_DUAL_CONTROL, &dual, sizeof(dual),
+	    NULL) ||
+	    !voice_ask("the vocproc (SLIMBUS_0_TX 0x4001 -> | -> SLIMBUS_0_RX 0x4000, no topology), created", APR_SVC_CVP, 0,
+	    VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2, &cvp, sizeof(cvp), &voice_cvp)) {
+		return false;
+	}
+	say("voice: CVP handle %u\n", voice_cvp);
+	if (!voice_ask("the vocproc, enabled", APR_SVC_CVP, voice_cvp, VSS_IVOCPROC_CMD_ENABLE, NULL, 0, NULL) ||
+	    !voice_ask("the vocproc, attached to the MVM", APR_SVC_MVM, voice_mvm, VSS_IMVM_CMD_ATTACH_VOCPROC, &voice_cvp,
+	    sizeof(voice_cvp), NULL) ||
+	    !voice_ask("the voice, started", APR_SVC_MVM, voice_mvm, VSS_IMVM_CMD_START_VOICE, NULL, 0, NULL)) {
+		return false;
+	}
+	say("voice: THE CALL'S VOICE IS ON: the modem <-> MVM \"11C05000\" <-> vocproc <-> earpiece and handset microphone\n");
+	return true;
+}
+
+static void
+voice_thread(__unused void *argument, __unused wait_result_t result)
+{
+	while (!stopping) {
+		if (voice_wanted && !voice_running) {
+			lck_mtx_lock(&mic_lock);
+			if (!voice_start()) {
+				say("voice: the call's voice could not be started: undone\n");
+				voice_stop();
+				voice_running = true;           /* not tried again for this call */
+			}
+			lck_mtx_unlock(&mic_lock);
+		} else if (!voice_wanted && voice_running) {
+			lck_mtx_lock(&mic_lock);
+			voice_stop();
+			lck_mtx_unlock(&mic_lock);
+		}
+		sleep_ms(50);
+	}
+	if (voice_running) {
+		voice_stop();
 	}
 }

@@ -128,13 +128,18 @@ void hakios_audio_record_fed(const int16_t *frames, uint32_t count);
 struct hakios_apr_answer {
 	uint32_t opcode, token, length;         /* length: of the payload, in bytes */
 	uint32_t words[64];
+	uint16_t from_port;                     /* the answering service's port (a voice session's handle) */
 };
 typedef bool (*hakios_apr_events_t)(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload,
     uint32_t length);
 
 bool hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
     uint32_t wait_ms, struct hakios_apr_answer *answer);
+bool hakios_adsp_apr_to(uint8_t service, uint16_t from_port, uint16_t to_port, uint32_t token, uint32_t opcode,
+    const void *payload, uint32_t length, uint32_t wait_ms, struct hakios_apr_answer *answer);
 void hakios_adsp_apr_events(hakios_apr_events_t handler);
+/* a call's voice through the DSP (hakios.mic.c): talking = a call is connected (the modem's driver says) */
+void hakios_voice_call(bool talking);
 const uint8_t *hakios_adsp_fw_file(const char *name, uint64_t *size);        /* /fw/name, read whole; give back with: */
 void hakios_adsp_fw_free(const uint8_t *data, uint64_t size);
 

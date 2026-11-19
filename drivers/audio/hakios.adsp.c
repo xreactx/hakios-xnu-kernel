@@ -2973,6 +2973,7 @@ struct apr_header {
 static struct {
 	uint32_t opcode, token, length;
 	uint32_t words[64];
+	uint16_t from_port;                     /* the answering service's port: a new voice session's handle */
 	volatile bool there;
 } apr_answer;
 static uint32_t apr_in, apr_out, apr_next_token = 1;
@@ -3034,9 +3035,14 @@ apr_input(const uint8_t *data, uint32_t length)
 		    "%#x %#x\n", header.from_service, header.from_domain, header.from_port, header.to_service, header.to_domain,
 		    header.to_port, header.opcode, header.token, payload, w[0], w[1], w[2], w[3]);
 	}
+	if (header.opcode == 0x000100beu && header.token == apr_waited_for && apr_waited_for != 0) {
+		/* APR_RSP_ACCEPTED: the command taken, its result to follow with the same token (the voice services) */
+		return;
+	}
 	bzero(apr_answer.words, sizeof(apr_answer.words));
 	memcpy(apr_answer.words, data + header_length, payload < sizeof(apr_answer.words) ? payload : sizeof(apr_answer.words));
 	apr_answer.length = payload;
+	apr_answer.from_port = header.from_port;
 	apr_answer.opcode = header.opcode;
 	apr_answer.token = header.token;
 	/* (released: the thread that waits must not see "there" before the words and the token above, as with battmgr's answers) */
@@ -3052,6 +3058,14 @@ bool
 hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
     uint32_t ms, struct hakios_apr_answer *answer)
 {
+	return hakios_adsp_apr_to(service, port, port, token, opcode, payload, length, ms, answer);
+}
+
+/* As hakios_adsp_apr(), from our port FROM to the service's port TO (the voice services: TO a session's handle, 0 to create one). */
+bool
+hakios_adsp_apr_to(uint8_t service, uint16_t from, uint16_t port, uint32_t token, uint32_t opcode, const void *payload,
+    uint32_t length, uint32_t ms, struct hakios_apr_answer *answer)
+{
 	uint8_t packet[sizeof(struct apr_header) + 256];
 	struct apr_header *header = (struct apr_header *)packet;
 	bool answered = false;
@@ -3065,7 +3079,7 @@ hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode,
 	header->size = (uint16_t)(sizeof(*header) + length);
 	header->from_service = service;
 	header->from_domain = APR_DOMAIN_APPS;
-	header->from_port = port;
+	header->from_port = from;
 	header->to_service = service;
 	header->to_domain = APR_DOMAIN_ADSP;
 	header->to_port = port;
@@ -3102,6 +3116,7 @@ hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode,
 					answer->opcode = apr_answer.opcode;
 					answer->token = apr_answer.token;
 					answer->length = apr_answer.length;
+					answer->from_port = apr_answer.from_port;
 					memcpy(answer->words, apr_answer.words, sizeof(answer->words));
 				}
 				break;
