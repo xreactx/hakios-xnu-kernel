@@ -216,6 +216,16 @@ option(const char *name)
 	return PE_parse_boot_argn(name, &value, sizeof(value)) && value != 0;
 }
 
+/* On unless NAME=0 (VoLTE's pieces since 18 November: dcm, imsrtp, ims_plain -- the command line has no room for them). */
+static bool
+option_on(const char *name)
+{
+	uint32_t value = 1;
+
+	PE_parse_boot_argn(name, &value, sizeof(value));
+	return value != 0;
+}
+
 /* ---- register access (as in hakios.wifi.c) ------------------------------------------------------- */
 
 static uint32_t __attribute__((noinline))
@@ -5721,7 +5731,7 @@ rmtfs_start(void)
 			our_servers[3].instance = 0x101;
 			our_servers[3].port = ipa_host_port->number;
 		}
-		if (dcm_port == NULL && option("dcm")) {
+		if (dcm_port == NULL && option_on("dcm")) {
 			dcm_port = qrtr_open(dcm_receive, NULL, NULL);
 			if (dcm_port != NULL) {
 				our_servers[4].service = DCM_SERVICE;
@@ -5746,7 +5756,7 @@ rmtfs_start(void)
 				    diag_cntl_port->number, diag_data_port->number);
 			}
 		}
-		if (imsrtp_port == NULL && option("imsrtp")) {
+		if (imsrtp_port == NULL && option_on("imsrtp")) {
 			imsrtp_port = qrtr_open(imsrtp_receive, NULL, NULL);
 			if (imsrtp_port != NULL) {
 				our_servers[5].service = IMSRTP_SERVICE;
@@ -8563,7 +8573,8 @@ voice_receive(__unused void *context, __unused uint32_t node, __unused uint32_t 
 				}
 			}
 			if (c[0] != call_id || c[1] != call_state_raw) {
-				if (c[0] != call_id) {
+				if (c[0] != call_id || c[1] == 2) {
+					/* a new call -- or the same id coming in again after an end (VoLTE reuses id 1) */
 					call_hung = 0;
 					call_answered = 0;
 				}
@@ -8581,9 +8592,13 @@ voice_receive(__unused void *context, __unused uint32_t node, __unused uint32_t 
 			}
 		}
 	}
-	/* TLV 0x20 the end reasons: count, then per call: id, reason (16 bits) */
-	if ((v = qmi_tlv(m, length, 0x20, &size)) != NULL && size >= 4) {
+	/* the end reasons: count, then per call: id, reason (16 bits) -- TLV 0x14 (a VoLTE call, 18 November: 25, release
+	 * normal), 0x20 seen before; TLV 0x33 per call id, a 16-bit SIP code (200 there) */
+	if (((v = qmi_tlv(m, length, 0x14, &size)) != NULL || (v = qmi_tlv(m, length, 0x20, &size)) != NULL) && size >= 4) {
 		tell("mpss: call: call %u ended, reason %u\n", v[1], v[2] | v[3] << 8);
+	}
+	if ((v = qmi_tlv(m, length, 0x33, &size)) != NULL && size >= 4) {
+		tell("mpss: call: call %u, SIP code %u\n", v[1], v[2] | v[3] << 8);
 	}
 }
 
@@ -9479,13 +9494,13 @@ ims_pdn_advance(void)
 		static int said = -1;
 		int why = (ims_pdn_port == NULL) | (ims_pdn_port_number == 0) << 1 | (!nas.state.registered) << 2 | (!ims_pdn_wanted) << 3;
 
-		if (why != said && (ims_pdn_wanted || option("dcm"))) {
+		if (why != said && (ims_pdn_wanted || option_on("dcm"))) {
 			said = why;
 			tell("mpss: ims pdn: waiting for:%s%s%s%s%s (step %d)\n", why & 1 ? " a port" : "", why & 2 ? " the WDS server" : "",
 			    why & 4 ? " registration" : "", why & 8 ? " a request" : "", why ? "" : " nothing", ims_pdn_step);
 		}
 	}
-	if (ims_pdn_port == NULL || ims_pdn_port_number == 0 || !(ims_pdn_wanted || option("dcm"))) {
+	if (ims_pdn_port == NULL || ims_pdn_port_number == 0 || !(ims_pdn_wanted || option_on("dcm"))) {
 		return;
 	}
 	/* (bound and its family set before registration: once the modem asks -- right as it registers -- only the start is left;
@@ -9538,7 +9553,7 @@ ims_pdn_advance(void)
 			qrtr_send(ims_pdn_port, ims_pdn_node, ims_pdn_port_number, q, 7 + 10);
 			return;
 		}
-		if (option("ims_plain")) {
+		if (option_on("ims_plain")) {
 			/*
 			 * (as dsi_netctrl's route lookup shows it on Android: "tpref 0 xt_t_pref 0", by profile, not APN type: the
 			 * modem bridges its own EPC call -- the one that answers 236, call already present -- to this 3GPP one)
@@ -9597,19 +9612,19 @@ voice_open(void)
 	}
 	PE_parse_boot_argn("volte", &volte_wanted, sizeof(volte_wanted));
 	PE_parse_boot_argn("ims_pdn", &ims_pdn_wanted, sizeof(ims_pdn_wanted));
-	if (option("dcm") || option("profiles")) {
+	if (option_on("dcm") || option("profiles")) {
 		prof_port = qrtr_open(prof_receive, prof_server, NULL);
 		if (prof_port != NULL) {
 			qrtr_lookup(prof_port, QMI_WDS, 0, 0);
 		}
 	}
-	if (option("dcm") && !option("dcm_noll")) {
+	if (option_on("dcm") && !option("dcm_noll")) {
 		ll_port = qrtr_open(ll_receive, ll_server, NULL);
 		if (ll_port != NULL) {
 			qrtr_lookup(ll_port, QMI_WDS, 0, 0);
 		}
 	}
-	if (ims_pdn_wanted || option("dcm")) {
+	if (ims_pdn_wanted || option_on("dcm")) {
 		ims_pdn_family = ims_pdn_wanted == 4 ? 4 : 6;  /* (ims_pdn=4: IPv4; with dcm=1 the modem asks for it) */
 		ims_pdn_port = qrtr_open(ims_pdn_receive, ims_pdn_server, NULL);
 		if (ims_pdn_port != NULL) {
