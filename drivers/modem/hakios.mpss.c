@@ -5078,6 +5078,7 @@ static void sms_hex(const char *what, const uint8_t *p, unsigned n);
  * the cookie, TLV 0x11 {IP family, the address as text}; TLV 0x12 (a cause) only when it failed.
  */
 static uint32_t dcm_node, dcm_client_port;
+static uint32_t dcm_instance;                   /* the activate request's TLV 0x13: the IMS instance, given back in the indication */
 static volatile int dcm_pending;                /* a PDP activate waits for the IMS connection */
 static uint32_t dcm_cookie;
 static int dcm_cookie_valid, dcm_family = 1;
@@ -5124,6 +5125,9 @@ dcm_pdp_activate(uint32_t node, uint32_t port, const uint8_t *m, unsigned length
 		r[o++] = (uint8_t)dcm_cookie; r[o++] = (uint8_t)(dcm_cookie >> 8); r[o++] = (uint8_t)(dcm_cookie >> 16);
 		r[o++] = (uint8_t)(dcm_cookie >> 24);
 	}
+	if ((v = qmi_tlv(m, length, 0x13, &size)) != NULL && size >= 4) {
+		dcm_instance = (uint32_t)(v[0] | v[1] << 8 | v[2] << 16 | (uint32_t)v[3] << 24);
+	}
 	if ((v = qmi_tlv(m, length, 0x13, &size)) != NULL && size >= 4 && !option("dcm_old")) {
 		r[o++] = 0x12; r[o++] = 4; r[o++] = 0;
 		memcpy(r + o, v, 4);
@@ -5140,10 +5144,16 @@ dcm_pdp_activate(uint32_t node, uint32_t port, const uint8_t *m, unsigned length
 static void
 dcm_pdp_up(const uint8_t *address, unsigned n)
 {
-	uint8_t q[7 + 7 + 4 + 7 + 3 + 4 + 1 + 48];
+	uint8_t q[7 + 7 + 4 + 7 + 3 + 4 + 1 + 48 + 7];
 	char text[48];
-	/* (the address's family is the daemon's own, not the request's: 1 IPv4, 2 IPv6 -- its handler maps 0 -> 1, 1 -> 2) */
-	unsigned at = 7, t = 0, family = n == 16 ? 2 : 1;
+	/*
+	 * The family is the request's own: 0 IPv4, 1 IPv6. (The daemon keeps 1/2 inside, CS_IPV4/CS_IPV6, but its
+	 * ProcessCSIndication writes 0 or 1 into the indication -- imsdatadaemon 0x1eb94/0x1ec14. Run 213728 sent 2: the
+	 * modem took the indication and its IMS never registered.) dcm_ind_family=N overrides.
+	 */
+	unsigned at = 7, t = 0, family = n == 16 ? 1 : 0;
+
+	PE_parse_boot_argn("dcm_ind_family", &family, sizeof(family));
 
 	if (!dcm_pending || dcm_port == NULL) {
 		return;
@@ -5170,8 +5180,15 @@ dcm_pdp_up(const uint8_t *address, unsigned n)
 	q[at++] = (uint8_t)t;
 	memcpy(q + at, text, t);
 	at += t;
+	if (dcm_instance != 0) {
+		/* TLV 0x12: the instance (imsdatadaemon: "eCS_ENETISCONN Instance Id %d", sent when not 0) */
+		q[at++] = 0x12; q[at++] = 4; q[at++] = 0;
+		q[at++] = (uint8_t)dcm_instance; q[at++] = (uint8_t)(dcm_instance >> 8); q[at++] = (uint8_t)(dcm_instance >> 16);
+		q[at++] = (uint8_t)(dcm_instance >> 24);
+	}
 	q[5] = (uint8_t)(at - 7); q[6] = 0;
-	tell("mpss: dcm: PDP ACTIVATED told to the modem: PDP 1, cookie %u, address %s (family %u)\n", dcm_cookie, text, family);
+	tell("mpss: dcm: PDP ACTIVATED told to the modem: PDP 1, cookie %u, address %s (family %u), instance %u\n", dcm_cookie, text,
+	    family, dcm_instance);
 	qrtr_send(dcm_port, dcm_node, dcm_client_port, q, at);
 	{
 		/* the app state the modem registered for (0x2e): indication 0x2f, TLV 0x10 = 0 ("criteria met", imsdatadaemon) */
@@ -8596,6 +8613,7 @@ voice_server(__unused void *context, bool arrived, uint32_t service, __unused ui
 #define IMSA_GET_REGISTRATION   0x0020
 #define IMSA_GET_SERVICES       0x0021
 #define IMSA_BIND               0x0033
+#define IMSA_IND_REG            0x0022
 
 static struct hakios_qrtr_port *imsa_port;
 static uint32_t imsa_node, imsa_port_number;
@@ -8610,12 +8628,22 @@ imsa_receive(__unused void *context, __unused uint32_t node, __unused uint32_t p
 	uint16_t size, result = 0xffff, error = 0xffff;
 	int registered = -1, status = -1, code = -1, key;
 
+	if (length >= 7 && m[0] == 4 /* an indication */) {
+		/* every IMSA indication (registered for with 0x22 below): 0x23 registration, 0x24 services, 0x26 PDP status ... */
+		tell("mpss: ims: indication %#x (%u bytes)\n", m[3] | m[4] << 8, (unsigned)length);
+		sms_hex("ims ind", m, (unsigned)(length > 160 ? 160 : length));
+		return;
+	}
 	if (length < 7 || m[0] != QMI_RESPONSE) {
 		return;
 	}
 	if ((v = qmi_tlv(m, length, 0x02, &size)) != NULL && size >= 4) {
 		result = (uint16_t)(v[0] | v[1] << 8);
 		error = (uint16_t)(v[2] | v[3] << 8);
+	}
+	if ((m[3] | m[4] << 8) == IMSA_IND_REG) {
+		tell("mpss: ims: indications registered for: result %u, error %u\n", result, error);
+		return;
 	}
 	if ((m[3] | m[4] << 8) == IMSA_BIND) {
 		tell("mpss: ims: bound to the primary subscription: result %u, error %u\n", result, error);
@@ -8700,7 +8728,17 @@ imsa_advance(void)
 		qrtr_send(imsa_port, imsa_node, imsa_port_number, bind, sizeof(bind));
 		return;
 	}
-	if (imsa_bound != 2 || now_us() - imsa_asked_us < 10000000ull) {
+	if (imsa_bound == 2 && !option("imsa_noind")) {
+		/* Indication Register (0x22): TLVs 0x10-0x19, one byte each, all on (libqmiservices' IMSA IDL) */
+		uint8_t reg[7 + 40] = { QMI_REQUEST, 0x93, 0, IMSA_IND_REG & 0xff, IMSA_IND_REG >> 8, 40, 0 };
+
+		for (unsigned i = 0; i < 10; i++) {
+			reg[7 + 4 * i] = (uint8_t)(0x10 + i); reg[8 + 4 * i] = 1; reg[9 + 4 * i] = 0; reg[10 + 4 * i] = 1;
+		}
+		imsa_bound = 3;
+		qrtr_send(imsa_port, imsa_node, imsa_port_number, reg, sizeof(reg));
+	}
+	if (imsa_bound < 2 || now_us() - imsa_asked_us < 10000000ull) {
 		return;
 	}
 	imsa_asked_us = now_us();
