@@ -268,6 +268,12 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework AudioToolbox -o obj/calld src/calld.c &&
 			{ ${LDID:-ldid} -Ssrc/calld.entitlements obj/calld 2>/dev/null ||
 			  echo "build.sh: no ldid: calld is unsigned, and SpringBoard will not show its alerts"; }
+		# the 6T's dialer, an application (src/PhonePad.m, PhonePad/): the number goes to kern.hakios.call_dial
+		rm -rf obj/PhonePad.app && mkdir -p obj/PhonePad.app &&
+		$DYN -fobjc-arc -miphoneos-version-min=16.0 -framework UIKit -framework Foundation -o obj/PhonePad.app/PhonePad \
+			src/PhonePad.m && cp PhonePad/Info.plist PhonePad/*.png obj/PhonePad.app/ &&
+			{ ${LDID:-ldid} -Ssrc/PhonePad.entitlements obj/PhonePad.app/PhonePad 2>/dev/null ||
+			  echo "build.sh: no ldid: PhonePad is unsigned, and SpringBoard will not launch it"; }
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
 		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/battery_test.c &&
 			{ ${LDID:-ldid} -Ssrc/battery_test.entitlements obj/battery_test 2>/dev/null ||
@@ -815,6 +821,8 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 		mv sysroot/private/var/staged_system_apps/* sysroot/Applications/
 		rm -rf sysroot/private/var
 	fi
+	# the 6T's dialer (src/PhonePad.m): a system application, so LaunchServices finds it when it walks /Applications
+	[ "${MODEM-0}" != 0 ] && [ -d obj/PhonePad.app ] && cp -a obj/PhonePad.app sysroot/Applications/
 	mv sysroot/sbin/launchd sysroot/sbin/launchd.darwin
 	cp obj/stage0 sysroot/sbin/launchd
 	# the applications' frame rate: on a phone CoreAnimation holds every process to 60 frames a second unless its

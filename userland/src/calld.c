@@ -6,7 +6,8 @@
  * and kern.hakios.call_number. CommCenter and the Phone app do not run here (CommCenter speaks Apple's baseband
  * protocol), so an incoming call is shown as an alert through CFUserNotification (SpringBoard's SBUserNotification,
  * signed with com.apple.springboard.CFUserNotification: src/calld.entitlements), with Answer and Decline, while a
- * ringtone plays; once answered, an alert with End stays up for the call. What is pressed goes back to the kernel
+ * ringtone plays; once answered, an alert with End stays up for the call. A call made from the dialer (src/PhonePad.m,
+ * through kern.hakios.call_dial) is shown as "Calling..." with End while it rings at the other end. What is pressed goes back to the kernel
  * through kern.hakios.call_action (1 answer, 2 end); the kernel then has the modem answer or end the call, and the
  * call's audio goes through the audio DSP (drivers/audio/hakios.mic.c). An alert is taken down when the call ends on
  * its own (the other side hangs up).
@@ -237,6 +238,43 @@ talking(void)
 	}
 }
 
+/* An outgoing call's alert while it is dialled and rings there, until End is pressed or it is answered or ends. */
+static void
+outgoing(void)
+{
+	char number[64];
+	UserNotificationRef n;
+	int ok = 1;
+
+	call_number(number, sizeof(number));
+	printf("calld: calling %s\n", number);
+	n = alert("Calling...", number, CFSTR("End"), NULL);
+	for (;;) {
+		CFOptionFlags response = 0;
+		int state;
+
+		if (n != NULL && notification_response(n, 0.25, &response) == 0) {
+			printf("calld: End pressed while calling\n");
+			call_action(2);
+			break;
+		}
+		if (n == NULL) {
+			usleep(250000);
+		}
+		state = call_state(&ok);
+		if (state != 1 && state != 5) {
+			printf("calld: the outgoing call is %s (state %d)\n", state == 3 ? "answered" : "over", state);
+			if (n != NULL) {
+				notification_cancel(n);
+			}
+			break;
+		}
+	}
+	if (n != NULL) {
+		CFRelease(n);
+	}
+}
+
 int
 main(void)
 {
@@ -254,6 +292,10 @@ main(void)
 
 		if (state == 2 && last != 2) {
 			incoming();
+			state = call_state(&ok);
+		}
+		if ((state == 1 || state == 5) && last != 1 && last != 5) {
+			outgoing();
 			state = call_state(&ok);
 		}
 		if ((state == 3 || state == 4) && last != 3 && last != 4) {

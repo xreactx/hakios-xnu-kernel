@@ -8475,6 +8475,37 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, call_state, CTLFLAG_RD | CTLFLAG_LOCKED, &cal
     "the last call's state: 0 none, 1 dialling, 2 incoming, 3 talking, 5 ringing there, 9 ended");
 SYSCTL_STRING(_kern_hakios, OID_AUTO, call_number, CTLFLAG_RD | CTLFLAG_LOCKED, call_number, sizeof(call_number),
     "the last call's other party");
+/* a number to dial, from the dialer (userland Phone Pad, as user mobile): digits, '+', '*', '#'; dialled once no call is up */
+static char call_dial_number[24];
+static volatile int call_dial_wanted;
+
+static int
+call_dial_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	char number[sizeof(call_dial_number)];
+	int error;
+
+	strlcpy(number, call_dial_number, sizeof(number));
+	error = sysctl_handle_string(oidp, number, sizeof(number), req);
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (number[0] == 0) {
+		return EINVAL;
+	}
+	for (const char *c = number; *c != 0; c++) {
+		if (!((*c >= '0' && *c <= '9') || *c == '+' || *c == '*' || *c == '#')) {
+			return EINVAL;
+		}
+	}
+	strlcpy(call_dial_number, number, sizeof(call_dial_number));
+	call_dial_wanted = 1;
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, call_dial, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    call_dial_sysctl, "A", "a number to dial (written: dialled when no call is up)");
+
 /* what the ringing screen (userland calld) asks: 1 answer the incoming call, 2 end (decline or hang up) the call */
 static int call_action;
 SYSCTL_INT(_kern_hakios, OID_AUTO, call_action, CTLFLAG_RW | CTLFLAG_LOCKED, &call_action, 0,
@@ -8533,7 +8564,7 @@ voice_receive(__unused void *context, __unused uint32_t node, __unused uint32_t 
 			    result == 0 ? " -- READY FOR CALLS" : "");
 			break;
 		case VOICE_DIAL_CALL:
-			tell("mpss: call: DIAL %s: result %u, error %u\n", call_to, result, error);
+			tell("mpss: call: DIAL %s: result %u, error %u\n", call_number, result, error);
 			if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 1) {
 				tell("mpss: call: the call's id %u\n", v[0]);
 			}
@@ -8578,8 +8609,8 @@ voice_receive(__unused void *context, __unused uint32_t node, __unused uint32_t 
 				}
 			}
 			if (c[0] != call_id || c[1] != call_state_raw) {
-				if (c[0] != call_id || c[1] == 2) {
-					/* a new call -- or the same id coming in again after an end (VoLTE reuses id 1) */
+				if (c[0] != call_id || c[1] == 2 || c[1] == 1) {
+					/* a new call -- or the same id coming in or going out again after an end (VoLTE reuses id 1) */
 					call_hung = 0;
 					call_answered = 0;
 				}
@@ -9688,6 +9719,18 @@ voice_advance(void)
 		t[0] = 0x01; t[1] = (uint8_t)n; t[2] = 0;
 		memcpy(t + 3, call_to, n);
 		tell("mpss: call: dialling %s\n", call_to);
+		voice_request(VOICE_DIAL_CALL, 0x82, t, 3 + n);
+		return;
+	}
+	if (call_dial_wanted && (call_id == 0 || call_state_raw == 9)) {
+		uint8_t t[3 + 24];
+		unsigned n = (unsigned)strlen(call_dial_number);
+
+		call_dial_wanted = 0;
+		t[0] = 0x01; t[1] = (uint8_t)n; t[2] = 0;
+		memcpy(t + 3, call_dial_number, n);
+		strlcpy(call_number, call_dial_number, sizeof(call_number));
+		tell("mpss: call: dialling %s (the dialer)\n", call_dial_number);
 		voice_request(VOICE_DIAL_CALL, 0x82, t, 3 + n);
 		return;
 	}

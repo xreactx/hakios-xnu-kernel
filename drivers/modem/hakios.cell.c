@@ -541,10 +541,26 @@ cell_receive(uint8_t mux, const uint8_t *packet, size_t length)
 		ims_router_advertisement(packet, length);
 	}
 	if (mux == IMS_PDN_MUX || mux == IMS_LL_MUX) {
-		if (hakios_ims_bridge) {
+		/*
+		 * (Forwarding between the IMS connection and the modem's own link is off unless ims_forward=1: with the plain
+		 * LTE connection the modem's IMS carries its SIP itself, and every run in which the bridge forwarded a packet
+		 * -- the network's TCP from 5060, before registration -- went back to the loader at once: 230418, 233520.)
+		 */
+		static int forward = -1;
+
+		if (forward < 0) {
+			uint32_t v = 0;
+
+			PE_parse_boot_argn("ims_forward", &v, sizeof(v));
+			forward = v != 0;
+		}
+		if (hakios_ims_bridge && forward) {
 			ims_bridge(mux, packet, length);
+		} else if (mux == IMS_PDN_MUX && length > 40 + 16 && packet[0] >> 4 == 6 && packet[6] == 58 && packet[40] == 134) {
+			/* (router advertisements: read above, for the prefix) */
 		} else if (ims_bridge_dropped++ < 8) {
-			printf("cell: %zu bytes on mux %u before the IMS bridge is up: dropped\n", length, mux);
+			printf("cell: %zu bytes on mux %u not forwarded (IPv%u, next header %u)\n", length, mux,
+			    length ? packet[0] >> 4 : 0, length >= 40 ? packet[6] : 0);
 		}
 		return;
 	}
