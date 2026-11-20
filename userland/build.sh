@@ -262,7 +262,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			  echo "build.sh: no ldid: gnssd is unsigned, and locationd will not take its fixes"; }
 		# the 6T's received texts shown as alerts (src/smsd.c)
 		# (SpringBoard shows a CFUserNotification only for the entitlement com.apple.springboard.CFUserNotification)
-		$DYN -fobjc-arc -framework CoreFoundation -framework Foundation -framework Contacts -o obj/smsd src/smsd.c src/calld_contacts.m &&
+		$DYN -fobjc-arc -framework CoreFoundation -framework Foundation -framework Contacts -o obj/smsd src/smsd.c src/mms.c src/calld_contacts.m &&
 			{ ${LDID:-ldid} -Ssrc/smsd.entitlements obj/smsd 2>/dev/null ||
 			  echo "build.sh: no ldid: smsd is unsigned, and SpringBoard will not show its alerts"; }
 		# the 6T's ringing screen (src/calld.c): an incoming call's Answer/Decline alert, with the same entitlement

@@ -198,14 +198,59 @@ when_text(NSDate *when)
 	return self;
 }
 
+/* a text's body: its pictures (MMS: lines "\001IMG:PATH", smsd's) shown in it, at most 220 points wide */
+static NSAttributedString *
+body_with_pictures(NSString *body, UIColor *color)
+{
+	NSMutableAttributedString *out = [NSMutableAttributedString new];
+	NSDictionary *style = @{ NSFontAttributeName: [UIFont systemFontOfSize:17], NSForegroundColorAttributeName: color };
+	NSArray<NSString *> *lines = [body componentsSeparatedByString:@"\n"];
+
+	for (NSUInteger i = 0; i < lines.count; i++) {
+		NSString *line = lines[i];
+
+		if (i > 0) {
+			[out appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:style]];
+		}
+		if ([line hasPrefix:@"\001IMG:"]) {
+			UIImage *image = [UIImage imageWithContentsOfFile:[line substringFromIndex:5]];
+
+			if (image != nil) {
+				NSTextAttachment *a = [NSTextAttachment new];
+				CGFloat w = MIN(220, image.size.width), h = image.size.width > 0 ? w * image.size.height / image.size.width : 0;
+
+				a.image = image;
+				a.bounds = CGRectMake(0, 0, w, h);
+				[out appendAttributedString:[NSAttributedString attributedStringWithAttachment:a]];
+			} else {
+				[out appendAttributedString:[[NSAttributedString alloc] initWithString:@"[Picture]" attributes:style]];
+			}
+		} else {
+			[out appendAttributedString:[[NSAttributedString alloc] initWithString:line attributes:style]];
+		}
+	}
+	return out;
+}
+
+/* a text's body as one line of plain text (the conversations' list, a picture said) */
+static NSString *
+body_plain(NSString *body)
+{
+	NSMutableArray *parts = [NSMutableArray array];
+
+	for (NSString *line in [body componentsSeparatedByString:@"\n"]) {
+		[parts addObject:[line hasPrefix:@"\001IMG:"] ? @"[Picture]" : line];
+	}
+	return [parts componentsJoinedByString:@" "];
+}
+
 - (void)show:(Text *)t
 {
 	BOOL mine = ![t.kind isEqualToString:@"in"];
 
-	self.body.text = t.body;
+	self.body.attributedText = body_with_pictures(t.body, mine ? UIColor.whiteColor : UIColor.labelColor);
 	self.back.backgroundColor = [t.kind isEqualToString:@"failed"] ? UIColor.systemRedColor :
 	    mine ? UIColor.systemGreenColor : UIColor.systemGray5Color;
-	self.body.textColor = mine ? UIColor.whiteColor : UIColor.labelColor;
 	self.note.text = [t.kind isEqualToString:@"failed"] ? @"Not sent" : [t.kind isEqualToString:@"sending"] ? @"Sending..." :
 	    when_text(t.when);
 	self.note.textAlignment = mine ? NSTextAlignmentRight : NSTextAlignmentLeft;
@@ -510,8 +555,7 @@ when_text(NSDate *when)
 	t = self.latest[(NSUInteger)indexPath.row];
 	cell.textLabel.text = [self nameOf:t.number];
 	cell.textLabel.textColor = UIColor.labelColor;
-	cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@", when_text(t.when),
-	    [t.body stringByReplacingOccurrencesOfString:@"\n" withString:@" "]];
+	cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@", when_text(t.when), body_plain(t.body)];
 	cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 	return cell;
 }

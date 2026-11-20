@@ -93,17 +93,19 @@ keep(const char *from, const char *text)
 
 /*
  * A data message (the kernel's "\001DATA:" and hex): on this phone an MMS notification -- a WAP push from the carrier
- * (from a number of its own) saying a picture or long message waits on its MMS server. Its sender is in it, as
- * "+NUMBER/TYPE=PLMN"; MMS itself (fetched over a data connection of its own) is not done here, so it is said so.
- * 1 when it was one (and taken care of).
+ * (from a number of its own) saying a picture or long message waits on its MMS server. It is fetched and unpacked
+ * (src/mms.c): its text, and its pictures as "\001IMG:PATH" lines; the sender is the one inside it. When it cannot be
+ * fetched, it is said so. 1 when it was one (and taken care of).
  */
+extern int mms_fetch(const unsigned char *push, size_t n, char *from, size_t from_size, char *text, size_t text_size);
+
 static int
 data_message(char *from, const char **text)
 {
-	static char said[96];
+	static char said[TEXT_BYTES];
 	unsigned char bytes[2048];
 	size_t n = 0;
-	const char *hex = *text + 6, *plmn;
+	const char *hex = *text + 6;
 
 	if (strncmp(*text, "\001DATA:", 6) != 0) {
 		return 0;
@@ -118,21 +120,10 @@ data_message(char *from, const char **text)
 		hex += 2;
 	}
 	bytes[n] = 0;
-	plmn = (const char *)memmem(bytes, n, "/TYPE=PLMN", 10);
-	if (plmn != NULL) {
-		const char *start = plmn;
-
-		while (start > (const char *)bytes && ((start[-1] >= '0' && start[-1] <= '9') || start[-1] == '+')) {
-			start--;
-		}
-		if (plmn - start >= 3 && (size_t)(plmn - start) < 24) {
-			memcpy(from, start, (size_t)(plmn - start));
-			from[plmn - start] = 0;
-		}
+	printf("smsd: a data message of %zu bytes\n", n);
+	if (!mms_fetch(bytes, n, from, 24, said, sizeof(said))) {
+		snprintf(said, sizeof(said), "[A picture or long message (MMS) that could not be fetched]");
 	}
-	printf("smsd: a data message of %zu bytes: %s, from %s\n", n, plmn != NULL ? "an MMS notification" :
-	    "not an MMS notification", from);
-	snprintf(said, sizeof(said), "[A picture or long message (MMS): HakiOS cannot receive those yet]");
 	*text = said;
 	return 1;
 }
@@ -154,8 +145,20 @@ arrived(const char *sender, const char *text)
 		snprintf(title, sizeof(title), "Text from %s", from);
 	}
 	printf("smsd: a text from %s (%zu bytes): kept and shown\n", from, strlen(text));
-	header = CFStringCreateWithCString(NULL, title, kCFStringEncodingUTF8);
-	message = CFStringCreateWithCString(NULL, text, kCFStringEncodingUTF8);
+	{
+		/* (in the alert, a picture is said, not its file) */
+		char *shown = strdup(text), *mark;
+
+		while (shown != NULL && (mark = strstr(shown, "\001IMG:")) != NULL) {
+			char *end = strchr(mark, '\n');
+
+			memmove(mark + 9, end != NULL ? end : mark + strlen(mark), strlen(end != NULL ? end : mark + strlen(mark)) + 1);
+			memcpy(mark, "[Picture]", 9);
+		}
+		header = CFStringCreateWithCString(NULL, title, kCFStringEncodingUTF8);
+		message = CFStringCreateWithCString(NULL, shown != NULL ? shown : text, kCFStringEncodingUTF8);
+		free(shown);
+	}
 	if (message == NULL) {
 		message = CFStringCreateWithCString(NULL, text, kCFStringEncodingISOLatin1);
 	}

@@ -8095,6 +8095,7 @@ step_nas(void)
 #define WMS_RAW_SEND            0x0020
 #define WMS_RAW_READ            0x0022
 #define WMS_SET_ROUTES          0x0032
+#define WMS_SEND_ACK            0x0037
 #define SMS_TEXT                "Hello from HakiOS on a OnePlus 6T"
 
 static struct hakios_qrtr_port *wms_port;
@@ -8620,6 +8621,28 @@ wms_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 			if (8u + n <= size) {
 				sms_deliver(v + 8, n);
 			}
+			/*
+			 * Its ack indicator 0: the modem has not acknowledged it, we must (Send Ack 0x37: TLV 1 the transaction id, the
+			 * protocol 1 3GPP, success; 0x12 1 when it came over IMS, the event's TLV 0x16). Ordinary texts come with 1;
+			 * an MMS notification (8-bit data) came with 0, and without the ack the network never sent its second part
+			 * (run 173645).
+			 */
+			if (v[0] == 0) {
+				const uint8_t *ims;
+				uint16_t ims_size;
+				uint8_t ack[7 + 9 + 4] = { QMI_REQUEST, 0x7c, 0x00, WMS_SEND_ACK & 0xff, WMS_SEND_ACK >> 8, 0, 0,
+					0x01, 6, 0, v[1], v[2], v[3], v[4], 1, 1 };
+				unsigned at = 7 + 9;
+
+				ims = qmi_tlv(m, length, 0x16, &ims_size);
+				if (ims != NULL && ims_size >= 1 && ims[0] != 0) {
+					ack[at++] = 0x12; ack[at++] = 1; ack[at++] = 0; ack[at++] = 1;
+				}
+				ack[5] = (uint8_t)(at - 7);
+				tell("mpss: sms: the modem left the acknowledgement to us (transaction %u%s): sent\n",
+				    (unsigned)(v[1] | v[2] << 8 | v[3] << 16 | (uint32_t)v[4] << 24), at > 7 + 9 ? ", over IMS" : "");
+				qrtr_send(wms_port, wms_node, wms_port_number, ack, at);
+			}
 		} else if ((v = qmi_tlv(m, length, 0x10, &size)) != NULL && size >= 5) {
 			uint32_t index = (uint32_t)(v[1] | v[2] << 8 | v[3] << 16 | (uint32_t)v[4] << 24);
 
@@ -8634,6 +8657,9 @@ wms_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 		return;
 	}
 	switch (id) {
+	case WMS_SEND_ACK:
+		tell("mpss: sms: our acknowledgement: result %u, error %u\n", result, error);
+		return;
 	case WMS_SET_ROUTES:
 		tell("mpss: sms: routes set (texts handed to us, acknowledged by the modem): result %u, error %u\n", result, error);
 		return;
