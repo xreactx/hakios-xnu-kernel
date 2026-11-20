@@ -281,6 +281,12 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			src/Texts.m && cp Texts/Info.plist Texts/*.png obj/Texts.app/ &&
 			{ ${LDID:-ldid} -Ssrc/Texts.entitlements obj/Texts.app/Texts 2>/dev/null ||
 			  echo "build.sh: no ldid: Texts is unsigned, and SpringBoard will not launch it"; }
+		# a spirit level and the motion sensors as an application sees them through CoreMotion (src/Level.m, Level/)
+		rm -rf obj/Level.app && mkdir -p obj/Level.app &&
+		$DYN -fobjc-arc -miphoneos-version-min=16.0 -framework UIKit -framework Foundation -framework CoreMotion \
+			-framework QuartzCore -framework CoreGraphics -o obj/Level.app/Level src/Level.m && cp Level/Info.plist Level/*.png obj/Level.app/ &&
+			{ ${LDID:-ldid} -Ssrc/Level.entitlements obj/Level.app/Level 2>/dev/null ||
+			  echo "build.sh: no ldid: Level is unsigned, and SpringBoard will not launch it"; }
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
 		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/battery_test.c &&
 			{ ${LDID:-ldid} -Ssrc/battery_test.entitlements obj/battery_test 2>/dev/null ||
@@ -835,6 +841,7 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# the 6T's dialer (src/PhonePad.m): a system application, so LaunchServices finds it when it walks /Applications
 	[ "${MODEM-0}" != 0 ] && [ -d obj/PhonePad.app ] && cp -a obj/PhonePad.app sysroot/Applications/
 	[ "${MODEM-0}" != 0 ] && [ -d obj/Texts.app ] && cp -a obj/Texts.app sysroot/Applications/
+	[ "${MODEM-0}" != 0 ] && [ -d obj/Level.app ] && cp -a obj/Level.app sysroot/Applications/
 	mv sysroot/sbin/launchd sysroot/sbin/launchd.darwin
 	cp obj/stage0 sysroot/sbin/launchd
 	# the applications' frame rate: on a phone CoreAnimation holds every process to 60 frames a second unless its
