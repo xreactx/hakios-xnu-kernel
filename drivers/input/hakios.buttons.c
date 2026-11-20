@@ -50,6 +50,7 @@
  * drivers/input/misc/pm8941-pwrkey.c (the "pmk8350" kind), drivers/pinctrl/qcom/pinctrl-spmi-gpio.c,
  * and the phone's own device tree (qcom,spmi@c440000, pon_hlos@1300, gpio_keys).
  */
+#include <os/atomic_private.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
@@ -326,10 +327,17 @@ spmi_map(void)
 {
 	uint32_t version;
 
-	if (arb_core == 0) {
-		arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+	if (os_atomic_load(&arb_core, acquire) == 0) {
+		/*
+		 * The core's address last, once the others are there: it is what says the arbiter is mapped, and two threads
+		 * may come here at once -- the buttons' and pmi_haptics' (run 212521: one found arb_core set and arb_cnfg still
+		 * 0, and read channel 250's owner at 0xae8). Both mapping it is harmless.
+		 */
+		__typeof__(arb_core) core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+
 		arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
 		arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+		os_atomic_store(&arb_core, core, release);
 	}
 	version = rd(arb_core + ARB_VERSION);
 	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) {

@@ -8067,9 +8067,18 @@ step_nas(void)
  * SMS-DELIVER PDU is decoded (sender, GSM 7-bit or UCS-2 text, the part number of a long one) and logged; the count and
  * the last one are in sysctls (kern.hakios.sms_received, sms_from, sms_text) for userland.
  *
- * Sending (boot-arg sms_to=DIGITS: international, without "+"): once the modem is registered, one text is sent through
- * Raw Send (0x20: TLV 1 = format 6, GSM/WCDMA point to point, then a length of 16 bits and the SMS-SUBMIT PDU: the SMSC
- * left to the SIM's (0), no validity period, the address international, GSM 7-bit text). Run 225813 delivered it.
+ * Sending: a text written to kern.hakios.sms_send ("NUMBER\nTEXT", UTF-8; by the Texts application, as user mobile) --
+ * or, as before, boot-arg sms_to=DIGITS (international, without "+") for one fixed text -- is sent once the modem is
+ * registered through Raw Send (0x20: TLV 1 = format 6, GSM/WCDMA point to point, then a length of 16 bits and the
+ * SMS-SUBMIT PDU: the SMSC left to the SIM's (0), no validity period, the address international with a "+", else
+ * unknown). In GSM 7-bit when every character is in its alphabet (with its extension table: {}[]~\|^ and the euro),
+ * else in UCS-2; a long one in parts (a concatenation header of 8-bit reference: 153 septets or 67 characters a part,
+ * at most SMS_PARTS), each sent once the one before is answered. kern.hakios.sms_send_state: 0 none, 1 sending, 2 sent,
+ * 3 not sent; sms_sends counts the texts finished either way. Run 225813 delivered the first one.
+ *
+ * Received texts are kept too, the last SMS_KEPT of them with a sequence number, in kern.hakios.sms_inbox (a line each:
+ * sequence, sender, reference, part, parts, the text in UTF-8 with \\, \n and \t escaped) so that several arriving at
+ * once are not lost to the last one, and a long one can be put together again (userland smsd).
  */
 #define QMI_WMS                 5
 #define WMS_SET_EVENT_REPORT    0x0001
@@ -8084,6 +8093,27 @@ static volatile int sms_state;                  /* 0 nothing to do or not yet, 1
 static volatile int wms_setup;                  /* 0 not yet, 1 routes and events asked */
 static char sms_to[24];
 static int sms_received;
+#define SMS_PARTS               6
+#define SMS_UNITS               (153 * SMS_PARTS)
+static char sms_out_to[24];                     /* the number: digits, a "+" in front for an international one */
+static uint16_t sms_out_units[SMS_UNITS];       /* septets (GSM 7-bit) or UTF-16 units (UCS-2) */
+static unsigned sms_out_count, sms_out_part, sms_out_parts;
+static bool sms_out_ucs2;
+static uint8_t sms_out_ref;
+static volatile int sms_out_wanted;             /* a text is to be sent */
+static int sms_send_state, sms_sends;
+SYSCTL_INT(_kern_hakios, OID_AUTO, sms_send_state, CTLFLAG_RD | CTLFLAG_LOCKED, &sms_send_state, 0,
+    "the last text sent: 0 none, 1 sending, 2 sent, 3 not sent");
+SYSCTL_INT(_kern_hakios, OID_AUTO, sms_sends, CTLFLAG_RD | CTLFLAG_LOCKED, &sms_sends, 0, "texts sent or failed");
+#define SMS_KEPT                16
+static struct {
+	uint32_t seq;
+	uint16_t ref;
+	uint8_t part, parts;
+	char from[24];
+	char text[512];
+} sms_kept[SMS_KEPT];
+static volatile uint32_t sms_kept_gen;          /* odd while one is being written */
 static char sms_from[24];
 static char sms_text[324];
 
@@ -8095,6 +8125,44 @@ SYSCTL_STRING(_kern_hakios, OID_AUTO, sms_text, CTLFLAG_RD | CTLFLAG_LOCKED, sms
 static const char gsm7[128] =
     "@?$???????\n??\r???_?????????????? !\"#?%&'()*+,-./0123456789:;<=>?"
     "?ABCDEFGHIJKLMNOPQRSTUVWXYZ??????abcdefghijklmnopqrstuvwxyz?????";
+
+/* the GSM 7-bit default alphabet in Unicode (3GPP TS 23.038), and its extension table (after the escape, 0x1b) */
+static const uint16_t gsm7_unicode[128] = {
+	0x40, 0xa3, 0x24, 0xa5, 0xe8, 0xe9, 0xf9, 0xec, 0xf2, 0xc7, 0x0a, 0xd8, 0xf8, 0x0d, 0xc5, 0xe5,
+	0x394, 0x5f, 0x3a6, 0x393, 0x39b, 0x3a9, 0x3a0, 0x3a8, 0x3a3, 0x398, 0x39e, 0xa0, 0xc6, 0xe6, 0xdf, 0xc9,
+	0x20, 0x21, 0x22, 0x23, 0xa4, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+	0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
+	0xa1, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f,
+	0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0xc4, 0xd6, 0xd1, 0xdc, 0xa7,
+	0xbf, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f,
+	0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0xe4, 0xf6, 0xf1, 0xfc, 0xe0,
+};
+static const struct { uint8_t code; uint16_t unicode; } gsm7_extension[] = {
+	{ 0x0a, 0x0c }, { 0x14, '^' }, { 0x28, '{' }, { 0x29, '}' }, { 0x2f, '\\' }, { 0x3c, '[' }, { 0x3d, '~' },
+	{ 0x3e, ']' }, { 0x40, '|' }, { 0x65, 0x20ac },
+};
+
+/* one code point as UTF-8 into out (o: where), as long as it fits; the new o */
+static unsigned
+utf8_put(char *out, unsigned o, size_t size, uint32_t c)
+{
+	if (c < 0x80 && o + 1 < size) {
+		out[o++] = (char)c;
+	} else if (c < 0x800 && o + 2 < size) {
+		out[o++] = (char)(0xc0 | c >> 6);
+		out[o++] = (char)(0x80 | (c & 0x3f));
+	} else if (c >= 0x800 && c < 0x10000 && o + 3 < size) {
+		out[o++] = (char)(0xe0 | c >> 12);
+		out[o++] = (char)(0x80 | (c >> 6 & 0x3f));
+		out[o++] = (char)(0x80 | (c & 0x3f));
+	} else if (c >= 0x10000 && o + 4 < size) {
+		out[o++] = (char)(0xf0 | c >> 18);
+		out[o++] = (char)(0x80 | (c >> 12 & 0x3f));
+		out[o++] = (char)(0x80 | (c >> 6 & 0x3f));
+		out[o++] = (char)(0x80 | (c & 0x3f));
+	}
+	return o;
+}
 
 static void
 sms_digits(const uint8_t *p, unsigned digits, uint8_t type, char *out, size_t size)
@@ -8150,9 +8218,9 @@ sms_hex(const char *what, const uint8_t *p, unsigned n)
 static void
 sms_deliver(const uint8_t *p, unsigned n)
 {
-	unsigned i = 0, digits, udl, header = 0, part = 0, parts = 0, o = 0;
+	unsigned i = 0, digits, udl, header = 0, part = 0, parts = 0, ref = 0, o = 0;
 	uint8_t first, type, dcs;
-	char from[24], text[324];
+	char from[24], text[512];
 
 	sms_hex("pdu", p, n);
 	if (n < 1) {
@@ -8189,17 +8257,26 @@ sms_deliver(const uint8_t *p, unsigned n)
 			uint8_t id = p[h], length = p[h + 1];
 
 			if ((id == 0 && length == 3 && h + 4 < n) || (id == 8 && length == 4 && h + 5 < n)) {
+				ref = id == 0 ? p[h + 2] : (unsigned)(p[h + 2] << 8 | p[h + 3]);
 				parts = p[h + 2 + length - 2];
 				part = p[h + 2 + length - 1];
 			}
 			h += 2u + length;
 		}
 	}
-	if ((dcs & 0xcc) == 0x08 || (dcs & 0xf0) == 0x08) {     /* UCS-2: what is ASCII kept, the rest '?' */
-		for (unsigned k = i + header; k + 1 < i + udl && k + 1 < n && o + 1 < sizeof(text); k += 2) {
-			uint16_t c = (uint16_t)(p[k] << 8 | p[k + 1]);
+	if ((dcs & 0xcc) == 0x08 || (dcs & 0xf0) == 0x08) {     /* UCS-2 (UTF-16: a pair is one character), into UTF-8 */
+		for (unsigned k = i + header; k + 1 < i + udl && k + 1 < n; k += 2) {
+			uint32_t c = (uint32_t)(p[k] << 8 | p[k + 1]);
 
-			text[o++] = c >= 0x20 && c < 0x7f ? (char)c : c == '\n' ? '\n' : '?';
+			if (c >= 0xd800 && c < 0xdc00 && k + 3 < i + udl && k + 3 < n) {
+				uint32_t low = (uint32_t)(p[k + 2] << 8 | p[k + 3]);
+
+				if (low >= 0xdc00 && low < 0xe000) {
+					c = 0x10000 + ((c - 0xd800) << 10) + (low - 0xdc00);
+					k += 2;
+				}
+			}
+			o = utf8_put(text, o, sizeof(text), c);
 		}
 	} else if ((dcs & 0xcc) == 0x04) {      /* 8-bit data */
 		snprintf(text, sizeof(text), "(%u bytes of data)", udl);
@@ -8208,6 +8285,7 @@ sms_deliver(const uint8_t *p, unsigned n)
 		unsigned skip = (header * 8 + 6) / 7, bits = 0, s = 0;
 		uint32_t acc = 0;
 		const uint8_t *q = p + i;
+		bool escape = false;
 
 		for (; s < udl; s++) {
 			if (bits < 7) {
@@ -8217,14 +8295,43 @@ sms_deliver(const uint8_t *p, unsigned n)
 				acc |= (uint32_t)*q++ << bits;
 				bits += 8;
 			}
-			if (s >= skip && o + 1 < sizeof(text)) {
-				text[o++] = gsm7[acc & 0x7f];
+			if (s >= skip) {
+				uint8_t code = acc & 0x7f;
+
+				if (escape) {
+					uint32_t c = '?';
+
+					for (unsigned e = 0; e < sizeof(gsm7_extension) / sizeof(gsm7_extension[0]); e++) {
+						if (gsm7_extension[e].code == code) {
+							c = gsm7_extension[e].unicode;
+						}
+					}
+					o = utf8_put(text, o, sizeof(text), c);
+					escape = false;
+				} else if (code == 0x1b) {
+					escape = true;
+				} else {
+					o = utf8_put(text, o, sizeof(text), gsm7_unicode[code]);
+				}
 			}
 			acc >>= 7;
 			bits -= 7;
 		}
 	}
 	text[o] = 0;
+	{
+		/* (kept for kern.hakios.sms_inbox: the generation odd while it is written, so that a reader can tell) */
+		unsigned slot = (unsigned)sms_received % SMS_KEPT;
+
+		os_atomic_inc(&sms_kept_gen, release);
+		sms_kept[slot].seq = (uint32_t)sms_received + 1;
+		sms_kept[slot].ref = (uint16_t)ref;
+		sms_kept[slot].part = (uint8_t)part;
+		sms_kept[slot].parts = (uint8_t)parts;
+		strlcpy(sms_kept[slot].from, from, sizeof(sms_kept[slot].from));
+		strlcpy(sms_kept[slot].text, text, sizeof(sms_kept[slot].text));
+		os_atomic_inc(&sms_kept_gen, release);
+	}
 	sms_received++;
 	strlcpy(sms_from, from, sizeof(sms_from));
 	strlcpy(sms_text, text, sizeof(sms_text));
@@ -8237,6 +8344,205 @@ sms_deliver(const uint8_t *p, unsigned n)
 bad:
 	tell("mpss: sms: a message of %u bytes received that does not parse\n", n);
 }
+
+/* kern.hakios.sms_inbox: the texts kept, oldest first, a line each (see above) */
+static int
+sms_inbox_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	const size_t size = SMS_KEPT * (32 + 24 + 2 * sizeof(sms_kept[0].text)) + 1;
+	char *out = kalloc_data(size, Z_WAITOK | Z_ZERO);
+	size_t o = 0;
+	int error;
+
+	if (out == NULL) {
+		return ENOMEM;
+	}
+	for (int tries = 0; tries < 10; tries++) {
+		uint32_t gen = os_atomic_load(&sms_kept_gen, acquire), first = (uint32_t)sms_received;
+
+		o = 0;
+		first = first > SMS_KEPT ? first - SMS_KEPT : 0;
+		for (uint32_t seq = first + 1; seq <= (uint32_t)sms_received; seq++) {
+			unsigned slot = (seq - 1) % SMS_KEPT;
+
+			if (sms_kept[slot].seq != seq) {
+				continue;
+			}
+			o += (size_t)snprintf(out + o, size - o, "%u\t%s\t%u\t%u\t%u\t", seq, sms_kept[slot].from, sms_kept[slot].ref,
+			    sms_kept[slot].part, sms_kept[slot].parts);
+			for (const char *c = sms_kept[slot].text; *c != 0 && o + 3 < size; c++) {
+				if (*c == '\\' || *c == '\n' || *c == '\t') {
+					out[o++] = '\\';
+					out[o++] = *c == '\n' ? 'n' : *c == '\t' ? 't' : '\\';
+				} else {
+					out[o++] = *c;
+				}
+			}
+			if (o + 1 < size) {
+				out[o++] = '\n';
+			}
+		}
+		out[o] = 0;
+		if ((gen & 1) == 0 && os_atomic_load(&sms_kept_gen, acquire) == gen) {
+			break;
+		}
+	}
+	error = SYSCTL_OUT(req, out, o + 1);
+	kfree_data(out, size);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sms_inbox, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    sms_inbox_sysctl, "A", "the texts received last: sequence, sender, reference, part, parts, text");
+
+/* one UTF-8 character of s from *at (moved past it); 0xfffd for what does not decode */
+static uint32_t
+utf8_get(const char *s, size_t *at)
+{
+	const uint8_t *p = (const uint8_t *)s + *at;
+	uint32_t c = p[0];
+	unsigned more = c < 0x80 ? 0 : (c & 0xe0) == 0xc0 ? 1 : (c & 0xf0) == 0xe0 ? 2 : (c & 0xf8) == 0xf0 ? 3 : 4;
+
+	if (more == 4) {
+		(*at)++;
+		return 0xfffd;
+	}
+	c = more == 0 ? c : more == 1 ? (c & 0x1f) : more == 2 ? (c & 0x0f) : (c & 0x07);
+	for (unsigned k = 1; k <= more; k++) {
+		if ((p[k] & 0xc0) != 0x80) {
+			*at += k;
+			return 0xfffd;
+		}
+		c = c << 6 | (p[k] & 0x3f);
+	}
+	*at += 1 + more;
+	return c;
+}
+
+/* the text into septets, or (when one character is not in the GSM alphabet) UTF-16 units; false if too long */
+static bool
+sms_out_encode(const char *text)
+{
+	size_t at = 0;
+	unsigned n = 0;
+
+	sms_out_ucs2 = false;
+	while (text[at] != 0) {
+		uint32_t c = utf8_get(text, &at);
+		bool found = false;
+
+		for (unsigned g = 0; g < 128 && !found; g++) {
+			if (gsm7_unicode[g] == c && g != 0x1b) {
+				if (n + 1 > SMS_UNITS) {
+					return false;
+				}
+				sms_out_units[n++] = (uint16_t)g;
+				found = true;
+			}
+		}
+		for (unsigned e = 0; e < sizeof(gsm7_extension) / sizeof(gsm7_extension[0]) && !found; e++) {
+			if (gsm7_extension[e].unicode == c) {
+				if (n + 2 > SMS_UNITS) {
+					return false;
+				}
+				sms_out_units[n++] = 0x1b;
+				sms_out_units[n++] = gsm7_extension[e].code;
+				found = true;
+			}
+		}
+		if (!found) {
+			sms_out_ucs2 = true;
+			break;
+		}
+	}
+	if (sms_out_ucs2) {
+		at = 0;
+		n = 0;
+		while (text[at] != 0) {
+			uint32_t c = utf8_get(text, &at);
+
+			if (c >= 0x10000) {
+				if (n + 2 > 67 * SMS_PARTS) {
+					return false;
+				}
+				c -= 0x10000;
+				sms_out_units[n++] = (uint16_t)(0xd800 + (c >> 10));
+				sms_out_units[n++] = (uint16_t)(0xdc00 + (c & 0x3ff));
+			} else {
+				if (n + 1 > 67 * SMS_PARTS) {
+					return false;
+				}
+				sms_out_units[n++] = (uint16_t)c;
+			}
+		}
+		sms_out_parts = n <= 70 ? 1 : (n + 66) / 67;
+	} else {
+		sms_out_parts = n <= 160 ? 1 : (n + 152) / 153;
+	}
+	sms_out_count = n;
+	return n != 0 && sms_out_parts <= SMS_PARTS;
+}
+
+/* kern.hakios.sms_send: "NUMBER\nTEXT" (the number digits, "+" in front for an international one); EBUSY while one is sent */
+static int
+sms_send_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	const size_t size = 24 + 4 * SMS_UNITS;
+	char *in, *text;
+	size_t length;
+	int error;
+
+	if (req->newptr == USER_ADDR_NULL) {
+		return SYSCTL_OUT(req, sms_out_to, strlen(sms_out_to) + 1);
+	}
+	length = req->newlen;
+	if (length == 0 || length >= size) {
+		return EINVAL;
+	}
+	if (sms_out_wanted || sms_send_state == 1) {
+		return EBUSY;
+	}
+	in = kalloc_data(size, Z_WAITOK | Z_ZERO);
+	if (in == NULL) {
+		return ENOMEM;
+	}
+	error = SYSCTL_IN(req, in, length);
+	in[length] = 0;
+	text = error == 0 ? strchr(in, '\n') : NULL;
+	if (text == NULL) {
+		error = error != 0 ? error : EINVAL;
+		goto out;
+	}
+	*text++ = 0;
+	if (strlen(in) == 0 || strlen(in) > 21) {
+		error = EINVAL;
+		goto out;
+	}
+	for (const char *c = in; *c != 0; c++) {
+		if (!((*c >= '0' && *c <= '9') || (*c == '+' && c == in))) {
+			error = EINVAL;
+			goto out;
+		}
+	}
+	if (!sms_out_encode(text)) {
+		error = E2BIG;
+		goto out;
+	}
+	strlcpy(sms_out_to, in, sizeof(sms_out_to));
+	sms_out_part = 0;
+	sms_out_ref++;
+	sms_send_state = 1;
+	sms_state = 0;
+	sms_out_wanted = 1;
+	tell("mpss: sms: a text to %s asked for: %u %s in %u part%s\n", sms_out_to, sms_out_count,
+	    sms_out_ucs2 ? "UCS-2 units" : "septets", sms_out_parts, sms_out_parts == 1 ? "" : "s");
+out:
+	kfree_data(in, size);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sms_send, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    sms_send_sysctl, "A", "a text to send: NUMBER, a newline, the text (UTF-8)");
 
 static void
 wms_raw_read(uint8_t storage, uint32_t index)
@@ -8308,7 +8614,8 @@ wms_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 	default:
 		return;
 	}
-	tell("mpss: sms: THE TEXT TO %s: result %u, error %u%s\n", sms_to, result, error, result == 0 ? " -- SENT" : "");
+	tell("mpss: sms: THE TEXT TO %s (part %u of %u): result %u, error %u%s\n", sms_out_to, sms_out_part + 1, sms_out_parts,
+	    result, error, result == 0 ? " -- SENT" : "");
 	if ((v = qmi_tlv(m, length, 0x01, &size)) != NULL && size >= 2) {
 		tell("mpss: sms: its reference %u\n", v[0] | v[1] << 8);
 	}
@@ -8321,6 +8628,14 @@ wms_receive(__unused void *context, __unused uint32_t node, __unused uint32_t po
 	if ((v = qmi_tlv(m, length, 0x12, &size)) != NULL && size >= 2) {
 		tell("mpss: sms: the network's cause %u (RP %u)\n", v[0], v[1]);
 	}
+	if (result == 0 && sms_out_part + 1 < sms_out_parts) {
+		sms_out_part++;
+		sms_state = 0;                  /* (the next part, from sms_advance) */
+		return;
+	}
+	sms_send_state = result == 0 ? 2 : 3;
+	sms_sends++;
+	sms_out_wanted = 0;
 	sms_state = 2;
 }
 
@@ -8358,6 +8673,12 @@ sms_open(void)
 				break;
 			}
 		}
+		if (sms_to[0] != 0 && sms_out_encode(SMS_TEXT)) {
+			sms_out_to[0] = '+';
+			strlcpy(sms_out_to + 1, sms_to, sizeof(sms_out_to) - 1);
+			sms_send_state = 1;
+			sms_out_wanted = 1;
+		}
 	}
 	wms_port = qrtr_open(wms_receive, wms_server, NULL);
 	if (wms_port != NULL) {
@@ -8365,13 +8686,14 @@ sms_open(void)
 	}
 }
 
-/* Once WMS is there: routes and events, once; once registered: the PDU made and sent, once. */
+/* Once WMS is there: routes and events, once; once registered: each part of the text asked for, made and sent in turn. */
 static void
 sms_advance(void)
 {
-	uint8_t q[7 + 3 + 3 + 160], pdu[160];
-	unsigned n = 0, digits = (unsigned)strlen(sms_to), septets = (unsigned)strlen(SMS_TEXT), bits = 0, at = 7;
-	uint32_t acc = 0;
+	uint8_t q[7 + 3 + 3 + 176], pdu[176];
+	const char *number = sms_out_to[0] == '+' ? sms_out_to + 1 : sms_out_to;
+	unsigned n = 0, digits = (unsigned)strlen(number), at = 7, from, count, udl;
+	bool header;
 
 	if (wms_port == NULL || wms_port_number == 0) {
 		return;
@@ -8396,33 +8718,72 @@ sms_advance(void)
 		qrtr_send(wms_port, wms_node, wms_port_number, events, sizeof(events));
 		at = 7;
 	}
-	if (sms_state != 0 || !nas.state.registered || digits == 0 || digits > 20) {
+	if (!sms_out_wanted || sms_state == 1 || !nas.state.registered || digits == 0 || digits > 20) {
 		return;
 	}
+	header = sms_out_parts > 1;
+	if (sms_out_ucs2) {
+		from = header ? sms_out_part * 67 : 0;
+		count = MIN(sms_out_count - from, header ? 67u : 70u);
+		/* (a surrogate pair is not split across two parts) */
+		if (header && from + count < sms_out_count && sms_out_units[from + count - 1] >= 0xd800 &&
+		    sms_out_units[from + count - 1] < 0xdc00) {
+			count--;
+		}
+	} else {
+		from = header ? sms_out_part * 153 : 0;
+		count = MIN(sms_out_count - from, header ? 153u : 160u);
+		/* (an escape is not left at a part's end, apart from its character) */
+		if (header && from + count < sms_out_count && sms_out_units[from + count - 1] == 0x1b) {
+			count--;
+		}
+	}
 	pdu[n++] = 0x00;                        /* the SMSC: the SIM's */
-	pdu[n++] = 0x01;                        /* SMS-SUBMIT, no validity period */
+	pdu[n++] = header ? 0x41 : 0x01;        /* SMS-SUBMIT, no validity period, a user data header when in parts */
 	pdu[n++] = 0x00;                        /* message reference: the modem's */
 	pdu[n++] = (uint8_t)digits;
-	pdu[n++] = 0x91;                        /* international, ISDN */
+	pdu[n++] = sms_out_to[0] == '+' ? 0x91 : 0x81;  /* international or unknown, ISDN */
 	for (unsigned i = 0; i < digits; i += 2) {
-		uint8_t lo = (uint8_t)(sms_to[i] - '0'), hi = i + 1 < digits ? (uint8_t)(sms_to[i + 1] - '0') : 0xf;
+		uint8_t lo = (uint8_t)(number[i] - '0'), hi = i + 1 < digits ? (uint8_t)(number[i + 1] - '0') : 0xf;
 
 		pdu[n++] = (uint8_t)(hi << 4 | lo);
 	}
 	pdu[n++] = 0x00;                        /* protocol */
-	pdu[n++] = 0x00;                        /* GSM 7-bit */
-	pdu[n++] = (uint8_t)septets;
-	for (unsigned i = 0; i < septets; i++) {        /* (these letters are their own GSM 7-bit codes) */
-		acc |= (uint32_t)(SMS_TEXT[i] & 0x7f) << bits;
-		bits += 7;
-		while (bits >= 8) {
-			pdu[n++] = (uint8_t)acc;
-			acc >>= 8;
-			bits -= 8;
+	pdu[n++] = sms_out_ucs2 ? 0x08 : 0x00;  /* UCS-2 or GSM 7-bit */
+	if (sms_out_ucs2) {
+		udl = (header ? 6 : 0) + 2 * count;
+		pdu[n++] = (uint8_t)udl;
+		if (header) {
+			pdu[n++] = 5; pdu[n++] = 0; pdu[n++] = 3;
+			pdu[n++] = sms_out_ref; pdu[n++] = (uint8_t)sms_out_parts; pdu[n++] = (uint8_t)(sms_out_part + 1);
 		}
-	}
-	if (bits > 0) {
-		pdu[n++] = (uint8_t)acc;
+		for (unsigned i = 0; i < count; i++) {
+			pdu[n++] = (uint8_t)(sms_out_units[from + i] >> 8);
+			pdu[n++] = (uint8_t)sms_out_units[from + i];
+		}
+	} else {
+		uint32_t acc = 0;
+		unsigned bits = 0;
+
+		udl = (header ? 7 : 0) + count;         /* (the header's 6 bytes and a fill bit: 7 septets) */
+		pdu[n++] = (uint8_t)udl;
+		if (header) {
+			pdu[n++] = 5; pdu[n++] = 0; pdu[n++] = 3;
+			pdu[n++] = sms_out_ref; pdu[n++] = (uint8_t)sms_out_parts; pdu[n++] = (uint8_t)(sms_out_part + 1);
+			bits = 1;                       /* the fill bit */
+		}
+		for (unsigned i = 0; i < count; i++) {
+			acc |= (uint32_t)(sms_out_units[from + i] & 0x7f) << bits;
+			bits += 7;
+			while (bits >= 8) {
+				pdu[n++] = (uint8_t)acc;
+				acc >>= 8;
+				bits -= 8;
+			}
+		}
+		if (bits > 0) {
+			pdu[n++] = (uint8_t)acc;
+		}
 	}
 	q[0] = QMI_REQUEST; q[1] = 0x77; q[2] = 0x00;
 	q[3] = WMS_RAW_SEND & 0xff; q[4] = WMS_RAW_SEND >> 8;
@@ -8433,7 +8794,8 @@ sms_advance(void)
 	at += n;
 	q[5] = (uint8_t)((at - 7) & 0xff); q[6] = (uint8_t)((at - 7) >> 8);
 	sms_state = 1;
-	tell("mpss: sms: about to send a text of %u characters to %s (a PDU of %u bytes)\n", septets, sms_to, n);
+	tell("mpss: sms: about to send part %u of %u of a text to %s: %u %s (a PDU of %u bytes)\n", sms_out_part + 1,
+	    sms_out_parts, sms_out_to, count, sms_out_ucs2 ? "UCS-2 units" : "septets", n);
 	qrtr_send(wms_port, wms_node, wms_port_number, q, at);
 }
 

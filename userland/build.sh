@@ -261,7 +261,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			  echo "build.sh: no ldid: gnssd is unsigned, and locationd will not take its fixes"; }
 		# the 6T's received texts shown as alerts (src/smsd.c)
 		# (SpringBoard shows a CFUserNotification only for the entitlement com.apple.springboard.CFUserNotification)
-		$DYN -framework CoreFoundation -o obj/smsd src/smsd.c &&
+		$DYN -fobjc-arc -framework CoreFoundation -framework Foundation -framework Contacts -o obj/smsd src/smsd.c src/calld_contacts.m &&
 			{ ${LDID:-ldid} -Ssrc/smsd.entitlements obj/smsd 2>/dev/null ||
 			  echo "build.sh: no ldid: smsd is unsigned, and SpringBoard will not show its alerts"; }
 		# the 6T's ringing screen (src/calld.c): an incoming call's Answer/Decline alert, with the same entitlement
@@ -274,6 +274,12 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			src/PhonePad.m && cp PhonePad/Info.plist PhonePad/*.png obj/PhonePad.app/ &&
 			{ ${LDID:-ldid} -Ssrc/PhonePad.entitlements obj/PhonePad.app/PhonePad 2>/dev/null ||
 			  echo "build.sh: no ldid: PhonePad is unsigned, and SpringBoard will not launch it"; }
+		# the 6T's texts, an application (src/Texts.m, Texts/): the conversations, and texts sent through kern.hakios.sms_send
+		rm -rf obj/Texts.app && mkdir -p obj/Texts.app &&
+		$DYN -fobjc-arc -miphoneos-version-min=16.0 -framework UIKit -framework Foundation -framework Contacts -o obj/Texts.app/Texts \
+			src/Texts.m && cp Texts/Info.plist Texts/*.png obj/Texts.app/ &&
+			{ ${LDID:-ldid} -Ssrc/Texts.entitlements obj/Texts.app/Texts 2>/dev/null ||
+			  echo "build.sh: no ldid: Texts is unsigned, and SpringBoard will not launch it"; }
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
 		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/battery_test.c &&
 			{ ${LDID:-ldid} -Ssrc/battery_test.entitlements obj/battery_test 2>/dev/null ||
@@ -823,6 +829,7 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	fi
 	# the 6T's dialer (src/PhonePad.m): a system application, so LaunchServices finds it when it walks /Applications
 	[ "${MODEM-0}" != 0 ] && [ -d obj/PhonePad.app ] && cp -a obj/PhonePad.app sysroot/Applications/
+	[ "${MODEM-0}" != 0 ] && [ -d obj/Texts.app ] && cp -a obj/Texts.app sysroot/Applications/
 	mv sysroot/sbin/launchd sysroot/sbin/launchd.darwin
 	cp obj/stage0 sysroot/sbin/launchd
 	# the applications' frame rate: on a phone CoreAnimation holds every process to 60 frames a second unless its

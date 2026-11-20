@@ -1,19 +1,26 @@
 /*
- * smsd: the 6T's received texts, from the kernel to the screen.
+ * smsd: the 6T's received texts, from the kernel to the screen and into the conversations.
  *
- * The kernel takes each incoming text from the modem (QMI WMS, drivers/modem/hakios.mpss.c) and keeps the count and
- * the last one in sysctls: kern.hakios.sms_received, sms_from, sms_text. CommCenter, which hands texts to imagent and
- * Messages on an iPhone, does not run here (it speaks Apple's baseband protocol), so for now each new text is shown
- * as an alert through CFUserNotification (SpringBoard's SBUserNotification): the sender as the title, the text as
- * the message (signed with com.apple.springboard.CFUserNotification: src/smsd.entitlements). Texts that arrive while one is shown wait their turn (the count is followed, not only the last one:
- * if several arrive between two looks, the ones before the last are only counted).
+ * The kernel takes each incoming text from the modem (QMI WMS, drivers/modem/hakios.mpss.c) and keeps the last ones in
+ * kern.hakios.sms_inbox: a line each -- a sequence number, the sender, and for a part of a long text its reference,
+ * part and parts -- then the text in UTF-8 (\\, \n and \t escaped). CommCenter, which hands texts to imagent and
+ * Messages on an iPhone, does not run here (it speaks Apple's baseband protocol), so smsd takes them: the parts of a
+ * long text are put together again (or, if one never comes, what came is taken after PART_WAIT seconds), each text is
+ * written into the conversations the Texts application shows (/var/mobile/Library/HakiOS/texts.txt: a line each --
+ * seconds since 1970, "in", the number, the text escaped as above) and shown as an alert through CFUserNotification
+ * (SpringBoard's SBUserNotification): the sender, by the contact's name when there is one (src/calld_contacts.m), as
+ * the title, the text as the message (signed with com.apple.springboard.CFUserNotification and for the address book:
+ * src/smsd.entitlements).
  *
  * Without the sysctls (another phone, or sms=0) it ends at once.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* (in iOS's CoreFoundation, served by SpringBoard, but marked unavailable in the SDK's header: declared by its symbol) */
@@ -21,73 +28,224 @@ extern SInt32 notice(CFTimeInterval timeout, CFOptionFlags flags, CFURLRef icon,
     CFStringRef header, CFStringRef message, CFStringRef button) __asm__("_CFUserNotificationDisplayNotice");
 #define PLAIN_ALERT 3   /* kCFUserNotificationPlainAlertLevel */
 
-static int
-received(int *ok)
-{
-	int n = 0;
-	size_t size = sizeof(n);
+extern int contact_name(const char *number, char *out, size_t size);     /* src/calld_contacts.m */
 
-	if (sysctlbyname("kern.hakios.sms_received", &n, &size, NULL, 0) != 0) {
-		*ok = 0;
+#define TEXTS_DIR       "/private/var/mobile/Library/HakiOS"
+#define TEXTS           TEXTS_DIR "/texts.txt"
+#define MOBILE          501
+#define INBOX_BYTES     (64 << 10)
+#define PENDING         16
+#define PART_WAIT       60              /* seconds a long text waits for a missing part */
+#define TEXT_BYTES      4096
+
+/* the parts of a long text, as they come */
+static struct {
+	int used;
+	char from[24];
+	unsigned ref, parts, have;
+	time_t first;
+	char *part[256];
+} pending[PENDING];
+
+static void
+unescape(char *s)
+{
+	char *o = s;
+
+	for (; *s != 0; s++) {
+		if (*s == '\\' && s[1] != 0) {
+			s++;
+			*o++ = *s == 'n' ? '\n' : *s == 't' ? '\t' : *s;
+		} else {
+			*o++ = *s;
+		}
 	}
-	return n;
+	*o = 0;
+}
+
+/* a text into the conversations file, escaped */
+static void
+keep(const char *from, const char *text)
+{
+	FILE *f;
+
+	(void)mkdir(TEXTS_DIR, 0755);
+	(void)chown(TEXTS_DIR, MOBILE, MOBILE);
+	f = fopen(TEXTS, "a");
+	if (f == NULL) {
+		perror("smsd: " TEXTS);
+		return;
+	}
+	fprintf(f, "%ld\tin\t%s\t", (long)time(NULL), from);
+	for (const char *c = text; *c != 0; c++) {
+		if (*c == '\\' || *c == '\n' || *c == '\t') {
+			fputc('\\', f);
+			fputc(*c == '\n' ? 'n' : *c == '\t' ? 't' : '\\', f);
+		} else {
+			fputc(*c, f);
+		}
+	}
+	fputc('\n', f);
+	fclose(f);
+	(void)chown(TEXTS, MOBILE, MOBILE);
+	(void)chmod(TEXTS, 0644);
+}
+
+/* a whole text: kept and shown */
+static void
+arrived(const char *from, const char *text)
+{
+	char name[96], title[160];
+	CFStringRef header, message;
+
+	keep(from, text);
+	if (contact_name(from, name, sizeof(name))) {
+		snprintf(title, sizeof(title), "%s", name);
+	} else {
+		snprintf(title, sizeof(title), "Text from %s", from);
+	}
+	printf("smsd: a text from %s (%zu bytes): kept and shown\n", from, strlen(text));
+	header = CFStringCreateWithCString(NULL, title, kCFStringEncodingUTF8);
+	message = CFStringCreateWithCString(NULL, text, kCFStringEncodingUTF8);
+	if (message == NULL) {
+		message = CFStringCreateWithCString(NULL, text, kCFStringEncodingISOLatin1);
+	}
+	/* (no wait for the button: the next text may come while this one is up) */
+	(void)notice(0, PLAIN_ALERT, NULL, NULL, NULL, header, message, CFSTR("OK"));
+	if (header != NULL) {
+		CFRelease(header);
+	}
+	if (message != NULL) {
+		CFRelease(message);
+	}
+}
+
+/* a long text's parts put together (what is missing left out) */
+static void
+assemble(int p)
+{
+	char *text = calloc(1, TEXT_BYTES);
+
+	for (unsigned k = 1; k <= pending[p].parts && text != NULL; k++) {
+		if (pending[p].part[k] != NULL) {
+			strlcat(text, pending[p].part[k], TEXT_BYTES);
+			free(pending[p].part[k]);
+			pending[p].part[k] = NULL;
+		}
+	}
+	if (pending[p].have < pending[p].parts) {
+		printf("smsd: a long text from %s came without %u of its %u parts\n", pending[p].from,
+		    pending[p].parts - pending[p].have, pending[p].parts);
+	}
+	if (text != NULL) {
+		arrived(pending[p].from, text);
+		free(text);
+	}
+	pending[p].used = 0;
 }
 
 static void
-string(const char *name, char *out, size_t size)
+part_of(const char *from, unsigned ref, unsigned part, unsigned parts, const char *text)
 {
-	size_t length = size - 1;
+	int p, free_slot = -1;
 
-	if (sysctlbyname(name, out, &length, NULL, 0) != 0) {
-		length = 0;
+	for (p = 0; p < PENDING; p++) {
+		if (pending[p].used && pending[p].ref == ref && pending[p].parts == parts && strcmp(pending[p].from, from) == 0) {
+			break;
+		}
+		if (!pending[p].used && free_slot < 0) {
+			free_slot = p;
+		}
 	}
-	out[length < size ? length : size - 1] = 0;
+	if (p == PENDING) {
+		if (free_slot < 0) {
+			arrived(from, text);    /* (no room: alone) */
+			return;
+		}
+		p = free_slot;
+		memset(&pending[p], 0, sizeof(pending[p]));
+		pending[p].used = 1;
+		strlcpy(pending[p].from, from, sizeof(pending[p].from));
+		pending[p].ref = ref;
+		pending[p].parts = parts;
+		pending[p].first = time(NULL);
+	}
+	if (part >= 1 && part <= parts && pending[p].part[part] == NULL) {
+		pending[p].part[part] = strdup(text);
+		pending[p].have++;
+	}
+	if (pending[p].have == pending[p].parts) {
+		assemble(p);
+	}
 }
 
 int
 main(void)
 {
-	int ok = 1, seen;
+	char *inbox = malloc(INBOX_BYTES);
+	unsigned seen = 0;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	seen = received(&ok);
-	if (!ok) {
-		printf("smsd: no texts in this kernel (kern.hakios.sms_received): nothing to do\n");
-		return 0;
+	if (inbox == NULL) {
+		return 1;
 	}
-	printf("smsd: waiting for texts (%d so far)\n", seen);
-	for (;;) {
-		char from[64], text[400], title[96];
-		int now = received(&ok), missed;
-		CFStringRef header, message;
+	{
+		size_t size = INBOX_BYTES;
 
-		if (now == seen) {
-			sleep(1);
-			continue;
+		if (sysctlbyname("kern.hakios.sms_inbox", inbox, &size, NULL, 0) != 0) {
+			printf("smsd: no texts in this kernel (kern.hakios.sms_inbox): nothing to do\n");
+			return 0;
 		}
-		missed = now - seen - 1;
-		seen = now;
-		string("kern.hakios.sms_from", from, sizeof(from));
-		string("kern.hakios.sms_text", text, sizeof(text));
-		if (missed > 0) {
-			snprintf(title, sizeof(title), "Text from %s (and %d before it)", from, missed);
-		} else {
-			snprintf(title, sizeof(title), "Text from %s", from);
+	}
+	printf("smsd: waiting for texts\n");
+	for (;;) {
+		size_t size = INBOX_BYTES - 1;
+		char *line, *next;
+
+		if (sysctlbyname("kern.hakios.sms_inbox", inbox, &size, NULL, 0) != 0) {
+			size = 0;
 		}
-		printf("smsd: text %d shown (from %s, %zu characters)\n", now, from, strlen(text));
-		header = CFStringCreateWithCString(NULL, title, kCFStringEncodingUTF8);
-		message = CFStringCreateWithCString(NULL, text, kCFStringEncodingUTF8);
-		if (message == NULL) {
-			message = CFStringCreateWithCString(NULL, text, kCFStringEncodingISOLatin1);
+		inbox[size] = 0;
+		/* (what this boot's kernel received, oldest first: each taken once) */
+		for (line = inbox; line != NULL && *line != 0; line = next) {
+			char *f[6];
+			unsigned seq, n = 0;
+
+			next = strchr(line, '\n');
+			if (next != NULL) {
+				*next++ = 0;
+			}
+			for (char *c = line; n < 6; n++) {
+				f[n] = c;
+				if (n < 5) {
+					c = strchr(c, '\t');
+					if (c == NULL) {
+						break;
+					}
+					*c++ = 0;
+				}
+			}
+			if (n < 5) {
+				continue;
+			}
+			seq = (unsigned)strtoul(f[0], NULL, 10);
+			if (seq <= seen) {
+				continue;
+			}
+			seen = seq;
+			unescape(f[5]);
+			if (strtoul(f[4], NULL, 10) > 1) {
+				part_of(f[1], (unsigned)strtoul(f[2], NULL, 10), (unsigned)strtoul(f[3], NULL, 10),
+				    (unsigned)strtoul(f[4], NULL, 10), f[5]);
+			} else {
+				arrived(f[1], f[5]);
+			}
 		}
-		/* (no wait for the button: the next text may come while this one is up) */
-		printf("smsd: the notice returned %d\n", (int)notice(0, PLAIN_ALERT, NULL, NULL, NULL, header, message,
-		    CFSTR("OK")));
-		if (header != NULL) {
-			CFRelease(header);
+		for (int p = 0; p < PENDING; p++) {
+			if (pending[p].used && time(NULL) - pending[p].first > PART_WAIT) {
+				assemble(p);
+			}
 		}
-		if (message != NULL) {
-			CFRelease(message);
-		}
+		sleep(1);
 	}
 }
