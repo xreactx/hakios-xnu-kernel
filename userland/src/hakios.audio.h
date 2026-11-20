@@ -89,6 +89,7 @@ void hakios_tfa9894_quiesce(void);     /* the same without sleeping, and its res
 /* The OnePlus 6T's earpiece (bsd/dev/hakios.slim.c): the WCD934x codec over the audio SLIMbus. */
 bool hakios_slim_codec_ready(uint32_t ms);     /* the codec brought up (slim=3), waited for up to ms */
 bool hakios_slim_earpiece(bool on);
+bool hakios_slim_earpiece_gain(int db);   /* the earpiece's digital volume, dB (0: as at reset) */
 bool hakios_slim_mic(bool on);         /* the codec's handset microphone (AMIC4) and the bus's channel from it, up or down */    /* the codec's EAR path and the bus's channel to it, up (once the AFE port runs) or down */
 /* the amplifiers' own temperature and battery voltage read (every second while they play): the reduction they call for */
 uint32_t hakios_speaker_monitor(bool tell);
@@ -142,6 +143,8 @@ void hakios_adsp_apr_events(hakios_apr_events_t handler);
 void hakios_voice_call(bool talking);
 /* hakios.sound.c: a call's voice is on the loudspeaker (its amplifier kept up, on the speaker whatever Darwin's route) */
 void hakios_sound_voice_speaker(bool on);
+/* a volume button pressed during a call (up > 0: up): the call's volume a step (drivers/audio/hakios.mic.c) */
+void hakios_voice_volume_key(int up);
 const uint8_t *hakios_adsp_fw_file(const char *name, uint64_t *size);        /* /fw/name, read whole; give back with: */
 void hakios_adsp_fw_free(const uint8_t *data, uint64_t size);
 

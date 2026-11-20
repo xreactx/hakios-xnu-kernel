@@ -197,6 +197,7 @@ void hakios_tfa9894_quiesce(void) {}
 void hakios_slim_start(void) {}
 bool hakios_slim_codec_ready(__unused uint32_t ms) { return false; }
 bool hakios_slim_earpiece(__unused bool on) { return false; }
+bool hakios_slim_earpiece_gain(__unused int db) { return false; }
 bool hakios_slim_mic(__unused bool on) { return false; }
 #endif
 

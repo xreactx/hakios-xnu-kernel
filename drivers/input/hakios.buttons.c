@@ -572,6 +572,14 @@ button_look(struct button *b, bool pressed)
 		b->since = now;
 		b->presses++;
 		printf("buttons: %s PRESSED at %s\n", b->name, when);
+		if (b->record == HAKIOS_BUTTON_VOLUME_UP || b->record == HAKIOS_BUTTON_VOLUME_DOWN) {
+			/* (during a call, the call's volume too: drivers/audio/hakios.mic.c, when it is built in) */
+			extern void hakios_voice_volume_key(int up) __attribute__((weak));
+
+			if (hakios_voice_volume_key != NULL) {
+				hakios_voice_volume_key(b->record == HAKIOS_BUTTON_VOLUME_UP ? 1 : -1);
+			}
+		}
 	} else {
 		absolutetime_to_nanoseconds(now - b->since, &held);
 		printf("buttons: %s released at %s, after %llu ms\n", b->name, when, held / NSEC_PER_MSEC);

@@ -873,6 +873,25 @@ hakios_slim_earpiece(bool on)
 	return ok;
 }
 
+/* the earpiece's digital volume (CDC_RX0_RX_VOL_CTL: dB, signed, -84 to +40; 0 at reset): the call's volume */
+bool
+hakios_slim_earpiece_gain(int db)
+{
+	bool ok;
+
+	if (!codec_ready) {
+		return false;
+	}
+	db = db < -84 ? -84 : db > 12 ? 12 : db;
+	lck_mtx_lock(&codec_lock);
+	ngd_quiet = true;
+	ok = codec_reg_write(0x0b45, (uint8_t)(int8_t)db);
+	ngd_quiet = false;
+	lck_mtx_unlock(&codec_lock);
+	printf("slim: codec: the earpiece's volume %d dB: %s\n", db, ok ? "set" : "NOT SET");
+	return ok;
+}
+
 /*
  * The codec's registers (Linux: drivers/mfd/wcd934x.c, its regmap over SLIMbus): 16-bit addresses through a window
  * -- the page (address >> 8) into the selector at value element 0x800, the register at 0x800 + its low byte. Its

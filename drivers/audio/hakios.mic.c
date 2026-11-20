@@ -2539,6 +2539,17 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, call_audio, CTLFLAG_RW | CTLFLAG_ANYBODY | CT
     "the call's audio: bit 0 the loudspeaker, bit 1 the microphone muted");
 static int voice_audio;                         /* what is applied */
 
+/*
+ * The call's volume: kern.hakios.call_volume, a step from 0 to CALL_VOLUME_STEPS - 1 (-1: never set, the DSP's own), the
+ * earpiece's digital volume in the codec (voice_volume(); the loudspeaker's not yet); the volume buttons move it
+ * during a call (hakios_voice_volume_key(), from drivers/input/hakios.buttons.c). Sent again on every new vocproc.
+ */
+#define CALL_VOLUME_STEPS                       6
+static int call_volume = -1;
+SYSCTL_INT(_kern_hakios, OID_AUTO, call_volume, CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, &call_volume, 0,
+    "the call's volume step, 0 to 5 (-1: the DSP's own)");
+static int voice_volume_now = -1;               /* what is applied */
+
 /* the vocproc on the handset microphone and RX (the earpiece's 0x4000 or the loudspeaker's 0x1006): made, enabled, attached */
 static bool
 voice_cvp_up(uint16_t rx)
@@ -2578,6 +2589,7 @@ voice_cvp_down(void)
 	(void)voice_ask("the vocproc, disabled", APR_SVC_CVP, voice_cvp, VSS_IVOCPROC_CMD_DISABLE, NULL, 0, NULL);
 	(void)voice_ask("the vocproc, destroyed", APR_SVC_CVP, voice_cvp, APRV2_IBASIC_CMD_DESTROY_SESSION, NULL, 0, NULL);
 	voice_cvp = 0;
+	voice_volume_now = -1;                  /* (a new vocproc is told again) */
 }
 
 static bool
@@ -2591,9 +2603,39 @@ voice_mute(bool on)
 	           &mute, sizeof(mute), NULL);
 }
 
+static bool
+voice_volume(int step)
+{
+	/* the earpiece's digital volume in the codec: the DSP refuses VSS_IVOLUME_CMD_SET_STEP without a volume calibration */
+	static const int8_t db[CALL_VOLUME_STEPS] = { -15, -10, -5, 0, 3, 6 };
+
+	if (voice_audio & CALL_AUDIO_SPEAKER) {
+		say("voice: the call's volume, step %d of %d: not on the loudspeaker yet\n", step, CALL_VOLUME_STEPS - 1);
+		return false;
+	}
+	say("voice: the call's volume, step %d of %d: %d dB at the earpiece\n", step, CALL_VOLUME_STEPS - 1, db[step]);
+	return hakios_slim_earpiece_gain(db[step]);
+}
+
+/* a volume button pressed (up > 0): the call's volume a step up or down, while the call's voice runs */
+void
+hakios_voice_volume_key(int up)
+{
+	int step;
+
+	if (!voice_running) {
+		return;
+	}
+	step = (call_volume < 0 ? CALL_VOLUME_STEPS / 2 : call_volume) + (up > 0 ? 1 : -1);
+	call_volume = step < 0 ? 0 : step >= CALL_VOLUME_STEPS ? CALL_VOLUME_STEPS - 1 : step;
+}
+
 static void
 voice_stop(void)
 {
+	if (voice_volume_now >= 0) {
+		(void)hakios_slim_earpiece_gain(0);     /* (Darwin's earpiece as before) */
+	}
 	if (voice_mvm != 0) {
 		(void)voice_ask("the voice, stopped", APR_SVC_MVM, voice_mvm, VSS_IMVM_CMD_STOP_VOICE, NULL, 0, NULL);
 	}
@@ -2725,6 +2767,14 @@ voice_thread(__unused void *argument, __unused wait_result_t result)
 		} else if (voice_wanted && voice_running && (call_audio & 3) != voice_audio) {
 			lck_mtx_lock(&mic_lock);
 			voice_controls();
+			lck_mtx_unlock(&mic_lock);
+		} else if (voice_wanted && voice_running && voice_cvp != 0 && call_volume >= 0 && call_volume != voice_volume_now) {
+			int step = call_volume < CALL_VOLUME_STEPS ? call_volume : CALL_VOLUME_STEPS - 1;
+
+			lck_mtx_lock(&mic_lock);
+			/* (refused: not asked again until it changes) */
+			(void)voice_volume(step);
+			voice_volume_now = call_volume;
 			lck_mtx_unlock(&mic_lock);
 		} else if (!voice_wanted) {
 			failed = false;

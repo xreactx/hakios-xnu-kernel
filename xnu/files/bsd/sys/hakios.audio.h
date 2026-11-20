@@ -89,6 +89,7 @@ void hakios_tfa9894_quiesce(void);     /* the same without sleeping, and its res
 /* The OnePlus 6T's earpiece (bsd/dev/hakios.slim.c): the WCD934x codec over the audio SLIMbus. */
 bool hakios_slim_codec_ready(uint32_t ms);     /* the codec brought up (slim=3), waited for up to ms */
 bool hakios_slim_earpiece(bool on);
+bool hakios_slim_earpiece_gain(int db);   /* the earpiece's digital volume, dB (0: as at reset) */
 bool hakios_btslim_sco(bool on);      /* the Bluetooth chip's SLIMbus: its SCO ports and channels 159/157, up or down (btslim>=4) */
 bool hakios_btslim_sco_rx(bool on);   /* to the headset: channel 157 into the chip's RX 16, up or down (SLIMBUS_7_RX running) */
 void hakios_btslim_status(const char *when);    /* the chip's SCO ports' status registers, logged */
@@ -149,6 +150,8 @@ void hakios_adsp_apr_events(hakios_apr_events_t handler);
 void hakios_voice_call(bool talking);
 /* hakios.sound.c: a call's voice is on the loudspeaker (its amplifier kept up, on the speaker whatever Darwin's route) */
 void hakios_sound_voice_speaker(bool on);
+/* a volume button pressed during a call (up > 0: up): the call's volume a step (drivers/audio/hakios.mic.c) */
+void hakios_voice_volume_key(int up);
 const uint8_t *hakios_adsp_fw_file(const char *name, uint64_t *size);        /* /fw/name, read whole; give back with: */
 void hakios_adsp_fw_free(const uint8_t *data, uint64_t size);
 
