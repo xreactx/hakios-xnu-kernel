@@ -82,6 +82,43 @@ tail_digits(NSString *number)
 	return d.length > 10 ? [d substringFromIndex:d.length - 10] : d;
 }
 
+/* a conversation's key: a number's last 10 digits, or a group's (numbers comma-separated) sorted and joined */
+static NSString *
+thread_key(NSString *number)
+{
+	NSMutableArray<NSString *> *tails = [NSMutableArray array];
+
+	if ([number rangeOfString:@","].location == NSNotFound) {
+		return tail_digits(number);
+	}
+	for (NSString *one in [number componentsSeparatedByString:@","]) {
+		if (one.length != 0) {
+			[tails addObject:tail_digits(one)];
+		}
+	}
+	return [[tails sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@","];
+}
+
+static BOOL
+is_group(NSString *number)
+{
+	return [number rangeOfString:@","].location != NSNotFound;
+}
+
+/* a conversation's name: its contact, or a group's members' names (or numbers) */
+static NSString *
+name_of(NSDictionary<NSString *, NSString *> *names, NSString *number)
+{
+	NSMutableArray *parts = [NSMutableArray array];
+
+	for (NSString *one in [number componentsSeparatedByString:@","]) {
+		if (one.length != 0) {
+			[parts addObject:names[tail_digits(one)] ?: one];
+		}
+	}
+	return [parts componentsJoinedByString:@", "];
+}
+
 static NSString *
 escaped(NSString *s)
 {
@@ -113,7 +150,7 @@ unescaped(NSString *s)
 
 @interface Text : NSObject
 @property (nonatomic, strong) NSDate *when;
-@property (nonatomic, copy) NSString *kind, *number, *body;
+@property (nonatomic, copy) NSString *kind, *number, *body, *sender;     /* (sender: who wrote it, in a group) */
 @end
 
 @implementation Text
@@ -144,6 +181,7 @@ unescaped(NSString *s)
 		t.kind = f[1];
 		t.number = f[2];
 		t.body = unescaped(f[3]);
+		t.sender = f.count >= 5 ? f[4] : nil;
 		[texts addObject:t];
 	}
 	return texts;
@@ -426,7 +464,8 @@ body_plain(NSString *body)
 @property (nonatomic, strong) UITextField *field;
 @property (nonatomic, strong) UIButton *send;
 @property (nonatomic, strong) Text *sending;
-@property (nonatomic, copy) NSString *mmsRequest;       /* the MMS being sent: its request in OUTBOX, until smsd takes it */
+@property (nonatomic, copy) NSString *mmsRequest;
+@property (nonatomic, strong) NSDictionary<NSString *, NSString *> *names;       /* the MMS being sent: its request in OUTBOX, until smsd takes it */
 @property (nonatomic) int sends;
 @property (nonatomic, strong) NSTimer *timer;
 @end
@@ -439,7 +478,8 @@ body_plain(NSString *body)
 
 	[super viewDidLoad];
 	self.view.backgroundColor = UIColor.systemBackgroundColor;
-	self.tail = tail_digits(self.number);
+	self.tail = thread_key(self.number);
+	self.names = [Store names];
 	self.table = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStylePlain];
 	self.table.dataSource = self;
 	self.table.separatorStyle = UITableViewCellSeparatorStyleNone;
@@ -514,7 +554,7 @@ body_plain(NSString *body)
 	NSUInteger before = self.texts.count;
 
 	for (Text *t in [Store texts]) {
-		if ([tail_digits(t.number) isEqualToString:self.tail]) {
+		if ([thread_key(t.number) isEqualToString:self.tail]) {
 			[mine addObject:t];
 		}
 	}
@@ -569,6 +609,11 @@ body_plain(NSString *body)
 	if (body.length == 0 || self.sending != nil) {
 		return;
 	}
+	if (is_group(self.number)) {
+		/* (to a group: an MMS to all of them, through smsd) */
+		[self queueMMS:nil text:body];
+		return;
+	}
 	request = [NSString stringWithFormat:@"%@\n%@", self.number, body];
 	bytes = request.UTF8String;
 	sysctlbyname("kern.hakios.sms_sends", &sends, &size, NULL, 0);
@@ -608,28 +653,38 @@ body_plain(NSString *body)
 - (void)sendPicture:(NSString *)path
 {
 	NSData *jpeg = picture_to_send(path);
-	NSString *saved, *request, *name, *text = self.field.text ?: @"";
-	NSFileManager *fm = NSFileManager.defaultManager;
+	NSString *saved;
 
 	if (jpeg == nil || self.sending != nil) {
 		return;
 	}
-	[fm createDirectoryAtPath:MMS_DIR withIntermediateDirectories:YES attributes:nil error:NULL];
-	[fm createDirectoryAtPath:OUTBOX withIntermediateDirectories:YES attributes:nil error:NULL];
-	name = [NSString stringWithFormat:@"out-%ld", (long)NSDate.date.timeIntervalSince1970];
-	saved = [MMS_DIR stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"jpg"]];
+	[NSFileManager.defaultManager createDirectoryAtPath:MMS_DIR withIntermediateDirectories:YES attributes:nil error:NULL];
+	saved = [MMS_DIR stringByAppendingPathComponent:[NSString stringWithFormat:@"out-%ld.jpg",
+	    (long)NSDate.date.timeIntervalSince1970]];
 	[jpeg writeToFile:saved atomically:YES];
-	request = [NSString stringWithFormat:@"%@\n%@\n%@", self.number, saved, text];
+	NSLog(@"Texts: an MMS to %@: a picture of %lu bytes", self.number, (unsigned long)jpeg.length);
+	[self queueMMS:saved text:self.field.text ?: @""];
+}
+
+/* an MMS asked of smsd: a request in OUTBOX (the number or a group's numbers, the picture or an empty line, the text) */
+- (void)queueMMS:(NSString *)picture text:(NSString *)text
+{
+	NSString *request, *name = [NSString stringWithFormat:@"out-%ld", (long)NSDate.date.timeIntervalSince1970];
+
+	if (self.sending != nil) {
+		return;
+	}
+	[NSFileManager.defaultManager createDirectoryAtPath:OUTBOX withIntermediateDirectories:YES attributes:nil error:NULL];
+	request = [NSString stringWithFormat:@"%@\n%@\n%@", self.number, picture ?: @"", text];
 	self.mmsRequest = [OUTBOX stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"req"]];
 	[request writeToFile:[self.mmsRequest stringByAppendingString:@".tmp"] atomically:YES encoding:NSUTF8StringEncoding error:NULL];
 	rename([self.mmsRequest stringByAppendingString:@".tmp"].fileSystemRepresentation, self.mmsRequest.fileSystemRepresentation);
-	NSLog(@"Texts: an MMS to %@: a picture of %lu bytes", self.number, (unsigned long)jpeg.length);
 	self.sending = [Text new];
 	self.sending.when = NSDate.date;
 	self.sending.kind = @"sending";
 	self.sending.number = self.number;
-	self.sending.body = text.length != 0 ? [NSString stringWithFormat:@"%@\n\001IMG:%@", text, saved] :
-	    [@"\001IMG:" stringByAppendingString:saved];
+	self.sending.body = picture == nil ? text : text.length != 0 ? [NSString stringWithFormat:@"%@\n\001IMG:%@", text, picture] :
+	    [@"\001IMG:" stringByAppendingString:picture];
 	self.field.text = @"";
 	[self reload];
 }
@@ -649,7 +704,13 @@ body_plain(NSString *body)
 {
 	Bubble *cell = [tableView dequeueReusableCellWithIdentifier:@"bubble" forIndexPath:indexPath];
 
-	[cell show:self.texts[(NSUInteger)indexPath.row]];
+	Text *t = self.texts[(NSUInteger)indexPath.row];
+
+	[cell show:t];
+	if (t.sender.length != 0 && [t.kind isEqualToString:@"in"]) {
+		/* (a group's: who wrote it) */
+		cell.note.text = [NSString stringWithFormat:@"%@ · %@", name_of(self.names, t.sender), cell.note.text];
+	}
 	return cell;
 }
 
@@ -693,7 +754,7 @@ body_plain(NSString *body)
 	}
 	self.count = texts.count;
 	for (Text *t in texts) {
-		last[tail_digits(t.number)] = t;
+		last[thread_key(t.number)] = t;
 	}
 	self.latest = [last.allValues sortedArrayUsingComparator:^NSComparisonResult(Text *a, Text *b) {
 		return [b.when compare:a.when];
@@ -703,7 +764,7 @@ body_plain(NSString *body)
 
 - (NSString *)nameOf:(NSString *)number
 {
-	return self.names[tail_digits(number)] ?: number;
+	return name_of(self.names, number);
 }
 
 - (void)open:(NSString *)number
@@ -717,7 +778,7 @@ body_plain(NSString *body)
 
 - (void)compose:(id)sender
 {
-	UIAlertController *a = [UIAlertController alertControllerWithTitle:@"New Message" message:@"To a number, or a contact's name"
+	UIAlertController *a = [UIAlertController alertControllerWithTitle:@"New Message" message:@"To a number or a contact's name; several, separated by commas, for a group"
 	    preferredStyle:UIAlertControllerStyleAlert];
 	__weak UIAlertController *weak = a;
 
@@ -726,25 +787,32 @@ body_plain(NSString *body)
 	}];
 	[a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
 	[a addAction:[UIAlertAction actionWithTitle:@"Next" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
-		NSString *to = [weak.textFields[0].text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
-		NSMutableString *number = [NSMutableString string];
+		NSMutableArray<NSString *> *numbers = [NSMutableArray array];
 
-		/* a contact's name: its number */
-		for (NSString *tail in self.names) {
-			if ([self.names[tail] localizedCaseInsensitiveCompare:to] == NSOrderedSame) {
-				to = tail;
-				break;
+		/* each one, separated by commas: a contact's name (its number) or a number; several make a group */
+		for (NSString *piece in [weak.textFields[0].text componentsSeparatedByString:@","]) {
+			NSString *to = [piece stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+			NSMutableString *number = [NSMutableString string];
+
+			for (NSString *tail in self.names) {
+				if ([self.names[tail] localizedCaseInsensitiveCompare:to] == NSOrderedSame) {
+					to = tail;
+					break;
+				}
+			}
+			for (NSUInteger i = 0; i < to.length; i++) {
+				unichar c = [to characterAtIndex:i];
+
+				if ((c >= '0' && c <= '9') || (c == '+' && number.length == 0)) {
+					[number appendFormat:@"%C", c];
+				}
+			}
+			if (tail_digits(number).length >= 3) {
+				[numbers addObject:number];
 			}
 		}
-		for (NSUInteger i = 0; i < to.length; i++) {
-			unichar c = [to characterAtIndex:i];
-
-			if ((c >= '0' && c <= '9') || (c == '+' && number.length == 0)) {
-				[number appendFormat:@"%C", c];
-			}
-		}
-		if (tail_digits(number).length >= 3) {
-			[self open:number];
+		if (numbers.count != 0) {
+			[self open:[numbers componentsJoinedByString:@","]];
 		}
 	}]];
 	[self presentViewController:a animated:YES completion:nil];

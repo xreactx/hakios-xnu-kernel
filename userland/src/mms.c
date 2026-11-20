@@ -23,6 +23,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -267,14 +268,46 @@ part_type(const unsigned char *p, size_t n, size_t at, char *type, size_t size)
 	}
 }
 
-/* m-retrieve-conf's parts: the text into text, the pictures saved and named in it; the sender into from */
+static unsigned recipients;            /* To and Cc headers of the last message unpacked: 2 or more, a group's */
+
+/* number appended to the comma-separated list (if it is not there and is not this phone's own) */
+static void
+add_number(char *list, size_t size, const char *number, const char *own)
+{
+	char padded[512];
+
+	if (number[0] == 0 || (own[0] != 0 && strcmp(number, own) == 0)) {
+		return;
+	}
+	snprintf(padded, sizeof(padded), ",%s,", list);
+	{
+		char needle[40];
+
+		snprintf(needle, sizeof(needle), ",%s,", number);
+		if (strstr(padded, needle) != NULL) {
+			return;
+		}
+	}
+	if (list[0] != 0) {
+		strlcat(list, ",", size);
+	}
+	strlcat(list, number, size);
+}
+
+/*
+ * m-retrieve-conf's parts: the text into text, the pictures saved and named in it; the sender into from; everyone on
+ * it but this phone (the sender, To and Cc: a group's members) into people, comma-separated
+ */
 static int
-unpack(const unsigned char *m, size_t n, char *from, size_t from_size, char *text, size_t text_size)
+unpack(const unsigned char *m, size_t n, char *from, size_t from_size, char *text, size_t text_size, char *people,
+    size_t people_size, const char *own)
 {
 	size_t at = 0, parts, pictures = 0;
 	unsigned long when = (unsigned long)time(NULL);
 
 	text[0] = 0;
+	people[0] = 0;
+	recipients = 0;
 	/* the headers, to the content type (the last of them) */
 	while (at < n) {
 		unsigned char field = m[at++];
@@ -284,6 +317,16 @@ unpack(const unsigned char *m, size_t n, char *from, size_t from_size, char *tex
 
 			skip_value(m, n, &at);
 			plmn_number(m, start, at, from, from_size);
+			continue;
+		}
+		if (field == 0x97 || field == 0x82) {   /* To, Cc: one recipient a header */
+			size_t start = at;
+			char number[32] = "";
+
+			skip_value(m, n, &at);
+			plmn_number(m, start, at, number, sizeof(number));
+			recipients++;
+			add_number(people, people_size, number, own);
 			continue;
 		}
 		if (field == 0x84) {            /* Content-Type: the body follows it */
@@ -343,7 +386,20 @@ unpack(const unsigned char *m, size_t n, char *from, size_t from_size, char *tex
 		}
 		at = data_at + data;
 	}
+	add_number(people, people_size, from, own);
 	return text[0] != 0;
+}
+
+/* this phone's own number (the kernel's, from the IMS registration), or "" */
+static void
+own_number(char *out, size_t size)
+{
+	size_t length = size - 1;
+
+	if (sysctlbyname("kern.hakios.own_number", out, &length, NULL, 0) != 0) {
+		length = 0;
+	}
+	out[length < size ? length : size - 1] = 0;
 }
 
 /*
@@ -351,14 +407,17 @@ unpack(const unsigned char *m, size_t n, char *from, size_t from_size, char *tex
  * (see above), the sender into from; 0 when it could not be.
  */
 int
-mms_fetch(const unsigned char *push, size_t n, char *from, size_t from_size, char *text, size_t text_size)
+mms_fetch(const unsigned char *push, size_t n, char *from, size_t from_size, char *text, size_t text_size, char *people,
+    size_t people_size)
 {
+	char own[32];
 	size_t at = 0, headers, length = 0;
 	char location[512] = "", transaction[128] = "", request[1024];
 	unsigned char *m;
 	int status = 0, ok;
 
 	settings();
+	own_number(own, sizeof(own));
 	/* WSP push: a transaction id, the PDU type (6), its headers (their length a uintvar), then the MMS PDU */
 	if (n < 3 || push[1] != 0x06) {
 		printf("smsd: mms: not a WAP push (type %#x)\n", n > 1 ? push[1] : 0);
@@ -410,7 +469,14 @@ mms_fetch(const unsigned char *push, size_t n, char *from, size_t from_size, cha
 		return 0;
 	}
 	printf("smsd: mms: %zu bytes fetched\n", length);
-	ok = length > 2 && m[0] == 0x8c && m[1] == 0x84 && unpack(m, length, from, from_size, text, text_size);
+	ok = length > 2 && m[0] == 0x8c && m[1] == 0x84 && unpack(m, length, from, from_size, text, text_size, people,
+	    people_size, own);
+	if (ok && recipients < 2) {
+		strlcpy(people, from, people_size);     /* (one recipient: this phone; not a group) */
+	}
+	if (ok && strchr(people, ',') != NULL) {
+		printf("smsd: mms: a group's: %s (this phone %s)\n", people, own[0] != 0 ? own : "not known");
+	}
 	free(m);
 	if (!ok) {
 		printf("smsd: mms: what was fetched is not a message with text or pictures\n");
@@ -511,7 +577,7 @@ mms_send(const char *number, const char *text, const char *picture)
 			return 0;
 		}
 	}
-	pdu = malloc(1024 + text_length + image_length);
+	pdu = malloc(2048 + text_length + image_length);
 	if (pdu == NULL) {
 		free(image);
 		return 0;
@@ -523,7 +589,15 @@ mms_send(const char *number, const char *text, const char *picture)
 	p += strlen(transaction) + 1;
 	pdu[p++] = 0x8d; pdu[p++] = 0x92;                       /* X-Mms-MMS-Version: 1.2 */
 	pdu[p++] = 0x89; pdu[p++] = 0x01; pdu[p++] = 0x81;      /* From: insert-address */
-	p += (size_t)snprintf((char *)pdu + p, 64, "%c%s/TYPE=PLMN", 0x97, number) + 1;   /* To (and its NUL) */
+	{
+		/* To: a header for each recipient (a group's: number is a comma-separated list) */
+		char list[512], *one, *rest;
+
+		strlcpy(list, number, sizeof(list));
+		for (one = strtok_r(list, ",", &rest); one != NULL; one = strtok_r(NULL, ",", &rest)) {
+			p += (size_t)snprintf((char *)pdu + p, 64, "%c%s/TYPE=PLMN", 0x97, one) + 1;    /* (and its NUL) */
+		}
+	}
 	pdu[p++] = 0x84; pdu[p++] = 0xa3;                       /* Content-Type: application/vnd.wap.multipart.mixed */
 	p += put_uintvar(pdu + p, (text_length != 0) + (image != NULL));
 	if (text_length != 0) {

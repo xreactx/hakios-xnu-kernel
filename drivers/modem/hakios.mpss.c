@@ -8116,6 +8116,9 @@ static int sms_send_state, sms_sends;
 SYSCTL_INT(_kern_hakios, OID_AUTO, sms_send_state, CTLFLAG_RD | CTLFLAG_LOCKED, &sms_send_state, 0,
     "the last text sent: 0 none, 1 sending, 2 sent, 3 not sent");
 SYSCTL_INT(_kern_hakios, OID_AUTO, sms_sends, CTLFLAG_RD | CTLFLAG_LOCKED, &sms_sends, 0, "texts sent or failed");
+static char own_number[24];
+SYSCTL_STRING(_kern_hakios, OID_AUTO, own_number, CTLFLAG_RD | CTLFLAG_LOCKED, own_number, sizeof(own_number),
+    "this phone's number, as IMS registered it");
 #define SMS_KEPT                16
 static struct {
 	uint32_t seq;
@@ -9119,6 +9122,31 @@ imsa_receive(__unused void *context, __unused uint32_t node, __unused uint32_t p
 		/* every IMSA indication (registered for with 0x22 below): 0x23 registration, 0x24 services, 0x26 PDP status ... */
 		tell("mpss: ims: indication %#x (%u bytes)\n", m[3] | m[4] << 8, (unsigned)length);
 		sms_hex("ims ind", m, (unsigned)(length > 160 ? 160 : length));
+		{
+			/* the phone's own number: the registration's "tel:+NUMBER" identity (AT&T: TLV 0x14 of 0x23) */
+			const char *tel = NULL;
+
+			for (size_t k = 0; k + 5 <= length && tel == NULL; k++) {
+				if (memcmp((const char *)m + k, "tel:+", 5) == 0) {
+					tel = (const char *)m + k;
+				}
+			}
+
+			if (tel != NULL) {
+				char number[sizeof(own_number)];
+				size_t n = 0;
+
+				for (const char *c = tel + 4; c < (const char *)m + length && n + 1 < sizeof(number) &&
+				    ((*c >= '0' && *c <= '9') || (*c == '+' && n == 0)); c++) {
+					number[n++] = *c;
+				}
+				number[n] = 0;
+				if (n >= 8 && strcmp(number, own_number) != 0) {
+					strlcpy(own_number, number, sizeof(own_number));
+					tell("mpss: ims: this phone's number: %s\n", own_number);
+				}
+			}
+		}
 		return;
 	}
 	if (length < 7 || m[0] != QMI_RESPONSE) {

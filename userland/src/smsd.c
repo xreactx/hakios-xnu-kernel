@@ -64,9 +64,12 @@ unescape(char *s)
 	*o = 0;
 }
 
-/* a text into the conversations file, escaped: its kind (in, out, failed), the other side's number */
+/*
+ * a text into the conversations file, escaped: its kind (in, out, failed), the conversation (the other side's number,
+ * or a group's numbers comma-separated) and, in a group, who wrote it (a fifth field)
+ */
 static void
-keep_kind(const char *kind, const char *from, const char *text)
+keep_kind(const char *kind, const char *from, const char *text, const char *sender)
 {
 	FILE *f;
 
@@ -86,6 +89,9 @@ keep_kind(const char *kind, const char *from, const char *text)
 			fputc(*c, f);
 		}
 	}
+	if (sender != NULL && sender[0] != 0) {
+		fprintf(f, "\t%s", sender);
+	}
 	fputc('\n', f);
 	fclose(f);
 	(void)chown(TEXTS, MOBILE, MOBILE);
@@ -95,7 +101,7 @@ keep_kind(const char *kind, const char *from, const char *text)
 static void
 keep(const char *from, const char *text)
 {
-	keep_kind("in", from, text);
+	keep_kind("in", from, text, NULL);
 }
 
 /*
@@ -168,7 +174,7 @@ outbox(void)
 				strcat(body, "\001IMG:");
 				strcat(body, picture);
 			}
-			keep_kind(ok ? "out" : "failed", number, body);
+			keep_kind(ok ? "out" : "failed", number, body, NULL);
 			free(body);
 		}
 		free(request);
@@ -182,7 +188,9 @@ outbox(void)
  * (src/mms.c): its text, and its pictures as "\001IMG:PATH" lines; the sender is the one inside it. When it cannot be
  * fetched, it is said so. 1 when it was one (and taken care of).
  */
-extern int mms_fetch(const unsigned char *push, size_t n, char *from, size_t from_size, char *text, size_t text_size);
+extern int mms_fetch(const unsigned char *push, size_t n, char *from, size_t from_size, char *text, size_t text_size,
+    char *people, size_t people_size);
+static char group[512];                 /* the last MMS's people, comma-separated, when it was a group's */
 
 static int
 data_message(char *from, const char **text)
@@ -206,7 +214,8 @@ data_message(char *from, const char **text)
 	}
 	bytes[n] = 0;
 	printf("smsd: a data message of %zu bytes\n", n);
-	if (!mms_fetch(bytes, n, from, 24, said, sizeof(said))) {
+	group[0] = 0;
+	if (!mms_fetch(bytes, n, from, 24, said, sizeof(said), group, sizeof(group))) {
 		snprintf(said, sizeof(said), "[A picture or long message (MMS) that could not be fetched]");
 	}
 	*text = said;
@@ -221,11 +230,17 @@ arrived(const char *sender, const char *text)
 	CFStringRef header, message;
 
 	strlcpy(from, sender, sizeof(from));
+	group[0] = 0;
 	(void)data_message(from, &text);
 
-	keep(from, text);
+	if (strchr(group, ',') != NULL) {
+		/* a group's: the conversation is its people, and who wrote it is said */
+		keep_kind("in", group, text, from);
+	} else {
+		keep(from, text);
+	}
 	if (contact_name(from, name, sizeof(name))) {
-		snprintf(title, sizeof(title), "%s", name);
+		snprintf(title, sizeof(title), "%s%s", name, strchr(group, ',') != NULL ? " (group)" : "");
 	} else {
 		snprintf(title, sizeof(title), "Text from %s", from);
 	}
