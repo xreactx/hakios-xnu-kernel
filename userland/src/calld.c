@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <time.h>
 #include <unistd.h>
 
 /* (in iOS's CoreFoundation, served by SpringBoard, but not in the SDK's headers: declared by their symbols) */
@@ -116,6 +117,23 @@ alert(const char *header, const char *message, CFStringRef first, CFStringRef se
 
 static SystemSoundID ringtone;
 static atomic_int ringing, ring_playing;
+static uint64_t buzzed_us;              /* the last vibration's start */
+
+#define BUZZ_EVERY_US                   1500000         /* (as an iPhone's ring: a buzz, a pause) */
+
+static uint64_t
+now_us(void)
+{
+	return clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1000;
+}
+
+/* the phone vibrates while it rings, through iOS's own vibration (the audio plugin's motor: /dev/hakios-haptic) */
+static void
+buzz(void)
+{
+	buzzed_us = now_us();
+	AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+}
 
 static void
 ring_once(void)
@@ -129,6 +147,8 @@ ring_once(void)
 static void
 ring_start(void)
 {
+	atomic_store(&ringing, 1);
+	buzz();
 	if (ringtone == 0) {
 		CFURLRef url = CFURLCreateWithFileSystemPath(NULL, CFSTR(RINGTONE), kCFURLPOSIXPathStyle, false);
 		OSStatus status = AudioServicesCreateSystemSoundID(url, &ringtone);
@@ -147,6 +167,9 @@ ring_start(void)
 static void
 ring_tick(void)
 {
+	if (atomic_load(&ringing) && now_us() - buzzed_us >= BUZZ_EVERY_US) {
+		buzz();
+	}
 	if (ringtone != 0 && atomic_load(&ringing) && !atomic_load(&ring_playing)) {
 		ring_once();
 	}
