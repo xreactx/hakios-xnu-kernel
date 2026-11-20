@@ -1,7 +1,9 @@
 /*
  * calld's names: the caller's name from iOS's own contacts (Contacts.framework, served by contactsd -- the people
  * entered in the Contacts application), for the call's alerts. calld is signed for the address book
- * (src/calld.entitlements: com.apple.private.tcc.allow kTCCServiceAddressBook).
+ * (src/calld.entitlements: com.apple.private.tcc.allow kTCCServiceAddressBook) and asks contactsd for it -- not
+ * com.apple.Contacts.database-allow, with which the framework opens the database itself, in the home of the user
+ * it runs as: root's, where there is none (0 contacts read, 19 November).
  *
  * Numbers are matched by their last 10 digits (a number dialled as 808..., +1808... and 1808... is the same one).
  */
@@ -64,7 +66,8 @@ contact_name(const char *number, char *out, size_t size)
 			printf("calld: the contacts cannot be read: %s\n", error.localizedDescription.UTF8String);
 		}
 		if (!found) {
-			printf("calld: %d contacts read, none with this number\n", seen);
+			printf("calld: %d contacts read (authorization %ld), none with this number\n", seen,
+			    (long)[CNContactStore authorizationStatusForEntityType:CNEntityTypeContacts]);
 			/* (Phone Pad's copy of the names, kept whenever it reads the contacts: NAMES, a 10-digit tail and a name a line) */
 			NSString *text = [NSString stringWithContentsOfFile:@NAMES encoding:NSUTF8StringEncoding error:NULL];
 
