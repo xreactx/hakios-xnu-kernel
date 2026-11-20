@@ -10,9 +10,62 @@
  */
 #import <UIKit/UIKit.h>
 #import <Contacts/Contacts.h>
+#import <ImageIO/ImageIO.h>
 #include <sys/sysctl.h>
 
 #define TEXTS @"/private/var/mobile/Library/HakiOS/texts.txt"
+#define MMS_DIR @"/private/var/mobile/Library/HakiOS/mms"
+#define OUTBOX @"/private/var/mobile/Library/HakiOS/outbox"
+#define PHOTOS @"/private/var/mobile/Media/DCIM"
+
+/* a picture made small enough to send (MMS: some 300 KB): its longer side 1280 pixels, JPEG, upright; NULL if not read */
+static NSData *
+picture_to_send(NSString *path)
+{
+	CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
+	NSDictionary *o = @{ (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+		(id)kCGImageSourceCreateThumbnailWithTransform: @YES, (id)kCGImageSourceThumbnailMaxPixelSize: @1280 };
+	CGImageRef small;
+	NSData *jpeg = nil;
+
+	if (source == NULL) {
+		return nil;
+	}
+	small = CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)o);
+	CFRelease(source);
+	if (small != NULL) {
+		for (CGFloat quality = 0.7; quality > 0.2; quality -= 0.15) {
+			jpeg = UIImageJPEGRepresentation([UIImage imageWithCGImage:small], quality);
+			if (jpeg.length < 300 * 1024) {
+				break;
+			}
+		}
+		CGImageRelease(small);
+	}
+	return jpeg;
+}
+
+/* a thumbnail of the picture at path, side pixels at most */
+static UIImage *
+thumbnail(NSString *path, CGFloat side)
+{
+	CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
+	NSDictionary *o = @{ (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+		(id)kCGImageSourceCreateThumbnailWithTransform: @YES, (id)kCGImageSourceThumbnailMaxPixelSize: @(side) };
+	CGImageRef small;
+	UIImage *image = nil;
+
+	if (source == NULL) {
+		return nil;
+	}
+	small = CGImageSourceCreateThumbnailAtIndex(source, 0, (__bridge CFDictionaryRef)o);
+	CFRelease(source);
+	if (small != NULL) {
+		image = [UIImage imageWithCGImage:small];
+		CGImageRelease(small);
+	}
+	return image;
+}
 
 static NSString *
 tail_digits(NSString *number)
@@ -260,6 +313,112 @@ body_plain(NSString *body)
 
 @end
 
+/* ---- a picture to send: the camera's (DCIM) and the ones received, newest first ---- */
+
+@interface PickerController : UICollectionViewController
+@property (nonatomic, strong) NSArray<NSString *> *paths;
+@property (nonatomic, copy) void (^picked)(NSString *path);
+@property (nonatomic, strong) NSCache *thumbnails;
+@end
+
+@implementation PickerController
+
+- (instancetype)init
+{
+	UICollectionViewFlowLayout *layout = [UICollectionViewFlowLayout new];
+	CGFloat side = (UIScreen.mainScreen.bounds.size.width - 4) / 3;
+
+	layout.itemSize = CGSizeMake(side, side);
+	layout.minimumInteritemSpacing = 2;
+	layout.minimumLineSpacing = 2;
+	return [super initWithCollectionViewLayout:layout];
+}
+
+- (void)viewDidLoad
+{
+	NSMutableArray<NSString *> *found = [NSMutableArray array];
+	NSMutableDictionary<NSString *, NSDate *> *when = [NSMutableDictionary dictionary];
+	NSFileManager *fm = NSFileManager.defaultManager;
+
+	[super viewDidLoad];
+	self.title = @"Choose a Picture";
+	self.thumbnails = [NSCache new];
+	self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemCancel
+	    target:self action:@selector(cancel:)];
+	[self.collectionView registerClass:[UICollectionViewCell class] forCellWithReuseIdentifier:@"picture"];
+	for (NSString *root in @[ PHOTOS, MMS_DIR ]) {
+		NSDirectoryEnumerator *e = [fm enumeratorAtPath:root];
+
+		for (NSString *name in e) {
+			NSString *ext = name.pathExtension.lowercaseString;
+
+			if ([@[ @"jpg", @"jpeg", @"heic", @"png" ] containsObject:ext]) {
+				NSString *path = [root stringByAppendingPathComponent:name];
+
+				[found addObject:path];
+				when[path] = [fm attributesOfItemAtPath:path error:NULL].fileModificationDate ?: NSDate.distantPast;
+			}
+		}
+	}
+	self.paths = [found sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+		return [when[b] compare:when[a]];
+	}];
+	NSLog(@"Texts: %lu pictures to choose from", (unsigned long)self.paths.count);
+}
+
+- (void)cancel:(id)sender
+{
+	[self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (NSInteger)collectionView:(UICollectionView *)collectionView numberOfItemsInSection:(NSInteger)section
+{
+	return (NSInteger)self.paths.count;
+}
+
+- (UICollectionViewCell *)collectionView:(UICollectionView *)collectionView cellForItemAtIndexPath:(NSIndexPath *)indexPath
+{
+	UICollectionViewCell *cell = [collectionView dequeueReusableCellWithReuseIdentifier:@"picture" forIndexPath:indexPath];
+	NSString *path = self.paths[(NSUInteger)indexPath.item];
+	UIImageView *view = (UIImageView *)[cell.contentView viewWithTag:1];
+	UIImage *small = [self.thumbnails objectForKey:path];
+
+	if (view == nil) {
+		view = [[UIImageView alloc] initWithFrame:cell.contentView.bounds];
+		view.tag = 1;
+		view.contentMode = UIViewContentModeScaleAspectFill;
+		view.clipsToBounds = YES;
+		[cell.contentView addSubview:view];
+	}
+	view.image = small;
+	if (small == nil) {
+		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+			UIImage *made = thumbnail(path, 300);
+
+			if (made != nil) {
+				[self.thumbnails setObject:made forKey:path];
+				dispatch_async(dispatch_get_main_queue(), ^{
+					[collectionView reloadItemsAtIndexPaths:@[ indexPath ]];
+				});
+			}
+		});
+	}
+	return cell;
+}
+
+- (void)collectionView:(UICollectionView *)collectionView didSelectItemAtIndexPath:(NSIndexPath *)indexPath
+{
+	NSString *path = self.paths[(NSUInteger)indexPath.item];
+
+	[self dismissViewControllerAnimated:YES completion:^{
+		if (self.picked != nil) {
+			self.picked(path);
+		}
+	}];
+}
+
+@end
+
 @interface ThreadController : UIViewController <UITableViewDataSource, UITextFieldDelegate>
 @property (nonatomic, copy) NSString *number, *tail;
 @property (nonatomic, strong) NSArray<Text *> *texts;
@@ -267,6 +426,7 @@ body_plain(NSString *body)
 @property (nonatomic, strong) UITextField *field;
 @property (nonatomic, strong) UIButton *send;
 @property (nonatomic, strong) Text *sending;
+@property (nonatomic, copy) NSString *mmsRequest;       /* the MMS being sent: its request in OUTBOX, until smsd takes it */
 @property (nonatomic) int sends;
 @property (nonatomic, strong) NSTimer *timer;
 @end
@@ -302,8 +462,17 @@ body_plain(NSString *body)
 	self.send.tintColor = UIColor.systemGreenColor;
 	[self.send addTarget:self action:@selector(sendText) forControlEvents:UIControlEventTouchUpInside];
 	self.send.translatesAutoresizingMaskIntoConstraints = NO;
+	UIButton *photo = [UIButton buttonWithType:UIButtonTypeSystem];
+
+	[photo setImage:[UIImage systemImageNamed:@"photo.on.rectangle" withConfiguration:[UIImageSymbolConfiguration
+	    configurationWithPointSize:22]] forState:UIControlStateNormal];
+	photo.tintColor = UIColor.systemGrayColor;
+	photo.accessibilityLabel = @"Picture";
+	[photo addTarget:self action:@selector(choosePicture) forControlEvents:UIControlEventTouchUpInside];
+	photo.translatesAutoresizingMaskIntoConstraints = NO;
 	[self.view addSubview:self.table];
 	[self.view addSubview:bar];
+	[bar addSubview:photo];
 	[bar addSubview:self.field];
 	[bar addSubview:self.send];
 	[NSLayoutConstraint activateConstraints:@[
@@ -316,7 +485,9 @@ body_plain(NSString *body)
 		[bar.bottomAnchor constraintEqualToAnchor:self.view.keyboardLayoutGuide.topAnchor],
 		[self.field.topAnchor constraintEqualToAnchor:bar.topAnchor constant:8],
 		[self.field.bottomAnchor constraintEqualToAnchor:bar.bottomAnchor constant:-8],
-		[self.field.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:12],
+		[photo.leadingAnchor constraintEqualToAnchor:bar.leadingAnchor constant:10],
+		[photo.centerYAnchor constraintEqualToAnchor:self.field.centerYAnchor],
+		[self.field.leadingAnchor constraintEqualToAnchor:photo.trailingAnchor constant:8],
 		[self.field.heightAnchor constraintEqualToConstant:36],
 		[self.send.leadingAnchor constraintEqualToAnchor:self.field.trailingAnchor constant:8],
 		[self.send.trailingAnchor constraintEqualToAnchor:bar.trailingAnchor constant:-10],
@@ -363,7 +534,15 @@ body_plain(NSString *body)
 /* every second: a text that came, and the one being sent */
 - (void)tick
 {
-	if (self.sending != nil) {
+	if (self.sending != nil && self.mmsRequest != nil) {
+		/* (an MMS: smsd removes the request, then writes the text out or failed; a while to send a picture) */
+		if (![NSFileManager.defaultManager fileExistsAtPath:self.mmsRequest] &&
+		    [[Store texts].lastObject.body isEqualToString:self.sending.body]) {
+			self.sending = nil;
+			self.mmsRequest = nil;
+			self.texts = @[];
+		}
+	} else if (self.sending != nil) {
 		int state = 0, sends = 0;
 		size_t size = sizeof(int);
 
@@ -410,6 +589,47 @@ body_plain(NSString *body)
 	self.sending.kind = @"sending";
 	self.sending.number = self.number;
 	self.sending.body = body;
+	self.field.text = @"";
+	[self reload];
+}
+
+- (void)choosePicture
+{
+	PickerController *picker = [PickerController new];
+	__weak ThreadController *weak = self;
+
+	picker.picked = ^(NSString *path) {
+		[weak sendPicture:path];
+	};
+	[self presentViewController:[[UINavigationController alloc] initWithRootViewController:picker] animated:YES completion:nil];
+}
+
+/* the picture made small, saved, and an MMS asked of smsd (OUTBOX: number, picture, text); the field's text with it */
+- (void)sendPicture:(NSString *)path
+{
+	NSData *jpeg = picture_to_send(path);
+	NSString *saved, *request, *name, *text = self.field.text ?: @"";
+	NSFileManager *fm = NSFileManager.defaultManager;
+
+	if (jpeg == nil || self.sending != nil) {
+		return;
+	}
+	[fm createDirectoryAtPath:MMS_DIR withIntermediateDirectories:YES attributes:nil error:NULL];
+	[fm createDirectoryAtPath:OUTBOX withIntermediateDirectories:YES attributes:nil error:NULL];
+	name = [NSString stringWithFormat:@"out-%ld", (long)NSDate.date.timeIntervalSince1970];
+	saved = [MMS_DIR stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"jpg"]];
+	[jpeg writeToFile:saved atomically:YES];
+	request = [NSString stringWithFormat:@"%@\n%@\n%@", self.number, saved, text];
+	self.mmsRequest = [OUTBOX stringByAppendingPathComponent:[name stringByAppendingPathExtension:@"req"]];
+	[request writeToFile:[self.mmsRequest stringByAppendingString:@".tmp"] atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+	rename([self.mmsRequest stringByAppendingString:@".tmp"].fileSystemRepresentation, self.mmsRequest.fileSystemRepresentation);
+	NSLog(@"Texts: an MMS to %@: a picture of %lu bytes", self.number, (unsigned long)jpeg.length);
+	self.sending = [Text new];
+	self.sending.when = NSDate.date;
+	self.sending.kind = @"sending";
+	self.sending.number = self.number;
+	self.sending.body = text.length != 0 ? [NSString stringWithFormat:@"%@\n\001IMG:%@", text, saved] :
+	    [@"\001IMG:" stringByAppendingString:saved];
 	self.field.text = @"";
 	[self reload];
 }

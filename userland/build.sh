@@ -277,7 +277,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			  echo "build.sh: no ldid: PhonePad is unsigned, and SpringBoard will not launch it"; }
 		# the 6T's texts, an application (src/Texts.m, Texts/): the conversations, and texts sent through kern.hakios.sms_send
 		rm -rf obj/Texts.app && mkdir -p obj/Texts.app &&
-		$DYN -fobjc-arc -miphoneos-version-min=16.0 -framework UIKit -framework Foundation -framework Contacts -o obj/Texts.app/Texts \
+		$DYN -fobjc-arc -miphoneos-version-min=16.0 -framework UIKit -framework Foundation -framework Contacts -framework ImageIO -framework CoreGraphics -o obj/Texts.app/Texts \
 			src/Texts.m && cp Texts/Info.plist Texts/*.png obj/Texts.app/ &&
 			{ ${LDID:-ldid} -Ssrc/Texts.entitlements obj/Texts.app/Texts 2>/dev/null ||
 			  echo "build.sh: no ldid: Texts is unsigned, and SpringBoard will not launch it"; }

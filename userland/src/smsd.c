@@ -15,6 +15,7 @@
  * Without the sysctls (another phone, or sms=0) it ends at once.
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <stdio.h>
@@ -63,9 +64,9 @@ unescape(char *s)
 	*o = 0;
 }
 
-/* a text into the conversations file, escaped */
+/* a text into the conversations file, escaped: its kind (in, out, failed), the other side's number */
 static void
-keep(const char *from, const char *text)
+keep_kind(const char *kind, const char *from, const char *text)
 {
 	FILE *f;
 
@@ -76,7 +77,7 @@ keep(const char *from, const char *text)
 		perror("smsd: " TEXTS);
 		return;
 	}
-	fprintf(f, "%ld\tin\t%s\t", (long)time(NULL), from);
+	fprintf(f, "%ld\t%s\t%s\t", (long)time(NULL), kind, from);
 	for (const char *c = text; *c != 0; c++) {
 		if (*c == '\\' || *c == '\n' || *c == '\t') {
 			fputc('\\', f);
@@ -89,6 +90,90 @@ keep(const char *from, const char *text)
 	fclose(f);
 	(void)chown(TEXTS, MOBILE, MOBILE);
 	(void)chmod(TEXTS, 0644);
+}
+
+static void
+keep(const char *from, const char *text)
+{
+	keep_kind("in", from, text);
+}
+
+/*
+ * The MMS the Texts application asks to send: a file in OUTBOX each (written whole, then renamed to .req) -- the number
+ * on its first line, the picture's path on its second (empty: none), the text after. Sent (src/mms.c), written into
+ * the conversations as out or failed (the picture as a "\001IMG:PATH" line), and the file removed.
+ */
+#define OUTBOX          TEXTS_DIR "/outbox"
+extern int mms_send(const char *number, const char *text, const char *picture);
+
+static void
+outbox(void)
+{
+	DIR *d = opendir(OUTBOX);
+	struct dirent *e;
+
+	if (d == NULL) {
+		(void)mkdir(TEXTS_DIR, 0755);
+		(void)chown(TEXTS_DIR, MOBILE, MOBILE);
+		(void)mkdir(OUTBOX, 0755);
+		(void)chown(OUTBOX, MOBILE, MOBILE);
+		return;
+	}
+	while ((e = readdir(d)) != NULL) {
+		char path[512], *request, number[32] = "", picture[256] = "", *text, *body;
+		size_t length = strlen(e->d_name);
+		FILE *f;
+		long size;
+		int ok;
+
+		if (length < 5 || strcmp(e->d_name + length - 4, ".req") != 0) {
+			continue;
+		}
+		snprintf(path, sizeof(path), OUTBOX "/%s", e->d_name);
+		f = fopen(path, "r");
+		if (f == NULL) {
+			continue;
+		}
+		fseek(f, 0, SEEK_END);
+		size = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		request = calloc(1, (size_t)size + 1);
+		if (request != NULL) {
+			fread(request, 1, (size_t)size, f);
+		}
+		fclose(f);
+		unlink(path);
+		if (request == NULL) {
+			continue;
+		}
+		text = request;
+		sscanf(text, "%31[^\n]", number);
+		text = strchr(text, '\n');
+		text = text != NULL ? text + 1 : request + size;
+		if (*text != '\n') {
+			sscanf(text, "%255[^\n]", picture);
+		}
+		text = strchr(text, '\n');
+		text = text != NULL ? text + 1 : request + size;
+		printf("smsd: an MMS to send to %s (%s, %zu bytes of text)\n", number, picture[0] != 0 ? "a picture" : "no picture",
+		    strlen(text));
+		ok = number[0] != 0 && mms_send(number, text, picture[0] != 0 ? picture : NULL);
+		body = calloc(1, strlen(text) + strlen(picture) + 16);
+		if (body != NULL) {
+			strcpy(body, text);
+			if (picture[0] != 0) {
+				if (body[0] != 0) {
+					strcat(body, "\n");
+				}
+				strcat(body, "\001IMG:");
+				strcat(body, picture);
+			}
+			keep_kind(ok ? "out" : "failed", number, body);
+			free(body);
+		}
+		free(request);
+	}
+	closedir(d);
 }
 
 /*
@@ -301,6 +386,7 @@ main(void)
 				assemble(p);
 			}
 		}
+		outbox();
 		sleep(1);
 	}
 }

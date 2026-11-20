@@ -455,3 +455,132 @@ mms_fetch(const unsigned char *push, size_t n, char *from, size_t from_size, cha
 	}
 	return 1;
 }
+
+/* ---- sending: m-send-req, POSTed to the MMSC ---- */
+
+static size_t
+put_uintvar(unsigned char *out, size_t v)
+{
+	unsigned char b[5];
+	size_t n = 0;
+
+	do {
+		b[n++] = (unsigned char)(v & 0x7f);
+		v >>= 7;
+	} while (v != 0 && n < sizeof(b));
+	for (size_t i = 0; i < n; i++) {
+		out[i] = b[n - 1 - i] | (i + 1 < n ? 0x80 : 0);
+	}
+	return n;
+}
+
+/*
+ * An MMS to `number` (digits, "+" in front for an international one): `text` (may be empty) and the JPEG at
+ * `picture` (may be NULL). m-send-req, version 1.2: the sender left to the network (insert-address), the recipient
+ * "NUMBER/TYPE=PLMN", a multipart.mixed body of a text/plain part (UTF-8) and an image/jpeg one. 1 when the MMSC
+ * answers with m-send-conf's status Ok.
+ */
+int
+mms_send(const char *number, const char *text, const char *picture)
+{
+	unsigned char *pdu, *answer;
+	unsigned char *image = NULL;
+	size_t image_length = 0, p = 0, text_length = strlen(text), answer_length = 0;
+	char transaction[32], head[512], h[128];
+	const char *host;
+	int status = 0, ok = 0, head_length;
+
+	settings();
+	if (picture != NULL && picture[0] != 0) {
+		FILE *f = fopen(picture, "rb");
+
+		if (f != NULL) {
+			fseek(f, 0, SEEK_END);
+			image_length = (size_t)ftell(f);
+			fseek(f, 0, SEEK_SET);
+			image = malloc(image_length);
+			if (image == NULL || fread(image, 1, image_length, f) != image_length) {
+				free(image);
+				image = NULL;
+				image_length = 0;
+			}
+			fclose(f);
+		}
+		if (image == NULL) {
+			printf("smsd: mms: the picture %s cannot be read\n", picture);
+			return 0;
+		}
+	}
+	pdu = malloc(1024 + text_length + image_length);
+	if (pdu == NULL) {
+		free(image);
+		return 0;
+	}
+	snprintf(transaction, sizeof(transaction), "hakios%lx", (unsigned long)time(NULL));
+	pdu[p++] = 0x8c; pdu[p++] = 0x80;                       /* X-Mms-Message-Type: m-send-req */
+	pdu[p++] = 0x98;                                        /* X-Mms-Transaction-Id */
+	memcpy(pdu + p, transaction, strlen(transaction) + 1);
+	p += strlen(transaction) + 1;
+	pdu[p++] = 0x8d; pdu[p++] = 0x92;                       /* X-Mms-MMS-Version: 1.2 */
+	pdu[p++] = 0x89; pdu[p++] = 0x01; pdu[p++] = 0x81;      /* From: insert-address */
+	p += (size_t)snprintf((char *)pdu + p, 64, "%c%s/TYPE=PLMN", 0x97, number) + 1;   /* To (and its NUL) */
+	pdu[p++] = 0x84; pdu[p++] = 0xa3;                       /* Content-Type: application/vnd.wap.multipart.mixed */
+	p += put_uintvar(pdu + p, (text_length != 0) + (image != NULL));
+	if (text_length != 0) {
+		static const unsigned char headers[] = { 0x03, 0x83, 0x81, 0xea,  /* text/plain; charset=utf-8 */
+			0x8e, 't', 'e', 'x', 't', '.', 't', 'x', 't', 0 };          /* Content-Location: text.txt */
+
+		p += put_uintvar(pdu + p, sizeof(headers));
+		p += put_uintvar(pdu + p, text_length);
+		memcpy(pdu + p, headers, sizeof(headers));
+		p += sizeof(headers);
+		memcpy(pdu + p, text, text_length);
+		p += text_length;
+	}
+	if (image != NULL) {
+		static const unsigned char headers[] = { 0x9e,                      /* image/jpeg */
+			0x8e, 'i', 'm', 'a', 'g', 'e', '.', 'j', 'p', 'g', 0 };     /* Content-Location: image.jpg */
+
+		p += put_uintvar(pdu + p, sizeof(headers));
+		p += put_uintvar(pdu + p, image_length);
+		memcpy(pdu + p, headers, sizeof(headers));
+		p += sizeof(headers);
+		memcpy(pdu + p, image, image_length);
+		p += image_length;
+	}
+	free(image);
+	host = strstr(mmsc, "://");
+	host = host != NULL ? host + 3 : mmsc;
+	strlcpy(h, host, sizeof(h));
+	h[strcspn(h, "/:")] = 0;
+	head_length = snprintf(head, sizeof(head), "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Android-Mms/2.0\r\n"
+	    "x-wap-profile: http://www.google.com/oha/rdf/ua-profile-kila.xml\r\n"
+	    "Content-Type: application/vnd.wap.mms-message\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", mmsc, h, p);
+	{
+		char *whole = malloc((size_t)head_length + p);
+
+		if (whole != NULL) {
+			memcpy(whole, head, (size_t)head_length);
+			memcpy(whole + head_length, pdu, p);
+			printf("smsd: mms: sending %zu bytes to %s (text %zu bytes, a picture of %zu)\n", p, number, text_length,
+			    image_length);
+			answer = http(whole, (size_t)head_length + p, &answer_length, &status);
+			free(whole);
+			if (answer != NULL && status == 200 && answer_length >= 2 && answer[0] == 0x8c && answer[1] == 0x81) {
+				/* m-send-conf: its X-Mms-Response-Status (0x92): 0x80 Ok */
+				for (size_t i = 2; i + 1 < answer_length; i++) {
+					if (answer[i] == 0x92) {
+						ok = answer[i + 1] == 0x80;
+						printf("smsd: mms: the MMSC answers status %#x%s\n", answer[i + 1], ok ? " (Ok): SENT" : "");
+						break;
+					}
+				}
+			} else {
+				printf("smsd: mms: no m-send-conf (HTTP %d, %zu bytes)\n", status, answer_length);
+			}
+			free(answer);
+		}
+	}
+	free(pdu);
+	return ok;
+}
