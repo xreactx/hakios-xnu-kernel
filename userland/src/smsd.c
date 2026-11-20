@@ -91,12 +91,61 @@ keep(const char *from, const char *text)
 	(void)chmod(TEXTS, 0644);
 }
 
+/*
+ * A data message (the kernel's "\001DATA:" and hex): on this phone an MMS notification -- a WAP push from the carrier
+ * (from a number of its own) saying a picture or long message waits on its MMS server. Its sender is in it, as
+ * "+NUMBER/TYPE=PLMN"; MMS itself (fetched over a data connection of its own) is not done here, so it is said so.
+ * 1 when it was one (and taken care of).
+ */
+static int
+data_message(char *from, const char **text)
+{
+	static char said[96];
+	unsigned char bytes[2048];
+	size_t n = 0;
+	const char *hex = *text + 6, *plmn;
+
+	if (strncmp(*text, "\001DATA:", 6) != 0) {
+		return 0;
+	}
+	while (hex[0] != 0 && hex[1] != 0 && n < sizeof(bytes) - 1) {
+		unsigned v;
+
+		if (sscanf(hex, "%2x", &v) != 1) {
+			break;
+		}
+		bytes[n++] = (unsigned char)v;
+		hex += 2;
+	}
+	bytes[n] = 0;
+	plmn = (const char *)memmem(bytes, n, "/TYPE=PLMN", 10);
+	if (plmn != NULL) {
+		const char *start = plmn;
+
+		while (start > (const char *)bytes && ((start[-1] >= '0' && start[-1] <= '9') || start[-1] == '+')) {
+			start--;
+		}
+		if (plmn - start >= 3 && (size_t)(plmn - start) < 24) {
+			memcpy(from, start, (size_t)(plmn - start));
+			from[plmn - start] = 0;
+		}
+	}
+	printf("smsd: a data message of %zu bytes: %s, from %s\n", n, plmn != NULL ? "an MMS notification" :
+	    "not an MMS notification", from);
+	snprintf(said, sizeof(said), "[A picture or long message (MMS): HakiOS cannot receive those yet]");
+	*text = said;
+	return 1;
+}
+
 /* a whole text: kept and shown */
 static void
-arrived(const char *from, const char *text)
+arrived(const char *sender, const char *text)
 {
-	char name[96], title[160];
+	char name[96], title[160], from[24];
 	CFStringRef header, message;
+
+	strlcpy(from, sender, sizeof(from));
+	(void)data_message(from, &text);
 
 	keep(from, text);
 	if (contact_name(from, name, sizeof(name))) {
@@ -128,7 +177,10 @@ assemble(int p)
 
 	for (unsigned k = 1; k <= pending[p].parts && text != NULL; k++) {
 		if (pending[p].part[k] != NULL) {
-			strlcat(text, pending[p].part[k], TEXT_BYTES);
+			/* (a data message's parts: one "\001DATA:" in front, the hex of each after it) */
+			int data = k > 1 && strncmp(pending[p].part[k], "\001DATA:", 6) == 0;
+
+			strlcat(text, pending[p].part[k] + (data ? 6 : 0), TEXT_BYTES);
 			free(pending[p].part[k]);
 			pending[p].part[k] = NULL;
 		}

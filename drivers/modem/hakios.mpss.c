@@ -8093,7 +8093,7 @@ static volatile int sms_state;                  /* 0 nothing to do or not yet, 1
 static volatile int wms_setup;                  /* 0 not yet, 1 routes and events asked */
 static char sms_to[24];
 static int sms_received;
-#define SMS_PARTS               6
+#define SMS_PARTS               10
 #define SMS_UNITS               (153 * SMS_PARTS)
 static char sms_out_to[24];                     /* the number: digits, a "+" in front for an international one */
 static uint16_t sms_out_units[SMS_UNITS];       /* septets (GSM 7-bit) or UTF-16 units (UCS-2) */
@@ -8278,9 +8278,15 @@ sms_deliver(const uint8_t *p, unsigned n)
 			}
 			o = utf8_put(text, o, sizeof(text), c);
 		}
-	} else if ((dcs & 0xcc) == 0x04) {      /* 8-bit data */
-		snprintf(text, sizeof(text), "(%u bytes of data)", udl);
-		o = (unsigned)strlen(text);
+	} else if ((dcs & 0xcc) == 0x04) {      /* 8-bit data (an MMS notification, a WAP push): "\001DATA:" and its bytes in hex */
+		static const char hex[] = "0123456789abcdef";
+
+		memcpy(text, "\001DATA:", 6);
+		o = 6;
+		for (unsigned k = i + header; k < i + udl && k < n && o + 2 < sizeof(text); k++) {
+			text[o++] = hex[p[k] >> 4];
+			text[o++] = hex[p[k] & 0xf];
+		}
 	} else {                                /* GSM 7-bit, after the header's septets */
 		unsigned skip = (header * 8 + 6) / 7, bits = 0, s = 0;
 		uint32_t acc = 0;
@@ -8419,6 +8425,25 @@ utf8_get(const char *s, size_t *at)
 	return c;
 }
 
+/* what the iPhone's keyboard makes of quotes, dashes and dots, as the GSM alphabet has them -- a curly apostrophe would
+ * otherwise send the whole text in UCS-2, 67 characters a part instead of 153 */
+static uint32_t
+sms_fold(uint32_t c)
+{
+	switch (c) {
+	case 0x2018: case 0x2019: case 0x201a: case 0x2032:
+		return '\'';
+	case 0x201c: case 0x201d: case 0x201e: case 0x2033:
+		return '"';
+	case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014: case 0x2212:
+		return '-';
+	case 0x00a0: case 0x2009: case 0x200a: case 0x202f:
+		return ' ';
+	default:
+		return c;
+	}
+}
+
 /* the text into septets, or (when one character is not in the GSM alphabet) UTF-16 units; false if too long */
 static bool
 sms_out_encode(const char *text)
@@ -8428,9 +8453,16 @@ sms_out_encode(const char *text)
 
 	sms_out_ucs2 = false;
 	while (text[at] != 0) {
-		uint32_t c = utf8_get(text, &at);
+		uint32_t c = sms_fold(utf8_get(text, &at));
 		bool found = false;
 
+		if (c == 0x2026) {              /* (an ellipsis: three dots) */
+			if (n + 3 > SMS_UNITS) {
+				return false;
+			}
+			sms_out_units[n++] = '.'; sms_out_units[n++] = '.'; sms_out_units[n++] = '.';
+			continue;
+		}
 		for (unsigned g = 0; g < 128 && !found; g++) {
 			if (gsm7_unicode[g] == c && g != 0x1b) {
 				if (n + 1 > SMS_UNITS) {
@@ -8526,6 +8558,8 @@ sms_send_sysctl SYSCTL_HANDLER_ARGS
 		}
 	}
 	if (!sms_out_encode(text)) {
+		tell("mpss: sms: a text of %zu bytes to %s is too long to send (%s, at most %u parts)\n", strlen(text), in,
+		    sms_out_ucs2 ? "UCS-2" : "GSM 7-bit", SMS_PARTS);
 		error = E2BIG;
 		goto out;
 	}
