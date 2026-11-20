@@ -567,13 +567,25 @@ mms_send(const char *number, const char *text, const char *picture)
 			answer = http(whole, (size_t)head_length + p, &answer_length, &status);
 			free(whole);
 			if (answer != NULL && status == 200 && answer_length >= 2 && answer[0] == 0x8c && answer[1] == 0x81) {
-				/* m-send-conf: its X-Mms-Response-Status (0x92): 0x80 Ok */
-				for (size_t i = 2; i + 1 < answer_length; i++) {
-					if (answer[i] == 0x92) {
-						ok = answer[i + 1] == 0x80;
-						printf("smsd: mms: the MMSC answers status %#x%s\n", answer[i + 1], ok ? " (Ok): SENT" : "");
+				/* m-send-conf: its X-Mms-Response-Status (0x92): 0x80 Ok -- read header by header (a version 1.2
+				 * is 0x8d 0x92 too: searched for, it was taken for the status, run 180011) */
+				size_t at = 2;
+
+				while (at + 1 < answer_length) {
+					unsigned char field = answer[at++];
+
+					if (field == 0x92) {
+						ok = answer[at] == 0x80;
+						printf("smsd: mms: the MMSC answers status %#x%s\n", answer[at], ok ? " (Ok): SENT" : "");
 						break;
 					}
+					if (field < 0x80) {
+						while (at < answer_length && answer[at] != 0) {
+							at++;
+						}
+						at++;
+					}
+					skip_value(answer, answer_length, &at);
 				}
 			} else {
 				printf("smsd: mms: no m-send-conf (HTTP %d, %zu bytes)\n", status, answer_length);
