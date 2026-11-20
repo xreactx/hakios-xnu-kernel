@@ -190,6 +190,7 @@ void hakios_tfa9894_init(void) {}
 bool hakios_tfa9894_prepare(void) { return false; }
 bool hakios_tfa9894_start(void) { return false; }
 void hakios_tfa9894_stop(void) {}
+bool hakios_tfa9894_attenuate(__unused unsigned half_db) { return false; }
 void hakios_tfa9894_quiesce(void) {}
 #endif
 

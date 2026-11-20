@@ -491,6 +491,42 @@ out:
 	return ok;
 }
 
+/*
+ * The firmware's volume: VOL, register 0x51 bits 8-15 (TFA2 family: TFA2_BF_VOL 0x5187, "FW volume control for
+ * primary audio channel"), an attenuation in steps of 0.5 dB -- 0 (none) is what Android's set-up leaves. Only ever
+ * less than that: the speaker is not driven harder than under Android. Kept, and set again at every start.
+ */
+static unsigned attenuation;                    /* in 0.5 dB */
+
+static bool
+vol_apply(void)
+{
+	uint16_t value = 0;
+	bool ok = reg_get(0x51, &value);
+
+	value = (uint16_t)((value & 0x00ffu) | (attenuation << 8));
+	ok = ok && reg_set(0x51, value);
+	return ok;
+}
+
+bool
+hakios_tfa9894_attenuate(unsigned half_db)
+{
+	bool ok = true;
+
+	lck_mtx_lock(&tfa_lock);
+	attenuation = half_db > 0xff ? 0xff : half_db;
+	if (prepared) {
+		uint16_t now = 0;
+
+		ok = vol_apply() && reg_get(0x51, &now);
+		say("tfa9894: the firmware's volume: -%u.%u dB (register 0x51 %#06x): %s\n", attenuation / 2, attenuation % 2 * 5, now,
+		    ok ? "set" : "NOT SET");
+	}
+	lck_mtx_unlock(&tfa_lock);
+	return ok;
+}
+
 /* Android's start; only while the port's clocks run, which register 0x10 is asked about first */
 bool
 hakios_tfa9894_start(void)
@@ -514,6 +550,9 @@ hakios_tfa9894_start(void)
 	say("tfa9894: before switching on, register 0x10 says %#06x (%s)\n", status, status == 0x785e ?
 	    "as under Android while it played" : "NOT AS UNDER ANDROID WHILE IT PLAYED: 0x785e");
 	ok = ok && reg_set(0x00, 0xa27c);
+	if (ok && attenuation != 0) {
+		(void)vol_apply();
+	}
 	started = ok;
 	show_regs(ok ? "SWITCHED ON" : "NOT SWITCHED ON");
 	lck_mtx_unlock(&tfa_lock);

@@ -2541,7 +2541,7 @@ static int voice_audio;                         /* what is applied */
 
 /*
  * The call's volume: kern.hakios.call_volume, a step from 0 to CALL_VOLUME_STEPS - 1 (-1: never set, the DSP's own), the
- * earpiece's digital volume in the codec (voice_volume(); the loudspeaker's not yet); the volume buttons move it
+ * earpiece's digital volume in the codec, or the loudspeaker amplifier's firmware volume (voice_volume()); the buttons move it
  * during a call (hakios_voice_volume_key(), from drivers/input/hakios.buttons.c). Sent again on every new vocproc.
  */
 #define CALL_VOLUME_STEPS                       6
@@ -2608,10 +2608,13 @@ voice_volume(int step)
 {
 	/* the earpiece's digital volume in the codec: the DSP refuses VSS_IVOLUME_CMD_SET_STEP without a volume calibration */
 	static const int8_t db[CALL_VOLUME_STEPS] = { -15, -10, -5, 0, 3, 6 };
+	/* the loudspeaker: its amplifier's firmware volume, which only takes away (the top is Android's level) */
+	static const int8_t speaker_db[CALL_VOLUME_STEPS] = { -20, -15, -10, -6, -3, 0 };
 
 	if (voice_audio & CALL_AUDIO_SPEAKER) {
-		say("voice: the call's volume, step %d of %d: not on the loudspeaker yet\n", step, CALL_VOLUME_STEPS - 1);
-		return false;
+		say("voice: the call's volume, step %d of %d: %d dB at the loudspeaker\n", step, CALL_VOLUME_STEPS - 1,
+		    speaker_db[step]);
+		return hakios_tfa9894_attenuate((unsigned)(-speaker_db[step] * 2));
 	}
 	say("voice: the call's volume, step %d of %d: %d dB at the earpiece\n", step, CALL_VOLUME_STEPS - 1, db[step]);
 	return hakios_slim_earpiece_gain(db[step]);
@@ -2626,7 +2629,9 @@ hakios_voice_volume_key(int up)
 	if (!voice_running) {
 		return;
 	}
-	step = (call_volume < 0 ? CALL_VOLUME_STEPS / 2 : call_volume) + (up > 0 ? 1 : -1);
+	/* (never set: the earpiece's 0 dB is the middle step, the loudspeaker's Android level the top one) */
+	step = (call_volume >= 0 ? call_volume : (voice_audio & CALL_AUDIO_SPEAKER) ? CALL_VOLUME_STEPS - 1 :
+	    CALL_VOLUME_STEPS / 2) + (up > 0 ? 1 : -1);
 	call_volume = step < 0 ? 0 : step >= CALL_VOLUME_STEPS ? CALL_VOLUME_STEPS - 1 : step;
 }
 
@@ -2634,7 +2639,8 @@ static void
 voice_stop(void)
 {
 	if (voice_volume_now >= 0) {
-		(void)hakios_slim_earpiece_gain(0);     /* (Darwin's earpiece as before) */
+		(void)hakios_slim_earpiece_gain(0);     /* (Darwin's earpiece and speaker as before) */
+		(void)hakios_tfa9894_attenuate(0);
 	}
 	if (voice_mvm != 0) {
 		(void)voice_ask("the voice, stopped", APR_SVC_MVM, voice_mvm, VSS_IMVM_CMD_STOP_VOICE, NULL, 0, NULL);

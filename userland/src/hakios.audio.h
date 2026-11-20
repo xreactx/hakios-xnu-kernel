@@ -85,6 +85,7 @@ void hakios_tfa9894_init(void);        /* boot-arg tfa9894=N: a look (1), or set
 bool hakios_tfa9894_prepare(void);     /* reset, the recorded set-up, powered down */
 bool hakios_tfa9894_start(void);       /* switched on: only while the port's clocks run */
 void hakios_tfa9894_stop(void);        /* muted and powered down */
+bool hakios_tfa9894_attenuate(unsigned half_db);  /* the firmware's volume, down by half_db x 0.5 dB (0: as Android) */
 void hakios_tfa9894_quiesce(void);     /* the same without sleeping, and its reset pin as found: the run's end, a panic */
 /* The OnePlus 6T's earpiece (bsd/dev/hakios.slim.c): the WCD934x codec over the audio SLIMbus. */
 bool hakios_slim_codec_ready(uint32_t ms);     /* the codec brought up (slim=3), waited for up to ms */
