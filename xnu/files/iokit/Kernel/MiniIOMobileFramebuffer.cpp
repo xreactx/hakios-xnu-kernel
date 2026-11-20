@@ -2426,6 +2426,9 @@ panelPowerLocked(bool on)
 	}
 }
 
+/* the panel as Darwin wants it, and held off by the proximity sensor during a call (hakios_fb_proximity()) */
+static bool gPanelWanted = true, gProximityOff;
+
 static void
 panelPower(bool on)
 {
@@ -2433,8 +2436,24 @@ panelPower(bool on)
 		return;
 	}
 	panelLock(true);
-	hakios_tl("fb_panel: the panel %s (%u sent, %u failed)\n", on ? "ON" : "OFF", gPanelSent, gPanelFailed);
-	panelPowerLocked(on);
+	hakios_tl("fb_panel: the panel %s (%u sent, %u failed)%s\n", on ? "ON" : "OFF", gPanelSent, gPanelFailed,
+	    on && gProximityOff ? ": kept off while at the ear" : "");
+	gPanelWanted = on;
+	panelPowerLocked(on && !gProximityOff);
+	panelUnlock();
+}
+
+/* A call held to the ear (near) or taken from it: the panel off, or as Darwin wants it again (drivers/audio/hakios.mic.c) */
+extern "C" void
+hakios_fb_proximity(bool near)
+{
+	if (!panelReady()) {
+		return;
+	}
+	panelLock(true);
+	hakios_tl("fb_panel: %s\n", near ? "at the ear: the panel off" : "from the ear: the panel as it was");
+	gProximityOff = near;
+	panelPowerLocked(!near && gPanelWanted);
 	panelUnlock();
 }
 

@@ -2756,6 +2756,34 @@ voice_controls(void)
 	}
 }
 
+/*
+ * The screen at the ear: while the call's voice runs on the earpiece and the proximity sensor says near
+ * (devices/fajita/soc/drivers/sensors/hakios.slpi.c), the panel is off and touches are dropped, so that a cheek ends
+ * nothing; back as they were when it says far, the call goes to the loudspeaker or ends. (Weak: not every phone has them.)
+ */
+extern int hakios_proximity(void) __attribute__((weak));
+extern void hakios_fb_proximity(bool near) __attribute__((weak));
+extern void hakios_touch_mute(bool mute) __attribute__((weak));
+static bool at_ear;
+
+static void
+voice_ear(void)
+{
+	bool near = voice_running && !(voice_audio & CALL_AUDIO_SPEAKER) && hakios_proximity != NULL && hakios_proximity() == 1;
+
+	if (near == at_ear) {
+		return;
+	}
+	at_ear = near;
+	say("voice: the phone is %s\n", near ? "AT THE EAR: the screen off, touches dropped" : "from the ear: the screen back");
+	if (hakios_touch_mute != NULL) {
+		hakios_touch_mute(near);
+	}
+	if (hakios_fb_proximity != NULL) {
+		hakios_fb_proximity(near);
+	}
+}
+
 static void
 voice_thread(__unused void *argument, __unused wait_result_t result)
 {
@@ -2791,9 +2819,11 @@ voice_thread(__unused void *argument, __unused wait_result_t result)
 				lck_mtx_unlock(&mic_lock);
 			}
 		}
+		voice_ear();
 		sleep_ms(50);
 	}
 	if (voice_running) {
 		voice_stop();
 	}
+	voice_ear();
 }

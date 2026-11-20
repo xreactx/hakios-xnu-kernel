@@ -52,6 +52,15 @@
 #include <sys/systm.h>
 #include <sys/hakios.input.h>
 
+/* the touches dropped (a finger down is lifted): the screen is at an ear in a call (drivers/audio/hakios.mic.c) */
+static volatile bool touch_muted;
+
+void
+hakios_touch_mute(bool mute)
+{
+	touch_muted = mute;
+}
+
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
@@ -715,19 +724,22 @@ touch_watch(void)
 			uint32_t sx = x >= SCREEN_WIDTH - 1 ? 65535 : x * 65535u / (SCREEN_WIDTH - 1);
 			uint32_t sy = y >= SCREEN_HEIGHT - 1 ? 65535 : y * 65535u / (SCREEN_HEIGHT - 1);
 
-			if (o[0] != 0 && kind[f] == 0) {
+			/* (while the screen is held to an ear in a call, nothing is touching: hakios_touch_mute()) */
+			uint8_t object = touch_muted ? 0 : o[0];
+
+			if (object != 0 && kind[f] == 0) {
 				hakios_touch_post(HAKIOS_TOUCH_DOWN, f, sx, sy);
 				touches++;
-			} else if (o[0] != 0 && (sx != posted_x[f] || sy != posted_y[f])) {
+			} else if (object != 0 && (sx != posted_x[f] || sy != posted_y[f])) {
 				hakios_touch_post(HAKIOS_TOUCH_MOVE, f, sx, sy);
-			} else if (o[0] == 0 && kind[f] != 0) {
+			} else if (object == 0 && kind[f] != 0) {
 				hakios_touch_post(HAKIOS_TOUCH_UP, f, posted_x[f], posted_y[f]);
 			}
-			if (o[0] != 0) {
+			if (object != 0) {
 				posted_x[f] = sx;
 				posted_y[f] = sy;
 			}
-			kind[f] = o[0];
+			kind[f] = object;
 		}
 	}
 }

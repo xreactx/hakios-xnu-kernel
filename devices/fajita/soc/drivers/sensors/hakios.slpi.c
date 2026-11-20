@@ -4578,6 +4578,13 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, mag_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &ma
 SYSCTL_INT(_kern_hakios, OID_AUTO, light, CTLFLAG_RD | CTLFLAG_LOCKED, &light, 0, "ambient light, millilux");
 SYSCTL_INT(_kern_hakios, OID_AUTO, light_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &light_samples, 0, "samples so far");
 SYSCTL_INT(_kern_hakios, OID_AUTO, proximity, CTLFLAG_RD | CTLFLAG_LOCKED, &proximity, 0, "1 near, 0 far, -1 not known yet");
+
+/* the proximity sensor: 1 near, 0 far, -1 not known yet (for the call's screen: drivers/audio/hakios.mic.c) */
+int
+hakios_proximity(void)
+{
+	return proximity;
+}
 SYSCTL_INT(_kern_hakios, OID_AUTO, proximity_raw, CTLFLAG_RD | CTLFLAG_LOCKED, &proximity_raw, 0, "the proximity sensor's reading");
 SYSCTL_INT(_kern_hakios, OID_AUTO, proximity_samples, CTLFLAG_RD | CTLFLAG_LOCKED, &proximity_samples, 0, "events so far");
 SYSCTL_INT(_kern_hakios, OID_AUTO, rv_x, CTLFLAG_RD | CTLFLAG_LOCKED, &rv_x, 0, "the geomagnetic rotation vector's x, x 10^6");
