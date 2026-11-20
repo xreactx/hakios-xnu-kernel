@@ -12,6 +12,11 @@
  * call's audio goes through the audio DSP (drivers/audio/hakios.mic.c). An alert is taken down when the call ends on
  * its own (the other side hangs up).
  *
+ * Each call is written down when it is over (the call history Phone Pad shows as Recents): a line of
+ * /var/mobile/Library/HakiOS/calls.txt -- its start (seconds since 1970), its kind (in, missed, declined, out), the
+ * number and how long it talked (s; 0: an outgoing call not answered). /var is kept from run to run (var_store).
+ * The caller's name comes from iOS's contacts (src/calld_contacts.m).
+ *
  * Without the sysctls (another phone, or no modem) it ends at once.
  */
 #include <AudioToolbox/AudioToolbox.h>
@@ -19,6 +24,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <time.h>
 #include <unistd.h>
@@ -38,6 +44,11 @@ extern SInt32 notification_cancel(UserNotificationRef notification) __asm__("_CF
 #define AUDIO_MUTE              2
 
 #define RINGTONE "/Library/Ringtones/Opening.m4r"
+#define HISTORY_DIR "/private/var/mobile/Library/HakiOS"
+#define HISTORY HISTORY_DIR "/calls.txt"
+#define MOBILE                  501     /* the user Phone Pad runs as */
+
+extern int contact_name(const char *number, char *out, size_t size);     /* src/calld_contacts.m */
 
 static int
 call_state(int *ok)
@@ -63,6 +74,68 @@ call_number(char *out, size_t size)
 	if (out[0] == 0) {
 		strlcpy(out, "Unknown", size);
 	}
+}
+
+/* what an alert says of the other side: the contact's name and the number, or the number */
+static void
+caller(char *out, size_t size)
+{
+	char number[64], name[96];
+
+	call_number(number, sizeof(number));
+	if (strcmp(number, "Unknown") != 0 && contact_name(number, name, sizeof(name))) {
+		snprintf(out, size, "%s\n%s", name, number);
+	} else {
+		strlcpy(out, number, size);
+	}
+}
+
+/* ---- the call history ---- */
+
+static struct {
+	int pending;
+	time_t start, talk_start, talk_end;
+	char kind[12], number[64];
+} record;
+
+static void
+record_begin(const char *kind)
+{
+	memset(&record, 0, sizeof(record));
+	record.pending = 1;
+	record.start = time(NULL);
+	strlcpy(record.kind, kind, sizeof(record.kind));
+	call_number(record.number, sizeof(record.number));
+}
+
+static void
+record_kind(const char *kind)
+{
+	strlcpy(record.kind, kind, sizeof(record.kind));
+}
+
+static void
+record_write(void)
+{
+	long talked = record.talk_end > record.talk_start ? (long)(record.talk_end - record.talk_start) : 0;
+	FILE *f;
+
+	if (!record.pending) {
+		return;
+	}
+	record.pending = 0;
+	(void)mkdir(HISTORY_DIR, 0755);
+	(void)chown(HISTORY_DIR, MOBILE, MOBILE);
+	f = fopen(HISTORY, "a");
+	if (f == NULL) {
+		perror("calld: " HISTORY);
+		return;
+	}
+	fprintf(f, "%ld\t%s\t%s\t%ld\n", (long)record.start, record.kind, record.number, talked);
+	fclose(f);
+	(void)chown(HISTORY, MOBILE, MOBILE);
+	(void)chmod(HISTORY, 0644);
+	printf("calld: in the history: %s call, %s, %ld s\n", record.kind, record.number, talked);
 }
 
 static void
@@ -192,12 +265,13 @@ ring_stop(void)
 static void
 incoming(void)
 {
-	char number[64], message[128];
+	char number[64], who[192], message[256];
 	UserNotificationRef n;
 	int ok = 1;
 
 	call_number(number, sizeof(number));
-	snprintf(message, sizeof(message), "%s\n(VoLTE)", number);
+	caller(who, sizeof(who));
+	snprintf(message, sizeof(message), "%s\n(VoLTE)", who);
 	printf("calld: an incoming call from %s: ringing\n", number);
 	n = alert("Incoming Call", message, CFSTR("Answer"), CFSTR("Decline"));
 	ring_start();
@@ -209,9 +283,11 @@ incoming(void)
 			ring_stop();
 			if ((response & 3) == DEFAULT_RESPONSE) {
 				printf("calld: Answer pressed\n");
+				record_kind("in");
 				call_action(1);
 			} else {
 				printf("calld: Decline pressed\n");
+				record_kind("declined");
 				call_action(2);
 			}
 			break;
@@ -223,6 +299,7 @@ incoming(void)
 		state = call_state(&ok);
 		if (state != 2) {
 			printf("calld: the call stopped ringing on its own (state %d)\n", state);
+			record_kind(state == 3 || state == 4 ? "in" : "missed");
 			ring_stop();
 			if (n != NULL) {
 				notification_cancel(n);
@@ -261,11 +338,15 @@ call_audio_set(int v)
 static void
 talking(void)
 {
-	char number[64], message[160];
+	char number[192], message[256];
 	int ok = 1;
 
-	call_number(number, sizeof(number));
-	printf("calld: on the call with %s\n", number);
+	if (!record.pending) {
+		record_begin("in");     /* (a call already up when calld started) */
+	}
+	record.talk_start = time(NULL);
+	caller(number, sizeof(number));
+	printf("calld: on the call with %s\n", record.number);
 	for (;;) {
 		int audio = call_audio_get(), done = 0;
 		UserNotificationRef n;
@@ -309,6 +390,7 @@ talking(void)
 			CFRelease(n);
 		}
 		if (done) {
+			record.talk_end = time(NULL);
 			return;
 		}
 		usleep(300000);         /* (the kernel takes the change; the alert comes back with it) */
@@ -319,12 +401,12 @@ talking(void)
 static void
 outgoing(void)
 {
-	char number[64];
+	char number[192];
 	UserNotificationRef n;
 	int ok = 1;
 
-	call_number(number, sizeof(number));
-	printf("calld: calling %s\n", number);
+	caller(number, sizeof(number));
+	printf("calld: calling %s\n", record.number);
 	n = alert("Calling...", number, CFSTR("End"), NULL);
 	for (;;) {
 		CFOptionFlags response = 0;
@@ -368,16 +450,21 @@ main(void)
 		int state = call_state(&ok);
 
 		if (state == 2 && last != 2) {
+			record_begin("missed");
 			incoming();
 			state = call_state(&ok);
 		}
 		if ((state == 1 || state == 5) && last != 1 && last != 5) {
+			record_begin("out");
 			outgoing();
 			state = call_state(&ok);
 		}
 		if ((state == 3 || state == 4) && last != 3 && last != 4) {
 			talking();
 			state = call_state(&ok);
+		}
+		if (state != 1 && state != 2 && state != 3 && state != 4 && state != 5) {
+			record_write();         /* (the call is over: into the history) */
 		}
 		last = state;
 		usleep(200000);

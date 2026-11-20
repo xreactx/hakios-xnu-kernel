@@ -265,12 +265,12 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			{ ${LDID:-ldid} -Ssrc/smsd.entitlements obj/smsd 2>/dev/null ||
 			  echo "build.sh: no ldid: smsd is unsigned, and SpringBoard will not show its alerts"; }
 		# the 6T's ringing screen (src/calld.c): an incoming call's Answer/Decline alert, with the same entitlement
-		$DYN -framework CoreFoundation -framework AudioToolbox -o obj/calld src/calld.c &&
+		$DYN -fobjc-arc -framework CoreFoundation -framework AudioToolbox -framework Foundation -framework Contacts -o obj/calld src/calld.c src/calld_contacts.m &&
 			{ ${LDID:-ldid} -Ssrc/calld.entitlements obj/calld 2>/dev/null ||
 			  echo "build.sh: no ldid: calld is unsigned, and SpringBoard will not show its alerts"; }
 		# the 6T's dialer, an application (src/PhonePad.m, PhonePad/): the number goes to kern.hakios.call_dial
 		rm -rf obj/PhonePad.app && mkdir -p obj/PhonePad.app &&
-		$DYN -fobjc-arc -miphoneos-version-min=16.0 -framework UIKit -framework Foundation -o obj/PhonePad.app/PhonePad \
+		$DYN -fobjc-arc -miphoneos-version-min=16.0 -framework UIKit -framework Foundation -framework Contacts -o obj/PhonePad.app/PhonePad \
 			src/PhonePad.m && cp PhonePad/Info.plist PhonePad/*.png obj/PhonePad.app/ &&
 			{ ${LDID:-ldid} -Ssrc/PhonePad.entitlements obj/PhonePad.app/PhonePad 2>/dev/null ||
 			  echo "build.sh: no ldid: PhonePad is unsigned, and SpringBoard will not launch it"; }

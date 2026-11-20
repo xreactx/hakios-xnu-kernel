@@ -8,5 +8,11 @@
 	<true/>
 	<key>application-identifier</key>
 	<string>com.hakios.phonepad</string>
+	<key>com.apple.private.tcc.allow</key>
+	<array>
+		<string>kTCCServiceAddressBook</string>
+	</array>
+	<key>com.apple.Contacts.database-allow</key>
+	<true/>
 </dict>
 </plist>

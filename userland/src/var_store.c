@@ -90,6 +90,12 @@ static const char *const SKIP[] = {
 	"mobile/Library/Biome", "db/biome",
 	"containers/Shared/SystemGroup/systemgroup.com.apple.lsd.iconscache",
 	"wireless/awdd", "db/analyticsd", "Keychains/Analytics",
+	/* crash and diagnostic reports, and Trial's experiment downloads (fetched again): the archive outgrew its slot
+	 * again on 19 November (run 200705), and the contacts entered in that run were lost with it */
+	"mobile/Library/Logs", "mobile/Library/Trial", "mobile/Library/com.apple.siri.inference",
+	/* (and still too large, run 202946: web storage, the search index, the usage stores -- each remade) */
+	"mobile/Library/HTTPStorages", "mobile/Library/Spotlight", "mobile/Library/com.apple.iTunesCloud",
+	"mobile/Library/CoreDuet", "mobile/Library/DuetActivityScheduler",
 	NULL,
 };
 
@@ -111,11 +117,14 @@ tally(const char *relative, uint64_t bytes)
 	char key[96];
 	size_t end = 0, parts = 0;
 
-	/* the key ends at the second '/' or at the last one, whichever comes first: directories only */
+	/* the key ends at the second '/' or at the last one, whichever comes first: directories only (the third in
+	 * mobile/Library, the largest part, on 19 November 129 of its 210 MB -- told by what is in it) */
+	size_t wanted = strncmp(relative, "mobile/Library/", 15) == 0 ? 3 : 2;
+
 	for (size_t i = 0; relative[i] != 0; i++) {
 		if (relative[i] == '/') {
 			end = i;
-			if (++parts == 2) {
+			if (++parts == wanted) {
 				break;
 			}
 		}
