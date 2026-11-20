@@ -147,6 +147,8 @@ bool hakios_adsp_apr_to(uint8_t service, uint16_t from_port, uint16_t to_port, u
 void hakios_adsp_apr_events(hakios_apr_events_t handler);
 /* a call's voice through the DSP (hakios.mic.c): talking = a call is connected (the modem's driver says) */
 void hakios_voice_call(bool talking);
+/* hakios.sound.c: a call's voice is on the loudspeaker (its amplifier kept up, on the speaker whatever Darwin's route) */
+void hakios_sound_voice_speaker(bool on);
 const uint8_t *hakios_adsp_fw_file(const char *name, uint64_t *size);        /* /fw/name, read whole; give back with: */
 void hakios_adsp_fw_free(const uint8_t *data, uint64_t size);
 

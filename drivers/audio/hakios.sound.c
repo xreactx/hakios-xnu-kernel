@@ -1368,12 +1368,32 @@ gain_of(uint32_t below_eighths)
 	return gain;
 }
 
+/*
+ * A call on the loudspeaker (hakios.mic.c, the call's voice through QUAT_MI2S_RX): the amplifier kept up as if Darwin
+ * played, and on the speaker whatever Darwin's route says, until the call moves back or ends.
+ */
+static volatile bool voice_speaker;
+
+void
+hakios_sound_voice_speaker(bool on)
+{
+	voice_speaker = on;
+	say("sound: a call %s the loudspeaker\n", on ? "is put on" : "leaves");
+}
+
+/* where Darwin plays, unless a call holds the loudspeaker */
+static bool
+route_receiver(void)
+{
+	return !voice_speaker && hakios_audio_route() == HAKIOS_AUDIO_ROUTE_RECEIVER;
+}
+
 /* The amplifiers: redwood's two (hakios.speaker.c), or the 6T's one (hakios.tfa9894.c) on an MI2S port. */
 static bool
 amp_start(void)
 {
 	/* (where Darwin plays decides, as it is when they start) */
-	amp_receiver = receiver && hakios_audio_route() == HAKIOS_AUDIO_ROUTE_RECEIVER;
+	amp_receiver = receiver && route_receiver();
 	if (amp_receiver) {
 		say("sound: to the earpiece\n");
 		if (hakios_slim_codec_ready(0) && hakios_slim_earpiece(true)) {
@@ -1564,7 +1584,7 @@ watch(void)
 	guard_level(below);                     /* (from the first sample on: see guard_off()) */
 
 	while (!stopping) {
-		uint64_t now = now_us(), sounded = last_sound_us;
+		uint64_t now = now_us(), sounded = voice_speaker ? now : last_sound_us;
 		uint32_t extra_now, generation_now;
 		bool muted_now;
 
@@ -1590,7 +1610,7 @@ watch(void)
 				guard_level(below_with(extra));
 			}
 		}
-		if (on && receiver && (hakios_audio_route() == HAKIOS_AUDIO_ROUTE_RECEIVER) != amp_receiver) {
+		if (on && receiver && route_receiver() != amp_receiver) {
 			/* Darwin plays elsewhere: what is on is stopped, and started again where it plays */
 			say_when(amp_receiver ? "Darwin plays through the speaker now: the earpiece is stopped" :
 			    "Darwin plays through the earpiece now: the speaker's amplifier is stopped");
@@ -1598,7 +1618,7 @@ watch(void)
 			amp_stop();
 			on = false;
 		}
-		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
+		if (!on && !given_up && (!muted || voice_speaker) && sounded != 0 && now - sounded < 100000) {
 			say_when("Darwin plays: the amplifiers are started");
 			starts++;
 			darwin_peak = 0;

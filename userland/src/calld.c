@@ -32,6 +32,9 @@ extern SInt32 notification_cancel(UserNotificationRef notification) __asm__("_CF
 #define NOTE_ALERT              1       /* kCFUserNotificationNoteAlertLevel */
 #define DEFAULT_RESPONSE        0       /* kCFUserNotificationDefaultResponse: the first button */
 #define ALTERNATE_RESPONSE      1       /* kCFUserNotificationAlternateResponse: the second */
+#define OTHER_RESPONSE          2       /* kCFUserNotificationOtherResponse: the third */
+#define AUDIO_SPEAKER           1       /* kern.hakios.call_audio's bits */
+#define AUDIO_MUTE              2
 
 #define RINGTONE "/Library/Ringtones/Opening.m4r"
 
@@ -71,7 +74,7 @@ call_action(int action)
 
 /* An alert with one or two buttons; NULL if SpringBoard does not take it. */
 static UserNotificationRef
-alert(const char *header, const char *message, CFStringRef first, CFStringRef second)
+alert3(const char *header, const char *message, CFStringRef first, CFStringRef second, CFStringRef third)
 {
 	CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
 	    &kCFTypeDictionaryValueCallBacks);
@@ -86,6 +89,9 @@ alert(const char *header, const char *message, CFStringRef first, CFStringRef se
 	if (second != NULL) {
 		CFDictionarySetValue(d, CFSTR("AlternateButtonTitle"), second);
 	}
+	if (third != NULL) {
+		CFDictionarySetValue(d, CFSTR("OtherButtonTitle"), third);
+	}
 	/* (SpringBoard's own keys: shown over the lock screen too, and not dismissed by the home gesture) */
 	CFDictionarySetValue(d, CFSTR("SBUserNotificationDismissOnLock"), kCFBooleanFalse);
 	CFDictionarySetValue(d, CFSTR("SBUserNotificationAllowMenuButtonDismissal"), kCFBooleanFalse);
@@ -98,6 +104,12 @@ alert(const char *header, const char *message, CFStringRef first, CFStringRef se
 	CFRelease(h);
 	CFRelease(m);
 	return n;
+}
+
+static UserNotificationRef
+alert(const char *header, const char *message, CFStringRef first, CFStringRef second)
+{
+	return alert3(header, message, first, second, NULL);
 }
 
 /* ---- the ringtone: played again whenever it ends, while the call rings ---- */
@@ -200,41 +212,83 @@ incoming(void)
 	}
 }
 
-/* The call's alert while it talks, until End is pressed or the call ends. */
+static int
+call_audio_get(void)
+{
+	int v = 0;
+	size_t size = sizeof(v);
+
+	(void)sysctlbyname("kern.hakios.call_audio", &v, &size, NULL, 0);
+	return v;
+}
+
+static void
+call_audio_set(int v)
+{
+	if (sysctlbyname("kern.hakios.call_audio", NULL, NULL, &v, sizeof(v)) != 0) {
+		perror("calld: kern.hakios.call_audio");
+	}
+}
+
+/*
+ * The call's alert while it talks: End, Speaker (or Earpiece) and Mute (or Unmute), until End is pressed or the call
+ * ends. A press of Speaker or Mute takes the alert down (as any button does): the change is asked for
+ * (kern.hakios.call_audio) and the alert shown again as things now are.
+ */
 static void
 talking(void)
 {
-	char number[64], message[128];
-	UserNotificationRef n;
+	char number[64], message[160];
 	int ok = 1;
 
 	call_number(number, sizeof(number));
-	snprintf(message, sizeof(message), "%s", number);
 	printf("calld: on the call with %s\n", number);
-	n = alert("On Call", message, CFSTR("End"), NULL);
 	for (;;) {
-		CFOptionFlags response = 0;
-		int state;
+		int audio = call_audio_get(), done = 0;
+		UserNotificationRef n;
 
-		if (n != NULL && notification_response(n, 0.25, &response) == 0) {
-			printf("calld: End pressed\n");
-			call_action(2);
-			break;
-		}
-		if (n == NULL) {
-			usleep(250000);
-		}
-		state = call_state(&ok);
-		if (state != 3 && state != 4) {
-			printf("calld: the call ended (state %d)\n", state);
-			if (n != NULL) {
-				notification_cancel(n);
+		snprintf(message, sizeof(message), "%s\n%s%s", number, audio & AUDIO_SPEAKER ? "Speaker" : "Earpiece",
+		    audio & AUDIO_MUTE ? ", muted" : "");
+		n = alert3("On Call", message, CFSTR("End"), audio & AUDIO_SPEAKER ? CFSTR("Earpiece") : CFSTR("Speaker"),
+		    audio & AUDIO_MUTE ? CFSTR("Unmute") : CFSTR("Mute"));
+		for (;;) {
+			CFOptionFlags response = 0;
+			int state;
+
+			if (n != NULL && notification_response(n, 0.25, &response) == 0) {
+				if ((response & 3) == DEFAULT_RESPONSE) {
+					printf("calld: End pressed\n");
+					call_action(2);
+					done = 1;
+				} else if ((response & 3) == ALTERNATE_RESPONSE) {
+					printf("calld: %s pressed\n", audio & AUDIO_SPEAKER ? "Earpiece" : "Speaker");
+					call_audio_set(audio ^ AUDIO_SPEAKER);
+				} else {
+					printf("calld: %s pressed\n", audio & AUDIO_MUTE ? "Unmute" : "Mute");
+					call_audio_set(audio ^ AUDIO_MUTE);
+				}
+				break;
 			}
-			break;
+			if (n == NULL) {
+				usleep(250000);
+			}
+			state = call_state(&ok);
+			if (state != 3 && state != 4) {
+				printf("calld: the call ended (state %d)\n", state);
+				if (n != NULL) {
+					notification_cancel(n);
+				}
+				done = 1;
+				break;
+			}
 		}
-	}
-	if (n != NULL) {
-		CFRelease(n);
+		if (n != NULL) {
+			CFRelease(n);
+		}
+		if (done) {
+			return;
+		}
+		usleep(300000);         /* (the kernel takes the change; the alert comes back with it) */
 	}
 }
 
