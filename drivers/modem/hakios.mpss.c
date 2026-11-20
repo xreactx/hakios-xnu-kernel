@@ -1696,7 +1696,14 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 	    second, third);
 	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx(%#llx, %#llx)", step, function, first, second);
 	held = hakios_tz_enter();
-	for (int i = 0; i < 100; i++) {
+	/*
+	 * An interrupted call is resumed until it ends -- as Linux does, without a count: authenticating an image is long,
+	 * and in a busy boot it was interrupted more than 100 times (the SLPI's, run 234728); 30 s at most.
+	 */
+	uint64_t give_up = 0;
+
+	clock_interval_to_deadline(30, NSEC_PER_SEC, &give_up);
+	for (uint64_t i = 0; i == 0 || mach_absolute_time() < give_up; i++) {
 		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
 		register uint64_t x1 __asm__("x1") = arguments;
 		register uint64_t x2 __asm__("x2") = first;
@@ -1710,7 +1717,10 @@ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uin
 		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
 		session = x6;
 		if (x0 != SCM_INTERRUPTED) {
-			printf("mpss: %u: TrustZone returns %d, answer %#llx\n", step, (int32_t)x0, x1);
+			printf("mpss: %u: TrustZone returns %d, answer %#llx%s\n", step, (int32_t)x0, x1, i > 0 ? " (after resuming it)" : "");
+			if (i > 0) {
+				printf("mpss: %u: (the call was interrupted %llu times)\n", step, i);
+			}
 			*answer = x1;
 			hakios_tz_leave(held);
 			return (int32_t)x0;
