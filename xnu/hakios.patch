@@ -519,7 +519,7 @@ index 95192dd62449..b00da803b5b4 100644
  
  	/*
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 1d71c66629fb..a22095ccf5f0 100644
+index 1d71c66629fb..b5d39ba4314d 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -1157,6 +1157,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
@@ -712,13 +712,14 @@ index 1d71c66629fb..a22095ccf5f0 100644
  	ret = persona_proc_adopt(p, persona, cred);
  
  	kauth_cred_unref(&cred);
-@@ -5586,10 +5685,75 @@ bad:
+@@ -5586,10 +5685,102 @@ bad:
   * Note:	The argument and environment vectors are user space pointers
   *		to arrays of user space pointers.
   */
 +/*
 + * Bring-up aid: the sysctl kern.exec_inject holds "LIBRARY NAME NAME ..."; every program
-+ * whose file name is one of the NAMEs is started with DYLD_INSERT_LIBRARIES=LIBRARY in its
++ * whose file name is one of the NAMEs (or, for the NAME "*app", that is inside an application bundle)
++ * is started with DYLD_INSERT_LIBRARIES=LIBRARY in its
 + * environment, so that dyld loads our library into it. Several such groups may follow each
 + * other, separated by ";". A program named in more than one group gets every one of those
 + * libraries, joined with ":" in the one DYLD_INSERT_LIBRARIES, so SpringBoard can carry both
@@ -726,9 +727,22 @@ index 1d71c66629fb..a22095ccf5f0 100644
 + * from a job description, which is why the kernel adds this one. Set once by our init (from
 + * etc/inject.conf) before it hands over to launchd.
 + */
-+static char exec_inject_conf[512];
++static char exec_inject_conf[1024];
 +SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
 +    "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
++
++static bool
++exec_inject_apps(void)
++{
++	static int apps = -1;
++
++	if (apps < 0) {
++		int on = 1;
++
++		apps = !(PE_parse_boot_argn("inject_apps", &on, sizeof(on)) && on == 0);
++	}
++	return apps != 0;
++}
 +
 +static bool
 +exec_inject_env(struct image_params *imgp, char *env, size_t size)
@@ -766,6 +780,19 @@ index 1d71c66629fb..a22095ccf5f0 100644
 +			    strncmp(word, name, namelen) == 0) {
 +				matched = true;         /* this group names this program; its library is added once */
 +			}
++			/*
++			 * "*app": every application -- a program in an .app bundle in /Applications or an installed one's
++			 * /var/containers/Bundle/Application (the path saved in ip_strings); not SpringBoard's and the system's
++			 * own bundles (CoreServices, PrivateFrameworks' view services: given a library each at boot, the phone
++			 * went into a Qualcomm crash dump some 30 s in, four boots of four, 19 November). Boot-arg
++			 * inject_apps=0: none.
++			 */
++			if (!matched && (size_t)(p - word) == 4 && strncmp(word, "*app", 4) == 0 && liblen != 0 && exec_inject_apps() &&
++			    imgp->ip_strings != NULL && strnstr(imgp->ip_strings, ".app/", MAXPATHLEN + 32) != NULL &&
++			    (strnstr(imgp->ip_strings, "=/Applications/", MAXPATHLEN + 32) != NULL ||
++			    strnstr(imgp->ip_strings, "/Bundle/Application/", MAXPATHLEN + 32) != NULL)) {
++				matched = true;
++			}
 +		}
 +		if (matched && liblen != 0 && used + 1 + liblen < size) {
 +			if (any) {
@@ -788,7 +815,7 @@ index 1d71c66629fb..a22095ccf5f0 100644
  	int error = 0;
  	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
  	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
-@@ -5759,6 +5923,33 @@ exec_extract_strings(struct image_params *imgp)
+@@ -5759,6 +5950,33 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
  
@@ -822,7 +849,7 @@ index 1d71c66629fb..a22095ccf5f0 100644
  	/* Save space for envv[] NULL terminator */
  	if (imgp->ip_argspace < new_ptr_size) {
  		error = E2BIG;
-@@ -6636,7 +6827,23 @@ handle_mac_transition:
+@@ -6636,7 +6854,23 @@ handle_mac_transition:
  	}
  
  	/* Update the process' identity version and set the security token */
@@ -847,7 +874,7 @@ index 1d71c66629fb..a22095ccf5f0 100644
  	task_set_uniqueid(task);
  	set_security_token_task_internal(p, task);
  
-@@ -7538,6 +7745,11 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -7538,6 +7772,11 @@ process_signature(proc_t p, struct image_params *imgp)
  	}
  
  done:

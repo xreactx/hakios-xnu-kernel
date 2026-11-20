@@ -4549,6 +4549,7 @@ static struct see_sensor {
 	uint64_t suid[2];
 	uint32_t events;
 } see_sensor[SEE_SENSORS] = {
+	/* (10 a second: at 50 and 25, three boots of four ended in a Qualcomm crash dump some 30 s in, 19 November) */
 	[SEE_ACCEL] = { "accel", 513, 0x41200000u },            /* 10 */
 	[SEE_GYRO] = { "gyro", 513, 0x41200000u },
 	[SEE_MAG] = { "mag", 513, 0x41200000u },
@@ -4911,7 +4912,7 @@ see_other(unsigned k, uint32_t msg_id, const uint8_t *p, size_t length)
 		*y = (int)v[1];
 		*z = (int)v[2];
 	}
-	if ((*samples)++ < 5 || (*samples % (k == SEE_LIGHT ? 20 : 100)) == 0) {
+	if ((*samples)++ < 5 || (*samples % (k == SEE_LIGHT ? 20 : 500)) == 0) {
 		tell("slpi: see: %s sample %d: %lld %lld %lld %s\n", see_sensor[k].type, *samples, v[0], v[1], v[2], units[k]);
 	}
 }
@@ -4993,7 +4994,7 @@ see_event(const uint64_t suid[2], uint32_t msg_id, const uint8_t *p, size_t leng
 		accel_x = (int)v[0];
 		accel_y = (int)v[1];
 		accel_z = (int)v[2];
-		if (accel_samples++ < 5 || (accel_samples % 100) == 0) {
+		if (accel_samples++ < 5 || (accel_samples % 500) == 0) {
 			tell("slpi: see: ACCELEROMETER sample %d: x %lld, y %lld, z %lld mm/s^2 (status %llu)\n", accel_samples, v[0], v[1],
 			    v[2], status);
 		}

@@ -159,9 +159,10 @@ SILEO_BIN="chmod cp mkdir mv rm"
 INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
-/redwood/lib/libhakios.app.dylib Sileo VoiceMemos
+/redwood/lib/libhakios.app.dylib Sileo VoiceMemos Measure
 /redwood/lib/libhakios.tweaks.dylib Preferences
-/redwood/lib/libhakios.bluetool.dylib BlueTool"}
+/redwood/lib/libhakios.bluetool.dylib BlueTool
+/redwood/lib/libhakios.motion.dylib *app"}
 # (with the 6T's GPS, LOCATIOND=1: Settings, Maps and locationd are told by MobileGestalt that there is one --
 # src/inject_loc.c, which in Settings opens the tweak loader in its turn)
 if [ "${LOCATIOND-0}" != 0 ]; then
@@ -309,6 +310,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			-o obj/libhakios.loc.dylib src/inject_loc.c
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -lobjc \
 			-o obj/libhakios.app.dylib src/inject_app.c
+		# ... and inside every application ("*app"), CoreMotion answered from the kernel's sensors (src/inject_motion.m)
+		$DYN -fobjc-arc -dynamiclib -install_name /redwood/lib/libhakios.motion.dylib -framework Foundation \
+			-framework CoreMotion -lobjc -o obj/libhakios.motion.dylib src/inject_motion.m
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
 			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
@@ -438,6 +442,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.loc.dylib ] && cp obj/libhakios.loc.dylib root/lib/
+	[ -f obj/libhakios.motion.dylib ] && cp obj/libhakios.motion.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
 	[ -f obj/libhakios.bluetool.dylib ] && cp obj/libhakios.bluetool.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
