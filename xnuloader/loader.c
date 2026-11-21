@@ -1116,6 +1116,8 @@ struct kernel_live {
 	uint64_t stop;                  /* ours to write: the host wants the run to end ("oem stop") */
 	uint64_t magic2;                /* "XNULIVE2": the kernel is new enough to have what follows */
 	uint64_t sound;                 /* (a virtual address too) the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": the kernel is new enough to have what follows */
+	uint64_t next_boot;             /* the kernel's to write: KERNEL_NEXT_ANDROID (see slot_to_android) */
 };
 
 /*
@@ -1182,6 +1184,10 @@ static int charger_enabled;
 static const char *recording_data;
 static uint64_t recording_len;
 #define KERNEL_LIVE_MAGIC2      0x324556494c554e58ULL
+#define KERNEL_LIVE_MAGIC3      0x334556494c554e58ULL
+#define KERNEL_NEXT_ANDROID     0x44494f52444e41ULL     /* "ANDROID" */
+static int android_next;
+static void slot_to_android(void);                /* the kernel asked for Android's slot next (one-shot: done before the reset) */
 #define KERNEL_LIVE_MAGIC       0x214556494c554e58ULL
 #define OTHER_CPU_NOT_STARTED   1000    /* run_on_other_cpu(): the firmware said yes but the core never arrived */
 #define OTHER_CPU_HUNG          1001    /* ... the kernel stopped giving signs of life */
@@ -1577,6 +1583,91 @@ ufs_check_gpt(efi_block_io *bio, uint64_t unit)
 	print("ufs: unit %d: GPT header crc %s (%x), table of %d entries crc %s (%x)\n", unit,
 	    got_header == header_crc ? "right" : "WRONG", (uint64_t)got_header, count,
 	    got_entries == entries_crc ? "right" : "WRONG", (uint64_t)got_entries);
+}
+
+/*
+ * "Restart into Android" from HakiOS (the kernel's kern.hakios.next_boot): boot_a's GPT entry is given the
+ * unbootable attribute (bit 55, Qualcomm's PART_ATT_UNBOOTABLE_BIT; active 50, retries 51-53, successful 54 -- as the
+ * phone's own GPT has them, checked against the backup of 2026-11-21), in the primary and the backup table, both
+ * CRC-32s made again. At the next boot ABL finds the active slot unbootable and switches to the other one itself --
+ * the type GUIDs, the boot LUN, everything set_active does -- as it did when slot a first failed its verification.
+ * Coming back to HakiOS is "fastboot set_active a", which clears the attribute again.
+ *
+ * Refused, with nothing written, unless every check passes: both GPT copies valid, boot_a and boot_b where the
+ * backup has them, the copies' tables identical, and boot_b bootable (not unbootable; successful, or retries left)
+ * -- a phone with no slot to start is the one thing this must not make. Returns 1 when written and read back.
+ */
+static uint8_t gpt_table[2][64 * 1024] __attribute__((aligned(4096)));
+
+static int
+gpt_name_is(const uint8_t *entry, const char *name)
+{
+	for (int i = 0; i < 36; i++) {
+		uint16_t c = (uint16_t)(entry[56 + 2 * i] | entry[57 + 2 * i] << 8);
+
+		if (c != (uint8_t)name[i]) {
+			return 0;
+		}
+		if (c == 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* header (512 bytes copied out) and table of the GPT whose header is at `lba`; 1 if both CRCs are right */
+static int
+gpt_read(efi_block_io *bio, uint64_t lba, uint8_t *header, uint8_t *table, uint64_t *table_bytes)
+{
+	uint64_t bs = bio->media->block_size, entries_lba, bytes;
+	uint32_t header_size, crc;
+
+	if (bs < 512 || bs > sizeof(gpt_table[0]) || EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, lba, bs, table)) ||
+	    memcmp(table, "EFI PART", 8) != 0) {
+		return 0;
+	}
+	memcpy(header, table, 512);
+	header_size = *(uint32_t *)(header + 12);
+	crc = *(uint32_t *)(header + 16);
+	if (header_size < 92 || header_size > 512) {
+		return 0;
+	}
+	*(uint32_t *)(header + 16) = 0;
+	if (ufs_crc32(header, header_size) != crc) {
+		return 0;
+	}
+	*(uint32_t *)(header + 16) = crc;
+	entries_lba = *(uint64_t *)(header + 72);
+	bytes = (uint64_t)*(uint32_t *)(header + 80) * *(uint32_t *)(header + 84);
+	if (*(uint32_t *)(header + 84) != 128 || bytes == 0 || (bytes + bs - 1) / bs * bs > sizeof(gpt_table[0]) ||
+	    EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, entries_lba, (bytes + bs - 1) / bs * bs, table)) ||
+	    ufs_crc32(table, bytes) != *(uint32_t *)(header + 88)) {
+		return 0;
+	}
+	*table_bytes = bytes;
+	return 1;
+}
+
+static int
+gpt_write(efi_block_io *bio, uint8_t *header, uint8_t *table, uint64_t bytes)
+{
+	static uint8_t block[4096] __attribute__((aligned(4096)));
+	uint64_t bs = bio->media->block_size;
+	uint32_t header_size = *(uint32_t *)(header + 12);
+
+	*(uint32_t *)(header + 88) = ufs_crc32(table, bytes);
+	*(uint32_t *)(header + 16) = 0;
+	*(uint32_t *)(header + 16) = ufs_crc32(header, header_size);
+	if (bs > sizeof(block) || EFI_ERROR(bio->write_blocks(bio, bio->media->media_id, *(uint64_t *)(header + 72),
+	    (bytes + bs - 1) / bs * bs, table))) {
+		return 0;
+	}
+	memset(block, 0, sizeof(block));
+	if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, *(uint64_t *)(header + 24), bs, block))) {
+		return 0;
+	}
+	memcpy(block, header, header_size);
+	return !EFI_ERROR(bio->write_blocks(bio, bio->media->media_id, *(uint64_t *)(header + 24), bs, block));
 }
 
 /* one line per 32 bytes: "ufs: PART WHAT +OFFSET: hex" */
@@ -2143,6 +2234,66 @@ block_tables(void)
 		    (uint64_t)g->d[4], (uint64_t)g->d[5], (uint64_t)g->d[6], (uint64_t)g->d[7],
 		    (uint64_t)(uintptr_t)ST->tables[i].table);
 	}
+}
+
+static void
+slot_to_android(void)
+{
+	uint8_t primary[512], backup[512];
+
+	for (uint32_t i = 0; i < block_shared.parts; i++) {
+		efi_block_io *bio = block_bios[i];
+		uint64_t bytes = 0, backup_bytes = 0, alternate;
+		int a = -1, b = -1;
+		uint64_t attr_a, attr_b;
+
+		if (!(block_shared.part[i].flags & BLOCK_PART_UNIT) || bio == NULL ||
+		    !gpt_read(bio, 1, primary, gpt_table[0], &bytes)) {
+			continue;
+		}
+		for (uint64_t k = 0; k < bytes / 128; k++) {
+			if (gpt_name_is(gpt_table[0] + 128 * k, "boot_a")) {
+				a = (int)k;
+			} else if (gpt_name_is(gpt_table[0] + 128 * k, "boot_b")) {
+				b = (int)k;
+			}
+		}
+		if (a < 0) {
+			continue;
+		}
+		print("slot: boot_a is entry %d of %s's table, boot_b entry %d\n", (uint64_t)a, block_shared.part[i].name,
+		    (uint64_t)b);
+		alternate = *(uint64_t *)(primary + 32);
+		if (b < 0 || !gpt_read(bio, alternate, backup, gpt_table[1], &backup_bytes) || backup_bytes != bytes ||
+		    memcmp(gpt_table[0], gpt_table[1], bytes) != 0) {
+			print("slot: the backup table is not the primary's, or boot_b is missing: NOTHING WRITTEN\n");
+			return;
+		}
+		attr_a = *(uint64_t *)(gpt_table[0] + 128 * a + 48);
+		attr_b = *(uint64_t *)(gpt_table[0] + 128 * b + 48);
+		print("slot: boot_a attributes %x, boot_b %x\n", attr_a, attr_b);
+		if ((attr_b >> 55 & 1) || !((attr_b >> 54 & 1) || (attr_b >> 51 & 7) != 0)) {
+			print("slot: boot_b is not bootable: NOTHING WRITTEN (the phone would have no slot to start)\n");
+			return;
+		}
+		attr_a |= 1ULL << 55;
+		*(uint64_t *)(gpt_table[0] + 128 * a + 48) = attr_a;
+		*(uint64_t *)(gpt_table[1] + 128 * a + 48) = attr_a;
+		/* the backup first: a reset in between leaves the primary as it was, and ABL reads the primary */
+		if (!gpt_write(bio, backup, gpt_table[1], bytes) || !gpt_write(bio, primary, gpt_table[0], bytes)) {
+			print("slot: A WRITE FAILED\n");
+			return;
+		}
+		bio->flush_blocks(bio);
+		if (gpt_read(bio, 1, primary, gpt_table[0], &bytes) && (*(uint64_t *)(gpt_table[0] + 128 * a + 48) >> 55 & 1)) {
+			print("slot: boot_a is marked unbootable, both tables: the bootloader starts Android's slot next\n");
+		} else {
+			print("slot: THE PRIMARY TABLE DOES NOT READ BACK AS WRITTEN\n");
+		}
+		write_logs(NULL, 0);
+		return;
+	}
+	print("slot: no unit has boot_a in a valid GPT: nothing written\n");
 }
 
 /*
@@ -4055,6 +4206,11 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			print("the kernel left a screen recording: %d bytes at %x\n", recording_len, recording[0]);
 		}
 	}
+	if (kernel_live != NULL && kernel_live->magic2 == KERNEL_LIVE_MAGIC2 && kernel_live->magic3 == KERNEL_LIVE_MAGIC3 &&
+	    kernel_live->next_boot == KERNEL_NEXT_ANDROID) {
+		print("the kernel asks for Android's slot at the next boot\n");
+		android_next = 1;
+	}
 	sound_data = NULL;
 	sound_len = 0;
 	if (kernel_live != NULL && kernel_live->magic2 == KERNEL_LIVE_MAGIC2 && kernel_live->sound != 0 &&
@@ -5323,6 +5479,9 @@ efi_main(efi_handle image, efi_system_table *st)
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
 		run_kernel(0, 0);
+		if (android_next) {
+			slot_to_android();
+		}
 	}
 	reboot();
 	return 0;

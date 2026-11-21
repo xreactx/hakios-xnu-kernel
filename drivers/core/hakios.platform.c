@@ -18,6 +18,7 @@
 #include <libkern/libkern.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
+#include <sys/proc.h>
 
 #include "hakios.drivers.h"
 
@@ -132,6 +133,34 @@ hakios_tz_leave(bool held)
 }
 
 static char hakios_drivers_string[] = HAKIOS_DRIVERS_LIST;
+
+/*
+ * kern.hakios.next_boot: "android" written here ends the run and has the loader leave this slot to the bootloader
+ * as unbootable, so that the phone comes up in Android (osfmk/arm64/loader_return.c, hakios_boot_android). Anybody
+ * may write it, as anybody may send a text (kern.hakios.sms_send): the phone's own "Android" application does.
+ */
+extern int hakios_boot_android(void);
+static char next_boot[16];
+
+static int
+next_boot_sysctl SYSCTL_HANDLER_ARGS
+{
+	char asked[16] = "";
+	int error = sysctl_handle_string(oidp, next_boot, sizeof(next_boot), req);
+
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	strlcpy(asked, next_boot, sizeof(asked));
+	if (strcmp(asked, "android") != 0) {
+		next_boot[0] = 0;
+		return EINVAL;
+	}
+	printf("hakios: restart into Android, as asked (pid %d)\n", proc_selfpid());
+	return hakios_boot_android();
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, next_boot, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    next_boot_sysctl, "A", "\"android\": end the run and start Android's slot");
 
 SYSCTL_STRING(_kern_hakios, OID_AUTO, drivers, CTLFLAG_RD | CTLFLAG_LOCKED, hakios_drivers_string, 0,
     "the drivers this kernel was built with (CONFIG_HAKIOS_* of its configuration, lowercase)");

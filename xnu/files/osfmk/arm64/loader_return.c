@@ -211,7 +211,11 @@ struct loader_live {
 	volatile uint64_t stop;         /* the loader's to write: the host has asked for the run to end */
 	uint64_t magic2;                /* "XNULIVE2": what follows is there (a loader may meet an older kernel) */
 	const uint64_t *sound;          /* loader_sound: the same for a recording of the sound */
+	uint64_t magic3;                /* "XNULIVE3": what follows is there */
+	volatile uint64_t next_boot;    /* the kernel's to write: LOADER_NEXT_ANDROID, and the loader (one-shot) marks this
+	                                 * slot unbootable before it resets, so that the bootloader starts Android's */
 };
+#define LOADER_NEXT_ANDROID     0x44494f52444e41ULL     /* "ANDROID" */
 
 /*
  * A screen recording (the display driver makes one with boot-arg rec_secs): where it is, for the
@@ -226,6 +230,7 @@ struct loader_live loader_live = {
 	.log_wrapped = &loader_log_wrapped, .log_head = LOADER_LOG_HEAD, .log_ring = LOADER_LOG_RING,
 	.recording = loader_recording,
 	.magic2 = 0x324556494c554e58ULL, .sound = loader_sound,
+	.magic3 = 0x334556494c554e58ULL,
 };
 
 /* Valid from the first instruction of C code: does not depend on gVirtBase/gPhysBase being set up. */
@@ -491,6 +496,44 @@ loader_return_timer_init(void)
 	thread_call_enter_delayed(call, deadline);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
+
+/*
+ * "Restart into Android" (kern.hakios.next_boot, drivers/core/hakios.platform.c): the run ends the orderly way -- the
+ * data volume saved, the GPU, Wi-Fi, audio DSP and modem given back -- with loader_live.next_boot set, and the loader,
+ * once it has the phone again, marks this slot unbootable and resets; the bootloader then starts the other slot
+ * (Android's) by itself, exactly as it does when a slot fails. Only a loader that knows XNULIVE3 acts on it; an older
+ * one simply resets, and HakiOS starts again.
+ */
+static void
+loader_android_now(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	static const char banner[] = "\n--- restart into Android: back to the loader ---\n";
+
+	for (const char *c = banner; *c; c++) {
+		loader_log_putc(*c);
+	}
+	hakios_var_save_on_return();
+	hakios_adreno_stop();
+	hakios_wifi_stop();
+	hakios_adsp_stop();
+	hakios_mpss_stop();
+	loader_return();
+}
+
+int hakios_boot_android(void);
+int
+hakios_boot_android(void)
+{
+	static thread_call_t call;
+
+	if (call != NULL) {
+		return 0;                       /* asked already */
+	}
+	loader_live.next_boot = LOADER_NEXT_ANDROID;
+	call = thread_call_allocate(loader_android_now, NULL);
+	thread_call_enter(call);
+	return 0;
+}
 
 /*
  * A loader that watches from another core also listens to the host, and passes on a request to
