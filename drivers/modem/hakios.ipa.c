@@ -318,6 +318,7 @@ hakios_ipa_version_3_5_1(void)
 	modem_rx.tlv = 8;
 }
 
+extern uint64_t hakios_ipa_smmu_root;    /* hakios.mpss.c: the IPA's SMMU tables (three pages), for a crash dump's address */
 static bool ready, trace;
 static uint32_t mem_offset;                     /* the local memory's offset within the IPA's shared memory */
 static struct dma table, zero;                  /* the tables' page (below) and a page of zeros */
@@ -1134,7 +1135,8 @@ hakios_ipa_data_setup(void)
 		}
 	}
 	printf("ipa: setting up this processor's data path: GSI status %#x, local memory at %#x; rings and buffers in DDR from %#llx "
-	    "(the tables at %#llx)\n", status, mem_offset, modem_rx.pages[0].phys, table.phys);
+	    "(the tables at %#llx; the SMMU's tables for it at %#llx)\n", status, mem_offset, modem_rx.pages[0].phys, table.phys,
+	    hakios_ipa_smmu_root);
 	gsi_interrupts_off();
 	for (unsigned n = 0; n < 4; n++) {
 		struct channel *ch = channels[n];

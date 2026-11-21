@@ -2538,7 +2538,13 @@ static struct block apps_smmu_context = { "apps smmu, the IPA's context", 0, 0x1
 #define SMMU_SGFSYNR0           0x050
 #define SMMU_SGFSYNR1           0x054
 #define SMMU_CBAR(n)            (4 * (n))
-#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)
+/*
+ * (and the context's VMID, bits 7:0: HLOS's, 3. With 0 the IPA's accesses through it -- its page tables walked by the
+ * SMMU too -- came to the memory's protection with VMID 0 and, now and then, met an XPU that wanted HLOS's: a violation
+ * on BIMC_MPU3 and a Qualcomm crash dump, masters 0x9a and 0x88, at the tables' pages, runs 223752 and 232718)
+ */
+#define SMMU_CBAR_VMID_HLOS     3u
+#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12 | SMMU_CBAR_VMID_HLOS)
 #define SMMU_CBA2R(n)           (0x800 + 4 * (n))
 #define SMMU_CBA2R_64_BIT       1
 #define SMMU_CB_SCTLR           0x00
@@ -2563,6 +2569,7 @@ static struct block apps_smmu_context = { "apps smmu, the IPA's context", 0, 0x1
 #define IPA_BLOCK_DEVICE        (1ull | 2ull << 2 | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)
 #define IPA_TABLE               3ull            /* a table entry of the root */
 extern lck_mtx_t hakios_smmu_lock;
+uint64_t hakios_ipa_smmu_root;          /* (printed by hakios.ipa.c) */
 static struct {
 	bool on;
 	uint32_t page, pages, match, match_uc, context, old_smr, old_s2cr, old_smr_uc, old_s2cr_uc, old_sctlr;
@@ -2664,13 +2671,20 @@ ipa_space_on(void)
 	root[IPA_SPACE_BASE >> 30] = kvtophys((vm_offset_t)ddr) | IPA_TABLE;
 	/* the rest of DDR (the phone has 6 or 8 GB from 0x80000000), as 1 GB blocks of the root: the data path's rings and
 	 * buffers (hakios.ipa.c) are wherever the kernel's memory is */
-	for (unsigned g = (IPA_SPACE_BASE >> 30) + 1; g < (IPA_SPACE_BASE >> 30) + 8; g++) {
-		root[g] = ((uint64_t)g << 30) | IPA_BLOCK;
+	if (option("modem_ipa_map_1g")) {
+		/* (a test: the IPA sees only DDR's first gigabyte and the SoC's memory; anything else it asks for the SMMU refuses,
+		 * and says where -- the crash dumps' accesses, VMID 0, above 6 GB, may be the IPA's, runs 223752 to 000028) */
+		printf("mpss: ipa: modem_ipa_map_1g: the IPA sees only DDR's first gigabyte\n");
+	} else {
+		for (unsigned g = (IPA_SPACE_BASE >> 30) + 1; g < (IPA_SPACE_BASE >> 30) + 8; g++) {
+			root[g] = ((uint64_t)g << 30) | IPA_BLOCK;
+		}
 	}
 	root[ipa_imem >> 30] = kvtophys((vm_offset_t)soc) | IPA_TABLE;
 	FlushPoC_DcacheRegion(ipa_space.tables, 3 * 4096);
 	settle();
 	ttbr = kvtophys(ipa_space.tables) | (uint64_t)ipa_space.context << 48;
+	hakios_ipa_smmu_root = kvtophys(ipa_space.tables);
 	printf("mpss: ipa: THE SMMU IS ABOUT TO BE WRITTEN: context %u gets our tables (root %#llx: DDR from %#llx as it is, 1 GB, and "
 	    "the SoC's memory at %#llx) and match registers %u and %u send streams %#x and %#x through it (before: smr %#x s2cr %#x, "
 	    "smr %#x s2cr %#x, sctlr %#x)\n", ipa_space.context, ttbr & 0x0000fffffffff000ull, IPA_SPACE_BASE, ipa_imem, ipa_space.match,
@@ -10715,6 +10729,9 @@ nas_thread(__unused void *parameter, __unused wait_result_t result)
 		loc_advance();
 		sms_advance();
 		voice_advance();
+		if (ipa_space.on && ((rd(apps_smmu_context.base + SMMU_CB_FSR) & SMMU_FSR_ALL) != 0 || rd(apps_smmu.base + SMMU_SGFSR) != 0)) {
+			ipa_space_faults("while running");      /* (said only when the SMMU has refused the IPA something) */
+		}
 		for (unsigned ms = 0; ms < 2000 && nas_wanted; ms += 100) {
 			sleep_ms(100);
 			call_dtmf_tick();
@@ -10884,11 +10901,44 @@ steps_thread(__unused void *parameter, __unused wait_result_t result)
 	thread_terminate(current_thread());
 }
 
+/*
+ * Qualcomm's crash-dump mode, off for this run (dumps=1 leaves it on): the boot's firmware sets the cookie in TCSR's
+ * BOOT_MISC_DETECT (0x1fd3000, 0x10; the 6T's UEFI's DloadCookieAddr) at each boot, and with it a crash -- the XPU
+ * violations of a running modem now and then, runs 223752 to 021049 -- leaves the phone in the dump mode (USB
+ * 05c6:900e) until its power button is held. Cleared, as Linux's qcom_scm_set_download_mode(false) does through
+ * TrustZone's secure register write, a crash resets the phone instead, and it comes back up in Android.
+ */
+#define SCM_IO_READ             SCM_CALL(5, 1)
+#define SCM_IO_WRITE            SCM_CALL(5, 2)
+#define TCSR_BOOT_MISC_DETECT   0x1fd3000ull
+
+static void
+dump_mode_off(void)
+{
+	uint64_t answer = ~0ull, before = ~0ull;
+
+	if (option("dumps")) {
+		tell("mpss: dumps=1: Qualcomm's crash-dump mode is left on\n");
+		return;
+	}
+	(void)scm("to read the crash-dump cookie", SCM_IO_READ, 1, TCSR_BOOT_MISC_DETECT, 0, 0, 0, &before);
+	if (scm("to clear the crash-dump cookie", SCM_IO_WRITE, 2, TCSR_BOOT_MISC_DETECT, 0, 0, 0, &answer) != 0) {
+		tell("mpss: THE CRASH-DUMP COOKIE IS NOT CLEARED: a crash still leaves the phone in the dump mode\n");
+		return;
+	}
+	answer = ~0ull;
+	(void)scm("to read the crash-dump cookie", SCM_IO_READ, 1, TCSR_BOOT_MISC_DETECT, 0, 0, 0, &answer);
+	tell("mpss: Qualcomm's crash-dump mode is off for this run (cookie %#llx, now %#llx): a crash resets the phone into "
+	    "Android\n", before, answer);
+}
+
 static void
 whole_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint64_t began = now_us();
 	unsigned services = 0;
+
+	dump_mode_off();
 
 	/* (the firmware may be on the root file system, which is not mounted yet when this begins: a minute at most) */
 	for (unsigned waited = 0; waited < 300 && rootvnode == NULLVP; waited++) {
