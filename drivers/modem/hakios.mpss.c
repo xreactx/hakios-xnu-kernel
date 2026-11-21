@@ -2777,6 +2777,7 @@ ipa_fw_file(const char *name, uint64_t *size, bool *in_image)
 static bool
 ipa_firmware_load(void)
 {
+	uint64_t header_phys = 0;
 	const uint8_t *header, *segment_file[8] = { NULL };
 	uint64_t header_size = 0, segment_size[8] = { 0 }, answer = ~0ull;
 	struct elf_segment segments[8];
@@ -2890,15 +2891,44 @@ ipa_firmware_load(void)
 	}
 	size = ((highest + 0xfff) & ~0xfffu) - ipa_fw_memory;
 	printf("mpss: %u: the IPA's image: %u segments to load, %#x bytes from %#x\n", step, loaded, size, ipa_fw_memory);
-	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
-		goto out;
+	/*
+	 * The header's buffer: TrustZone keeps it protected after the image has started, and a page of the kernel's -- mapped
+	 * cacheable, read ahead by the cores -- brought XPU violations and a crash dump now and then, right at the address of
+	 * that page (run 102854: 0x1a60fc000, read at +0x400 and +0x600 by two masters). Memory the kernel does not map instead:
+	 * 64 KB past modem_meta (the compute DSP's region), mapped only while the header is written. ipa_meta=ADDRESS
+	 * elsewhere; without either, a page of ours as before.
+	 */
+	{
+		uint64_t meta = 0;
+
+		PE_parse_boot_argn("modem_meta", &meta, sizeof(meta));
+		header_phys = meta != 0 ? meta + 0x10000 : 0;
+		PE_parse_boot_argn("ipa_meta", &header_phys, sizeof(header_phys));
 	}
-	memcpy((void *)page, header, header_size < PAGE_SIZE ? header_size : PAGE_SIZE);
-	for (vm_offset_t line = page; line < page + PAGE_SIZE; line += 64) {
-		__asm__ volatile ("dc civac, %0" : : "r" (line));
+	if (header_phys != 0) {
+		volatile uint8_t *window = (volatile uint8_t *)ml_io_map_unmappable((vm_offset_t)header_phys, PAGE_SIZE, VM_WIMG_WCOMB);
+
+		if (window == NULL) {
+			goto out;
+		}
+		for (uint32_t i = 0; i < PAGE_SIZE; i++) {
+			window[i] = i < header_size ? header[i] : 0;
+		}
+		__asm__ volatile ("dsb sy" ::: "memory");
+		ml_io_unmap((vm_offset_t)window, PAGE_SIZE);
+		tell("mpss: %u: the IPA's header at %#llx, memory the kernel does not map\n", step, header_phys);
+	} else {
+		if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+			goto out;
+		}
+		memcpy((void *)page, header, header_size < PAGE_SIZE ? header_size : PAGE_SIZE);
+		for (vm_offset_t line = page; line < page + PAGE_SIZE; line += 64) {
+			__asm__ volatile ("dc civac, %0" : : "r" (line));
+		}
+		header_phys = kvtophys(page);
 	}
 	settle();
-	result = scm("to take the IPA's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, pas_ipa, kvtophys(page), 0, 0, &answer);
+	result = scm("to take the IPA's header", SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, pas_ipa, header_phys, 0, 0, &answer);
 	if (result != 0 || answer != 0) {
 		printf("mpss: %u: TRUSTZONE DOES NOT TAKE THE IPA'S HEADER (%d, %#llx)\n", step, result, answer);
 		goto out;
@@ -3024,8 +3054,16 @@ ipa_firmware_load(void)
 	ok = true;
 	ipa_tz_loaded = true;
 out:
-	if (page != 0) {
+	if (page != 0 && option("ipa_header_free")) {
 		kmem_free(kernel_map, page, PAGE_SIZE);
+	} else if (page != 0) {
+		/*
+		 * The header's page is kept, as the audio and sensors DSPs' are: TrustZone may still hold it (its memory protection
+		 * on it) after the image has started, and the page given back to the allocator was then written by whichever core
+		 * had it next -- the likely cause of the crash dumps (XPU violations on BIMC, VMID 0, a different master each time,
+		 * right as this returned: runs 223752 to 090017). ipa_header_free=1: given back as before.
+		 */
+		tell("mpss: %u: the IPA's header page (%#llx) is kept\n", step, kvtophys(page));
 	}
 	if (!in_image) {
 		uint8_t *gone = __DECONST(uint8_t *, header);
