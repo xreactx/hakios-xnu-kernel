@@ -435,7 +435,9 @@ update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter
 		shown = 5;
 	}
 	if ((up > 0 || registered > 0) && shown > 0 && setter != NULL && data != NULL) {
-		BLOCK_CALL(setter, void (*)(void *, void *, int), data, shown);
+		/* (the setter writes the aggregator's own _data: its one argument is the value -- given (data, value), the bars
+		 * it got were a pointer's low bits, and the string setter a SystemStatus object for its string) */
+		BLOCK_CALL(setter, void (*)(void *, int), shown);
 		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
 		/* (the data is set after the original posted it: it is to be posted again, or the bars never change on screen) */
 		((void (*)(id, SEL, long))objc_msgSend)(self, sel_registerName("_notifyItemChanged:"), item);
@@ -472,15 +474,11 @@ update_service_item(id self, SEL sel, long item, void *data, id sim, id other, v
 		say("hakios: cellular: service item %ld: data %p, SIM info %p, other %p; string getter %p setter %p, content type getter %p "
 		    "setter %p; the kernel's network \"%s\"\n", item, data, (void *)sim, (void *)other, g1, s1, g3, s3, name);
 	}
-	/*
-	 * (not written: the string setter's arguments are not the bars setter's -- called as (data, string) it was given the
-	 * SystemStatus data where it wanted the string, and SpringBoard died on it, run 195319; the name stays unset)
-	 */
-	if ((0) && registered > 0 && name[0] != 0 && s1 != NULL && data != NULL) {
+	if (registered > 0 && name[0] != 0 && s1 != NULL) {
 		CFStringRef string = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
 
 		if (string != NULL) {
-			BLOCK_CALL(s1, void (*)(void *, void *, CFStringRef), data, string);
+			BLOCK_CALL(s1, void (*)(void *, CFStringRef), string);
 			((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
 			((void (*)(id, SEL, long))objc_msgSend)(self, sel_registerName("_notifyItemChanged:"), item);
 			if (strcmp(shown, name) != 0) {
@@ -521,8 +519,8 @@ update_data_network_item(id self, SEL sel, long item, void *data, BOOL primary, 
 		say("hakios: cellular: data network item %ld (primary %d): the kernel's data %d; LTE shown as %d\n", item, primary,
 		    sysctl_int("kern.hakios.cellular_data"), lte);
 	}
-	if (primary && sysctl_int("kern.hakios.cellular_registered") > 0 && setter != NULL && data != NULL) {
-		BLOCK_CALL(setter, void (*)(void *, void *, int), data, lte);
+	if (primary && sysctl_int("kern.hakios.cellular_registered") > 0 && setter != NULL) {
+		BLOCK_CALL(setter, void (*)(void *, unsigned int), (unsigned int)lte);
 		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
 		((void (*)(id, SEL, long))objc_msgSend)(self, sel_registerName("_notifyItemChanged:"), item);
 	}
@@ -634,6 +632,19 @@ cellular_hook(void)
 			method_setImplementation(method, (IMP)update_service_item);
 		}
 	}
+	{
+		const char *data_selector = "_updateDataNetworkItem:withData:primary:dataNetworkTypeGetter:dataNetworkTypeSetter:";
+		Class dcls = objc_getClass("SBStatusBarStateAggregator");
+		Method dmethod = dcls ? class_getInstanceMethod(dcls, sel_registerName(data_selector)) : NULL;
+
+		if (dmethod) {
+			say("hakios: cellular: -[SBStatusBarStateAggregator %s] types \"%s\": replaced\n", data_selector,
+			    method_getTypeEncoding(dmethod));
+			original_update_data_network_item = (void (*)(id, SEL, long, void *, BOOL, void *, void *))
+			    method_getImplementation(dmethod);
+			method_setImplementation(dmethod, (IMP)update_data_network_item);
+		}
+	}
 	const char *selector = "_updateSignalStrengthItem:withData:SIMInfo:barsGetter:barsSetter:";
 	Class cls = objc_getClass("SBStatusBarStateAggregator");
 	Method method = cls ? class_getInstanceMethod(cls, sel_registerName(selector)) : NULL;
@@ -687,7 +698,7 @@ cellular_hook(void)
 		sysctlbyname("kern.hakios.cellular_operator", name, &size, NULL, 0);
 		if ((registered != last_registered || bars != last_bars || data != last_data || strcmp(name, last_name) != 0) &&
 		    cellular_aggregator != nil) {
-			static const char *const updates[] = { "_updateSignalStrengthItem", "_updateServiceItem" };
+			static const char *const updates[] = { "_updateSignalStrengthItem", "_updateServiceItem", "_updateDataNetworkItem" };
 
 			last_registered = registered;
 			last_bars = bars;
