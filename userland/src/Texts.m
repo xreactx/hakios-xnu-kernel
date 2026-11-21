@@ -542,6 +542,30 @@ body_plain(NSString *body)
 	self.timer = [NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(tick) userInfo:nil repeats:YES];
 }
 
+/* the newest text in sight: once the table is laid out, and again a moment later (pictures change the rows' heights) */
+- (void)scrollToEnd:(BOOL)animated
+{
+	if (self.texts.count == 0) {
+		return;
+	}
+	[self.table layoutIfNeeded];
+	[self.table scrollToRowAtIndexPath:[NSIndexPath indexPathForRow:(NSInteger)self.texts.count - 1 inSection:0]
+	    atScrollPosition:UITableViewScrollPositionBottom animated:animated];
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+		if (self.texts.count != 0) {
+			[self.table layoutIfNeeded];
+			[self.table scrollToRowAtIndexPath:[NSIndexPath indexPathForRow:(NSInteger)self.texts.count - 1 inSection:0]
+			    atScrollPosition:UITableViewScrollPositionBottom animated:NO];
+		}
+	});
+}
+
+- (void)viewDidAppear:(BOOL)animated
+{
+	[super viewDidAppear:animated];
+	[self scrollToEnd:NO];
+}
+
 - (void)viewWillDisappear:(BOOL)animated
 {
 	[super viewWillDisappear:animated];
@@ -564,10 +588,7 @@ body_plain(NSString *body)
 	self.texts = mine;
 	if (mine.count != before) {
 		[self.table reloadData];
-		if (mine.count != 0) {
-			[self.table scrollToRowAtIndexPath:[NSIndexPath indexPathForRow:(NSInteger)mine.count - 1 inSection:0]
-			    atScrollPosition:UITableViewScrollPositionBottom animated:before != 0];
-		}
+		[self scrollToEnd:before != 0];
 	}
 }
 

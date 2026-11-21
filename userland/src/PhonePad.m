@@ -435,10 +435,25 @@ cell_for(UITableView *table, NSString *reuse)
 
 /* ---- the keypad ---- */
 
+#define KEYPAD_FLAG @"/private/var/mobile/Library/HakiOS/keypad"   /* calld's: the call's keypad is here while it is there */
+
+/* the call's state (kern.hakios.call_state): 3 talking, 4 on hold; 0 if not known */
+static int
+call_state_now(void)
+{
+	int state = 0;
+	size_t size = sizeof(state);
+
+	sysctlbyname("kern.hakios.call_state", &state, &size, NULL, 0);
+	return state;
+}
+
 @interface PadController : UIViewController
 @property (nonatomic, strong) UILabel *display;
 @property (nonatomic, strong) UILabel *status;
 @property (nonatomic, copy) NSString *number;
+@property (nonatomic, strong) UIButton *call;
+@property (nonatomic) BOOL inCall;       /* a call talks: the keys play tones into it, the green button returns to it */
 @end
 
 @implementation PadController
@@ -506,6 +521,8 @@ cell_for(UITableView *table, NSString *reuse)
 
 	CGFloat row = top + 4 * (size + gap * 0.7);
 	UIButton *call = [UIButton buttonWithType:UIButtonTypeSystem];
+
+	self.call = call;
 	call.frame = CGRectMake(left + size + gap, row, size, size);
 	call.backgroundColor = [UIColor colorWithRed:0.20 green:0.78 blue:0.35 alpha:1];
 	call.layer.cornerRadius = size / 2;
@@ -527,6 +544,36 @@ cell_for(UITableView *table, NSString *reuse)
 	[self.view addSubview:back];
 
 	[self refresh];
+	[NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(watchCall) userInfo:nil repeats:YES];
+	[self watchCall];
+}
+
+/* in a call or not: the keypad's two ways */
+- (void)watchCall
+{
+	int state = call_state_now();
+	BOOL inCall = state == 3 || state == 4;
+
+	if (inCall == self.inCall) {
+		return;
+	}
+	self.inCall = inCall;
+	self.number = @"";
+	[self refresh];
+	if (inCall) {
+		self.status.text = @"On a call: the keys play their tones";
+		[self.call setImage:[UIImage systemImageNamed:@"phone.arrow.up.right.fill" withConfiguration:[UIImageSymbolConfiguration
+		    configurationWithPointSize:28]] forState:UIControlStateNormal];
+		self.call.accessibilityLabel = @"Return to Call";
+		if ([self.tabBarController.viewControllers containsObject:self]) {
+			self.tabBarController.selectedViewController = self;
+		}
+	} else {
+		self.status.text = @"";
+		[self.call setImage:[UIImage systemImageNamed:@"phone.fill" withConfiguration:[UIImageSymbolConfiguration
+		    configurationWithPointSize:30]] forState:UIControlStateNormal];
+		self.call.accessibilityLabel = @"Call";
+	}
 }
 
 - (void)refresh
@@ -538,8 +585,19 @@ cell_for(UITableView *table, NSString *reuse)
 {
 	static NSString *const keys = @"123456789*0#";
 
+	NSString *key = [keys substringWithRange:NSMakeRange((NSUInteger)sender.tag, 1)];
+
+	if (self.inCall) {
+		/* (its tone into the call, at once) */
+		if (sysctlbyname("kern.hakios.call_dtmf", NULL, NULL, (void *)key.UTF8String, 2) != 0) {
+			self.status.text = [NSString stringWithFormat:@"Tone not sent (%s)", strerror(errno)];
+		}
+		self.number = [(self.number.length < 24 ? self.number : [self.number substringFromIndex:1]) stringByAppendingString:key];
+		[self refresh];
+		return;
+	}
 	if (self.number.length < 20) {
-		self.number = [self.number stringByAppendingString:[keys substringWithRange:NSMakeRange((NSUInteger)sender.tag, 1)]];
+		self.number = [self.number stringByAppendingString:key];
 	}
 	self.status.text = @"";
 	[self refresh];
@@ -577,6 +635,11 @@ cell_for(UITableView *table, NSString *reuse)
 {
 	NSString *problem;
 
+	if (self.inCall) {
+		/* Return to Call: calld shows the call's alert again */
+		[NSFileManager.defaultManager removeItemAtPath:KEYPAD_FLAG error:NULL];
+		return;
+	}
 	if (self.number.length == 0) {
 		return;
 	}

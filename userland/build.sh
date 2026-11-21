@@ -158,6 +158,7 @@ SILEO_BIN="chmod cp mkdir mv rm"
 # ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
 INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libhakios.sb.dylib SpringBoard
+/redwood/lib/libhakios.toast.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo VoiceMemos Measure
 /redwood/lib/libhakios.tweaks.dylib Preferences
@@ -304,6 +305,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			-o obj/libhakios.dylib src/inject.c
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.sb.dylib -framework CoreFoundation -framework CoreGraphics -framework IOKit -framework IOSurface -lobjc \
 			-o obj/libhakios.sb.dylib src/inject_sb.c
+		# ... and in SpringBoard, a banner at the top of the screen for a text that arrives (src/inject_toast.m)
+		$DYN -fobjc-arc -dynamiclib -install_name /redwood/lib/libhakios.toast.dylib -framework UIKit -framework Foundation \
+			-framework QuartzCore -framework CoreGraphics -lobjc -o obj/libhakios.toast.dylib src/inject_toast.m
 		# ... the tweak loader of the package manager's prefix (src/inject_tweaks.c): it goes into a
 		# program either as the one library the kernel inserts or opened by a library of ours
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.tweaks.dylib -framework CoreFoundation -lobjc \
@@ -449,6 +453,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.loc.dylib ] && cp obj/libhakios.loc.dylib root/lib/
 	[ -f obj/libhakios.motion.dylib ] && cp obj/libhakios.motion.dylib root/lib/
+	[ -f obj/libhakios.toast.dylib ] && cp obj/libhakios.toast.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
 	[ -f obj/libhakios.bluetool.dylib ] && cp obj/libhakios.bluetool.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then

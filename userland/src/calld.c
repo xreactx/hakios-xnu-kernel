@@ -24,6 +24,8 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <time.h>
@@ -36,6 +38,8 @@ extern UserNotificationRef notification_create(CFAllocatorRef allocator, CFTimeI
 extern SInt32 notification_response(UserNotificationRef notification, CFTimeInterval timeout, CFOptionFlags *response)
     __asm__("_CFUserNotificationReceiveResponse");
 extern SInt32 notification_cancel(UserNotificationRef notification) __asm__("_CFUserNotificationCancel");
+extern CFStringRef notification_value(UserNotificationRef notification, CFStringRef key, CFIndex index)
+    __asm__("_CFUserNotificationGetResponseValue");
 #define NOTE_ALERT              1       /* kCFUserNotificationNoteAlertLevel */
 #define DEFAULT_RESPONSE        0       /* kCFUserNotificationDefaultResponse: the first button */
 #define ALTERNATE_RESPONSE      1       /* kCFUserNotificationAlternateResponse: the second */
@@ -44,6 +48,7 @@ extern SInt32 notification_cancel(UserNotificationRef notification) __asm__("_CF
 #define AUDIO_MUTE              2
 
 #define RINGTONE "/Library/Ringtones/Opening.m4r"
+#define KEYPAD_FLAG "/private/var/mobile/Library/HakiOS/keypad"  /* the call's keypad is Phone Pad's while it is there */
 #define HISTORY_DIR "/private/var/mobile/Library/HakiOS"
 #define HISTORY HISTORY_DIR "/calls.txt"
 #define MOBILE                  501     /* the user Phone Pad runs as */
@@ -146,6 +151,25 @@ call_action(int action)
 	}
 }
 
+/*
+ * Phone Pad brought to the front, for the call's keypad: SpringBoardServices' SBSLaunchApplicationWithIdentifier
+ * (calld signed with com.apple.springboard.launchapplications), opened when wanted. 0 if it was.
+ */
+static int
+open_phone_pad(void)
+{
+	static int (*launch)(CFStringRef, Boolean);
+
+	if (launch == NULL) {
+		void *sbs = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+
+		launch = sbs != NULL ? (int (*)(CFStringRef, Boolean))dlsym(sbs, "SBSLaunchApplicationWithIdentifier") : NULL;
+	}
+	return launch != NULL ? launch(CFSTR("com.hakios.phonepad"), false) : -1;
+}
+
+static CFStringRef alert_field;         /* the next alert's text field's title (NULL: none): the call's keypad */
+
 /* An alert with one or two buttons; NULL if SpringBoard does not take it. */
 static UserNotificationRef
 alert3(const char *header, const char *message, CFStringRef first, CFStringRef second, CFStringRef third)
@@ -165,6 +189,13 @@ alert3(const char *header, const char *message, CFStringRef first, CFStringRef s
 	}
 	if (third != NULL) {
 		CFDictionarySetValue(d, CFSTR("OtherButtonTitle"), third);
+	}
+	if (alert_field != NULL) {
+		CFArrayRef titles = CFArrayCreate(NULL, (const void **)&alert_field, 1, &kCFTypeArrayCallBacks);
+
+		CFDictionarySetValue(d, CFSTR("TextFieldTitles"), titles);
+		CFRelease(titles);
+		alert_field = NULL;
 	}
 	/* (SpringBoard's own keys: shown over the lock screen too, and not dismissed by the home gesture) */
 	CFDictionarySetValue(d, CFSTR("SBUserNotificationDismissOnLock"), kCFBooleanFalse);
@@ -347,29 +378,88 @@ talking(void)
 	record.talk_start = time(NULL);
 	caller(number, sizeof(number));
 	printf("calld: on the call with %s\n", record.number);
+	/*
+	 * Three pages, the alert having three buttons at most: the call's (End, Speaker or Earpiece, More), More's (Mute or
+	 * Unmute, Keypad, Back), and the keypad's -- a text field: the digits typed are sent as tones (kern.hakios.call_dtmf).
+	 */
+	int page = 0;
+
 	for (;;) {
 		int audio = call_audio_get(), done = 0;
 		UserNotificationRef n;
 
 		snprintf(message, sizeof(message), "%s\n%s%s", number, audio & AUDIO_SPEAKER ? "Speaker" : "Earpiece",
 		    audio & AUDIO_MUTE ? ", muted" : "");
-		n = alert3("On Call", message, CFSTR("End"), audio & AUDIO_SPEAKER ? CFSTR("Earpiece") : CFSTR("Speaker"),
-		    audio & AUDIO_MUTE ? CFSTR("Unmute") : CFSTR("Mute"));
+		if (page == 0) {
+			n = alert3("On Call", message, CFSTR("End"), audio & AUDIO_SPEAKER ? CFSTR("Earpiece") : CFSTR("Speaker"),
+			    CFSTR("More"));
+		} else if (page == 1) {
+			n = alert3("On Call", message, audio & AUDIO_MUTE ? CFSTR("Unmute") : CFSTR("Mute"), CFSTR("Keypad"),
+			    CFSTR("Back"));
+		} else {
+			/* the keypad: Phone Pad's, no alert while it is there (it removes KEYPAD_FLAG with Return to Call) */
+			int fd = open(KEYPAD_FLAG, O_CREAT | O_WRONLY, 0644);
+
+			if (fd >= 0) {
+				fchown(fd, MOBILE, MOBILE);
+				close(fd);
+			}
+			printf("calld: the keypad: Phone Pad opened (%d)\n", open_phone_pad());
+			n = NULL;
+			for (;;) {
+				struct stat st;
+				int state = call_state(&ok);
+
+				if (state != 3 && state != 4) {
+					break;
+				}
+				if (stat(KEYPAD_FLAG, &st) != 0) {
+					printf("calld: back to the call from the keypad\n");
+					break;
+				}
+				usleep(250000);
+			}
+			unlink(KEYPAD_FLAG);
+			page = 0;
+			{
+				int state = call_state(&ok);
+
+				if (state == 3 || state == 4) {
+					continue;       /* (the call's alert again) */
+				}
+				printf("calld: the call ended (state %d)\n", state);
+				record.talk_end = time(NULL);
+				return;
+			}
+		}
 		for (;;) {
 			CFOptionFlags response = 0;
 			int state;
 
 			if (n != NULL && notification_response(n, 0.25, &response) == 0) {
-				if ((response & 3) == DEFAULT_RESPONSE) {
-					printf("calld: End pressed\n");
-					call_action(2);
-					done = 1;
-				} else if ((response & 3) == ALTERNATE_RESPONSE) {
-					printf("calld: %s pressed\n", audio & AUDIO_SPEAKER ? "Earpiece" : "Speaker");
-					call_audio_set(audio ^ AUDIO_SPEAKER);
-				} else {
-					printf("calld: %s pressed\n", audio & AUDIO_MUTE ? "Unmute" : "Mute");
-					call_audio_set(audio ^ AUDIO_MUTE);
+				int button = (int)(response & 3);
+
+				if (page == 0) {
+					if (button == DEFAULT_RESPONSE) {
+						printf("calld: End pressed\n");
+						call_action(2);
+						done = 1;
+					} else if (button == ALTERNATE_RESPONSE) {
+						printf("calld: %s pressed\n", audio & AUDIO_SPEAKER ? "Earpiece" : "Speaker");
+						call_audio_set(audio ^ AUDIO_SPEAKER);
+					} else {
+						page = 1;
+					}
+				} else if (page == 1) {
+					if (button == DEFAULT_RESPONSE) {
+						printf("calld: %s pressed\n", audio & AUDIO_MUTE ? "Unmute" : "Mute");
+						call_audio_set(audio ^ AUDIO_MUTE);
+						page = 0;
+					} else if (button == ALTERNATE_RESPONSE) {
+						page = 2;
+					} else {
+						page = 0;
+					}
 				}
 				break;
 			}

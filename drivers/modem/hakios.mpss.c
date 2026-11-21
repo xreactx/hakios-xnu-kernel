@@ -8891,6 +8891,9 @@ sms_advance(void)
 #define VOICE_END_CALL          0x0021
 #define VOICE_ANSWER_CALL       0x0022
 #define VOICE_ALL_CALL_STATUS   0x002e
+#define VOICE_BURST_DTMF        0x0028
+#define VOICE_START_CONT_DTMF   0x0029
+#define VOICE_STOP_CONT_DTMF    0x002a
 
 static struct hakios_qrtr_port *voice_port;
 static uint32_t voice_node, voice_port_number;
@@ -8940,6 +8943,56 @@ call_dial_sysctl SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_kern_hakios, OID_AUTO, call_dial, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
     call_dial_sysctl, "A", "a number to dial (written: dialled when no call is up)");
+
+/*
+ * Tones into the call (a menu's choices, a voicemail's PIN): digits, '*', '#' (and A-D) written to kern.hakios.call_dtmf
+ * by the call's keypad (userland calld), played while the call talks one digit at a time: Start Continuous DTMF (0x29:
+ * TLV 1 the call's id and the digit), DTMF_ON_US later Stop (0x2a: TLV 1 the call's id), DTMF_OFF_US before the next.
+ * (Burst DTMF, 0x28, is CDMA's: on LTE the modem answers 24, network unsupported -- run 185607.) The modem plays them
+ * into the call (over VoLTE as RTP telephone events).
+ */
+#define DTMF_ON_US              160000
+#define DTMF_OFF_US             120000
+static char call_dtmf_digits[33];
+static volatile int call_dtmf_wanted;
+static unsigned call_dtmf_at;           /* the next digit to play */
+static bool call_dtmf_on;               /* a digit is playing */
+static uint64_t call_dtmf_us;           /* when the last start or stop was asked */
+
+static int
+call_dtmf_sysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	char digits[sizeof(call_dtmf_digits)];
+	int error;
+
+	strlcpy(digits, call_dtmf_digits, sizeof(digits));
+	error = sysctl_handle_string(oidp, digits, sizeof(digits), req);
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (digits[0] == 0) {
+		return EINVAL;
+	}
+	for (const char *c = digits; *c != 0; c++) {
+		if (!((*c >= '0' && *c <= '9') || *c == '*' || *c == '#' || (*c >= 'A' && *c <= 'D'))) {
+			return EINVAL;
+		}
+	}
+	if (call_dtmf_wanted) {
+		/* (pressed while others play: after them, as long as there is room) */
+		if (strlen(call_dtmf_digits) + strlen(digits) >= sizeof(call_dtmf_digits)) {
+			return EBUSY;
+		}
+		strlcat(call_dtmf_digits, digits, sizeof(call_dtmf_digits));
+		return 0;
+	}
+	strlcpy(call_dtmf_digits, digits, sizeof(call_dtmf_digits));
+	call_dtmf_wanted = 1;
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, call_dtmf, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    call_dtmf_sysctl, "A", "tones to play into the call talking (digits, * and #)");
 
 /* what the ringing screen (userland calld) asks: 1 answer the incoming call, 2 end (decline or hang up) the call */
 static int call_action;
@@ -9009,6 +9062,13 @@ voice_receive(__unused void *context, __unused uint32_t node, __unused uint32_t 
 			break;
 		case VOICE_END_CALL:
 			tell("mpss: call: HANG UP: result %u, error %u\n", result, error);
+			break;
+		case VOICE_START_CONT_DTMF:
+		case VOICE_STOP_CONT_DTMF:
+			if (result != 0) {
+				tell("mpss: call: a tone's %s: result %u, error %u\n", id == VOICE_START_CONT_DTMF ? "start" : "stop", result,
+				    error);
+			}
 			break;
 		}
 		return;
@@ -10144,6 +10204,38 @@ voice_open(void)
 }
 
 /* Every second or two: events asked for once; call_to dialled; an incoming call answered; calls hung up on time. */
+/* the keypad's tones, a digit at a time (from voice_advance, and every 100 ms between) */
+static void
+call_dtmf_tick(void)
+{
+	if (voice_port == NULL || voice_port_number == 0 || call_id == 0 || call_hung) {
+		return;
+	}
+	if (call_dtmf_wanted && call_state_raw == 3) {
+		uint64_t now = now_us();
+
+		if (call_dtmf_on && now - call_dtmf_us >= DTMF_ON_US) {
+			uint8_t t[4] = { 0x01, 1, 0, (uint8_t)call_id };
+
+			call_dtmf_on = false;
+			call_dtmf_us = now;
+			voice_request(VOICE_STOP_CONT_DTMF, 0x86, t, sizeof(t));
+			if (call_dtmf_digits[call_dtmf_at] == 0) {
+				tell("mpss: call: tones %s played into call %u (the call's keypad)\n", call_dtmf_digits, call_id);
+				call_dtmf_at = 0;
+				call_dtmf_wanted = 0;
+			}
+		} else if (!call_dtmf_on && (call_dtmf_at == 0 || now - call_dtmf_us >= DTMF_OFF_US) &&
+		    call_dtmf_digits[call_dtmf_at] != 0) {
+			uint8_t t[5] = { 0x01, 2, 0, (uint8_t)call_id, (uint8_t)call_dtmf_digits[call_dtmf_at++] };
+
+			call_dtmf_on = true;
+			call_dtmf_us = now;
+			voice_request(VOICE_START_CONT_DTMF, 0x85, t, sizeof(t));
+		}
+	}
+}
+
 static void
 voice_advance(void)
 {
@@ -10196,8 +10288,13 @@ voice_advance(void)
 	}
 	if (call_id == 0 || call_state_raw == 9 || call_hung) {
 		call_action = 0;
+		call_dtmf_wanted = 0;
+		call_dtmf_at = 0;
+		call_dtmf_on = false;
 		return;
 	}
+	call_dtmf_tick();
+
 	if (call_action == 1 && call_state_raw == 2 && !call_answered) {
 		call_action = 0;
 		call_answered = 1;
@@ -10606,6 +10703,7 @@ nas_thread(__unused void *parameter, __unused wait_result_t result)
 		voice_advance();
 		for (unsigned ms = 0; ms < 2000 && nas_wanted; ms += 100) {
 			sleep_ms(100);
+			call_dtmf_tick();
 		}
 	}
 	nas_runs = false;

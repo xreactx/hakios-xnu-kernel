@@ -16,6 +16,8 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dirent.h>
+#include <pthread.h>
+#include <notify.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <stdio.h>
@@ -33,6 +35,7 @@ extern int contact_name(const char *number, char *out, size_t size);     /* src/
 
 #define TEXTS_DIR       "/private/var/mobile/Library/HakiOS"
 #define TEXTS           TEXTS_DIR "/texts.txt"
+#define TOAST           TEXTS_DIR "/toast.txt"
 #define MOBILE          501
 #define INBOX_BYTES     (64 << 10)
 #define PENDING         16
@@ -68,16 +71,20 @@ unescape(char *s)
  * a text into the conversations file, escaped: its kind (in, out, failed), the conversation (the other side's number,
  * or a group's numbers comma-separated) and, in a group, who wrote it (a fifth field)
  */
+static pthread_mutex_t keep_lock = PTHREAD_MUTEX_INITIALIZER;     /* (MMS are fetched and sent on threads of their own) */
+
 static void
 keep_kind(const char *kind, const char *from, const char *text, const char *sender)
 {
 	FILE *f;
 
+	pthread_mutex_lock(&keep_lock);
 	(void)mkdir(TEXTS_DIR, 0755);
 	(void)chown(TEXTS_DIR, MOBILE, MOBILE);
 	f = fopen(TEXTS, "a");
 	if (f == NULL) {
 		perror("smsd: " TEXTS);
+		pthread_mutex_unlock(&keep_lock);
 		return;
 	}
 	fprintf(f, "%ld\t%s\t%s\t", (long)time(NULL), kind, from);
@@ -96,6 +103,7 @@ keep_kind(const char *kind, const char *from, const char *text, const char *send
 	fclose(f);
 	(void)chown(TEXTS, MOBILE, MOBILE);
 	(void)chmod(TEXTS, 0644);
+	pthread_mutex_unlock(&keep_lock);
 }
 
 static void
@@ -112,6 +120,43 @@ keep(const char *from, const char *text)
 #define OUTBOX          TEXTS_DIR "/outbox"
 extern int mms_send(const char *number, const char *text, const char *picture);
 
+/* one request from OUTBOX (its contents, malloc'd: freed here): sent, and written into the conversations */
+static void *
+send_request(void *argument)
+{
+	char *request = argument, number[512] = "", picture[256] = "", *text, *body;
+	size_t size = strlen(request);
+	int ok;
+
+	text = request;
+	sscanf(text, "%511[^\n]", number);
+	text = strchr(text, '\n');
+	text = text != NULL ? text + 1 : request + size;
+	if (*text != '\n') {
+		sscanf(text, "%255[^\n]", picture);
+	}
+	text = strchr(text, '\n');
+	text = text != NULL ? text + 1 : request + size;
+	printf("smsd: an MMS to send to %s (%s, %zu bytes of text)\n", number, picture[0] != 0 ? "a picture" : "no picture",
+	    strlen(text));
+	ok = number[0] != 0 && mms_send(number, text, picture[0] != 0 ? picture : NULL);
+	body = calloc(1, strlen(text) + strlen(picture) + 16);
+	if (body != NULL) {
+		strcpy(body, text);
+		if (picture[0] != 0) {
+			if (body[0] != 0) {
+				strcat(body, "\n");
+			}
+			strcat(body, "\001IMG:");
+			strcat(body, picture);
+		}
+		keep_kind(ok ? "out" : "failed", number, body, NULL);
+		free(body);
+	}
+	free(request);
+	return NULL;
+}
+
 static void
 outbox(void)
 {
@@ -126,11 +171,10 @@ outbox(void)
 		return;
 	}
 	while ((e = readdir(d)) != NULL) {
-		char path[512], *request, number[32] = "", picture[256] = "", *text, *body;
+		char path[512], *request;
 		size_t length = strlen(e->d_name);
 		FILE *f;
 		long size;
-		int ok;
 
 		if (length < 5 || strcmp(e->d_name + length - 4, ".req") != 0) {
 			continue;
@@ -152,32 +196,16 @@ outbox(void)
 		if (request == NULL) {
 			continue;
 		}
-		text = request;
-		sscanf(text, "%31[^\n]", number);
-		text = strchr(text, '\n');
-		text = text != NULL ? text + 1 : request + size;
-		if (*text != '\n') {
-			sscanf(text, "%255[^\n]", picture);
-		}
-		text = strchr(text, '\n');
-		text = text != NULL ? text + 1 : request + size;
-		printf("smsd: an MMS to send to %s (%s, %zu bytes of text)\n", number, picture[0] != 0 ? "a picture" : "no picture",
-		    strlen(text));
-		ok = number[0] != 0 && mms_send(number, text, picture[0] != 0 ? picture : NULL);
-		body = calloc(1, strlen(text) + strlen(picture) + 16);
-		if (body != NULL) {
-			strcpy(body, text);
-			if (picture[0] != 0) {
-				if (body[0] != 0) {
-					strcat(body, "\n");
-				}
-				strcat(body, "\001IMG:");
-				strcat(body, picture);
+		{
+			pthread_t t;
+
+			/* (sent on a thread of its own: the MMSC's answer can take a minute) */
+			if (pthread_create(&t, NULL, send_request, request) == 0) {
+				pthread_detach(t);
+			} else {
+				send_request(request);
 			}
-			keep_kind(ok ? "out" : "failed", number, body, NULL);
-			free(body);
 		}
-		free(request);
 	}
 	closedir(d);
 }
@@ -190,12 +218,12 @@ outbox(void)
  */
 extern int mms_fetch(const unsigned char *push, size_t n, char *from, size_t from_size, char *text, size_t text_size,
     char *people, size_t people_size);
-static char group[512];                 /* the last MMS's people, comma-separated, when it was a group's */
+static __thread char group[512];        /* the last MMS's people, comma-separated, when it was a group's */
 
 static int
 data_message(char *from, const char **text)
 {
-	static char said[TEXT_BYTES];
+	static __thread char said[TEXT_BYTES];
 	unsigned char bytes[2048];
 	size_t n = 0;
 	const char *hex = *text + 6;
@@ -222,12 +250,54 @@ data_message(char *from, const char **text)
 	return 1;
 }
 
-/* a whole text: kept and shown */
+static void arrived_now(const char *sender, const char *text);
+
+struct later {
+	char *sender, *text;
+};
+
+static void *
+arrived_thread(void *argument)
+{
+	struct later *l = argument;
+
+	arrived_now(l->sender, l->text);
+	free(l->sender);
+	free(l->text);
+	free(l);
+	return NULL;
+}
+
+/*
+ * a whole text: kept and shown -- an MMS notification on a thread of its own (its fetch, and the MMSC's answer to
+ * "retrieved", can take a minute: the texts after it are not to wait, run 190926)
+ */
 static void
 arrived(const char *sender, const char *text)
 {
+	pthread_t t;
+	struct later *l;
+
+	if (strncmp(text, "\001DATA:", 6) != 0 || (l = calloc(1, sizeof(*l))) == NULL) {
+		arrived_now(sender, text);
+		return;
+	}
+	l->sender = strdup(sender);
+	l->text = strdup(text);
+	if (l->sender == NULL || l->text == NULL || pthread_create(&t, NULL, arrived_thread, l) != 0) {
+		arrived_now(sender, text);
+		free(l->sender);
+		free(l->text);
+		free(l);
+		return;
+	}
+	pthread_detach(t);
+}
+
+static void
+arrived_now(const char *sender, const char *text)
+{
 	char name[96], title[160], from[24];
-	CFStringRef header, message;
 
 	strlcpy(from, sender, sizeof(from));
 	group[0] = 0;
@@ -246,7 +316,7 @@ arrived(const char *sender, const char *text)
 	}
 	printf("smsd: a text from %s (%zu bytes): kept and shown\n", from, strlen(text));
 	{
-		/* (in the alert, a picture is said, not its file) */
+		/* (in the banner, a picture is said, not its file) */
 		char *shown = strdup(text), *mark;
 
 		while (shown != NULL && (mark = strstr(shown, "\001IMG:")) != NULL) {
@@ -255,20 +325,21 @@ arrived(const char *sender, const char *text)
 			memmove(mark + 9, end != NULL ? end : mark + strlen(mark), strlen(end != NULL ? end : mark + strlen(mark)) + 1);
 			memcpy(mark, "[Picture]", 9);
 		}
-		header = CFStringCreateWithCString(NULL, title, kCFStringEncodingUTF8);
-		message = CFStringCreateWithCString(NULL, shown != NULL ? shown : text, kCFStringEncodingUTF8);
+		/*
+		 * a banner at the top of the screen, 5 s, inside SpringBoard (src/inject_toast.m): the title and the text in
+		 * TOAST, then the Darwin notification com.hakios.toast
+		 */
+		FILE *f = fopen(TOAST ".tmp", "w");
+
+		if (f != NULL) {
+			fprintf(f, "%s\n%s", title, shown != NULL ? shown : text);
+			fclose(f);
+			chown(TOAST ".tmp", MOBILE, MOBILE);
+			chmod(TOAST ".tmp", 0644);
+			rename(TOAST ".tmp", TOAST);
+			notify_post("com.hakios.toast");
+		}
 		free(shown);
-	}
-	if (message == NULL) {
-		message = CFStringCreateWithCString(NULL, text, kCFStringEncodingISOLatin1);
-	}
-	/* (no wait for the button: the next text may come while this one is up) */
-	(void)notice(0, PLAIN_ALERT, NULL, NULL, NULL, header, message, CFSTR("OK"));
-	if (header != NULL) {
-		CFRelease(header);
-	}
-	if (message != NULL) {
-		CFRelease(message);
 	}
 }
 
