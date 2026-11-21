@@ -4,7 +4,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/xnu-env.sh"
 cd "$XNU_SRC" || exit 1
 # The Wi-Fi driver's object (tools/mk-ath11k.sh) is linked into the kernel when it is there; make
 # does not see it change, so the linked kernel is thrown away when it has.
-# (ATH=ath10k: the OnePlus 6T's driver, tools/mk-ath10k.sh, in place of redwood's)
+# (ATH=ath10k: the OnePlus 6T's driver, tools/mk-ath10k.sh, in place of redwood's -- chosen by itself when the
+# configuration has the 6T's Wi-Fi, hakios_wifi6t: built without it, the 6T's kernels linked ath11k and the Wi-Fi did not
+# come up, 19 to 21 November)
+if [ -z "$ATH" ] && [ -f config/MASTER.hakios ] && grep -q '^#  HAKIOS_DRIVERS = \[.* hakios_wifi6t ' config/MASTER.hakios; then
+	ATH=ath10k
+fi
 ATH=${ATH:-ath11k}
 LX=$XNUDEPS/build/$ATH/out/$ATH.o
 # ... only into a kernel that has the Wi-Fi driver (CONFIG_HAKIOS_WIFI): the object's calls are answered by hakios.lx.c
