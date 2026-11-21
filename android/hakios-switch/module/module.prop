@@ -3,4 +3,4 @@ name=Restart into HakiOS
 version=1.0
 versionCode=1
 author=HakiOS
-description=Tap Action to restart into HakiOS (slot a). Android's slot is left to the bootloader as unbootable; HakiOS's "Android" app switches back.
+description=Tap Action to restart into HakiOS: slot a is made active through the phone's own boot control, as an OTA update switches slots. HakiOS's "Android" app switches back.

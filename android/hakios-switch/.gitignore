@@ -1,2 +1,6 @@
 module/hakios-slot
+module/hakios-bootctl
+hakios-slot
+hakios-bootctl
 hakios-switch.zip
+sysroot/
