@@ -1798,6 +1798,9 @@ ufs_survey(void)
 #define BLOCK_SYSTEM_A_LAST  817983ULL
 #define BLOCK_SYSTEM_A_WRITE_FIRST 629248ULL
 #define BLOCK_SYSTEM_A_TYPE  { 0x77036cd4, 0x03d5, 0x42bb, { 0x8e, 0xd1, 0x37, 0xe5, 0xa8, 0x8b, 0xaa, 0x34 } }
+/* (the type GUID the active slot's system has: Qualcomm's ABL swaps the two slots' type GUIDs on set_active, so
+ * system_a has this one once HakiOS is installed and slot a made active -- 2026-11-21, every save refused) */
+#define BLOCK_SYSTEM_ACTIVE_TYPE { 0x97d7b011, 0x54da, 0x4835, { 0xb3, 0xc4, 0x91, 0x7a, 0xd6, 0xe7, 0x3d, 0x74 } }
 #define BLOCK_SYSTEM_A_UNIQ  { 0x07ea75d4, 0x6026, 0xd575, { 0x46, 0x4d, 0xac, 0x2c, 0x7e, 0xf6, 0x5b, 0x3c } }
 
 /* The partitions a write may reach -- one at most in a run: the first of these found as it was set up. */
@@ -2165,7 +2168,10 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 	if (t == NULL || block_write_part >= 0) {
 		return 0;                       /* another partition (or one is chosen already): nothing to say about it */
 	}
-	if (memcmp(&info->type_guid, &t->type, sizeof(t->type)) != 0) {
+	static const efi_guid system_active = BLOCK_SYSTEM_ACTIVE_TYPE;
+
+	if (memcmp(&info->type_guid, &t->type, sizeof(t->type)) != 0 && !(t->first == BLOCK_SYSTEM_A_FIRST &&
+	    memcmp(&info->type_guid, &system_active, sizeof(system_active)) == 0)) {
 		why = "its type GUID is not the one it had";
 	} else if (t->first != 0 && memcmp(&info->unique_guid, &t->uniq, sizeof(t->uniq)) != 0) {
 		why = "its unique GUID is not the one it had";

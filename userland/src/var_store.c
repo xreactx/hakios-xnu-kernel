@@ -14,7 +14,8 @@
  *   var_store save          pack /private/var into the store
  *   var_store load          unpack the newest good store into /private/var (init, at boot)
  *   var_store watch [SECS]  stay and save by itself: when the kernel says the run is ending, and
- *                           every SECS seconds besides (a launchd job of ours does this)
+ *                           every SECS seconds besides when anything in it changed (a launchd job of ours
+ *                           does this, every 300 s: an installed phone is never ended in order)
  *   var_store show          what the store holds, both slots
  *   var_store erase         forget both slots (the next boot starts empty again)
  *   var_store stamp PATH    write a line into PATH saying when: a marker for a run
@@ -1028,6 +1029,88 @@ pack_tree(const char *relative)
 	return ok;
 }
 
+/*
+ * A fingerprint of the tree as save() would pack it -- every name, size, mode and time of change, in the same
+ * sorted order -- so that `watch SECS` saves only when something did change: an installed phone (xl standalone)
+ * never goes back to a loader in order, and is saved by the clock alone; without this, a hundred-odd megabytes
+ * would be written every few minutes for nothing.
+ */
+static uint64_t fp_hash;
+
+static void
+fp_mix(const void *data, size_t n)
+{
+	const uint8_t *b = data;
+
+	for (size_t i = 0; i < n; i++) {
+		fp_hash = (fp_hash ^ b[i]) * 0x100000001b3ULL;
+	}
+}
+
+static void
+fp_tree(const char *relative)
+{
+	static char dirbuf[MAX_DEPTH][4096];
+	static int depth;
+	struct stat st;
+	size_t base = strlen(path);
+	int dir_fd;
+
+	if (lstat(path, &st) != 0) {
+		return;
+	}
+	fp_mix(relative, strlen(relative) + 1);
+	fp_mix(&st.st_mode, sizeof(st.st_mode));
+	fp_mix(&st.st_size, sizeof(st.st_size));
+	fp_mix(&st.st_mtimespec, sizeof(st.st_mtimespec));
+	fp_mix(&st.st_ctimespec, sizeof(st.st_ctimespec));
+	if ((st.st_mode & S_IFMT) != S_IFDIR || (relative[0] != 0 && is_skipped(relative)) || depth >= MAX_DEPTH) {
+		return;
+	}
+	if ((dir_fd = open(path, O_RDONLY | O_DIRECTORY, 0)) < 0) {
+		return;
+	}
+	depth++;
+	{
+		uint64_t mark_a = arena_used, mark_n = names_used;
+		long count = gather_names(dir_fd, dirbuf[depth - 1], sizeof(dirbuf[0]), mark_a, mark_n);
+		size_t rbase = strlen(relative);
+
+		for (long k = 0; k < count; k++) {
+			const char *name = name_arena + name_at[mark_n + k];
+			char child[MAX_PATH];
+
+			if (base + 1 + strlen(name) >= MAX_PATH || rbase + 1 + strlen(name) >= MAX_PATH) {
+				continue;
+			}
+			path[base] = '/';
+			strcpy(path + base + 1, name);
+			if (rbase > 0) {
+				memcpy(child, relative, rbase);
+				child[rbase] = '/';
+				strcpy(child + rbase + 1, name);
+			} else {
+				strcpy(child, name);
+			}
+			fp_tree(child);
+			path[base] = 0;
+		}
+		arena_used = mark_a;
+		names_used = mark_n;
+	}
+	depth--;
+	close(dir_fd);
+}
+
+static uint64_t
+fingerprint(void)
+{
+	fp_hash = 0xcbf29ce484222325ULL;
+	strcpy(path, ROOT);
+	fp_tree("");
+	return fp_hash;
+}
+
 static int
 save(void)
 {
@@ -1498,7 +1581,7 @@ save_once(void)
 static int
 watch(int seconds)
 {
-	uint64_t last = 0;
+	uint64_t last = 0, saved_fp = 0;
 	int asked = 0;
 
 	fd = open(DEVICE, O_RDWR, 0);
@@ -1529,8 +1612,21 @@ watch(int seconds)
 			asked = 1;
 		}
 		gettimeofday(&tv, NULL);
+		if (!asked && seconds > 0 && (uint64_t)tv.tv_sec - last >= (uint64_t)seconds) {
+			uint64_t now_fp = fingerprint();
+
+			if (now_fp == saved_fp) {
+				last = (uint64_t)tv.tv_sec;     /* nothing changed since the last save: nothing written */
+				usleep(100000);
+				continue;
+			}
+		}
 		if (asked || (seconds > 0 && (uint64_t)tv.tv_sec - last >= (uint64_t)seconds)) {
 			int ok = save_once();
+
+			if (ok) {
+				saved_fp = fingerprint();       /* (after: anything the save itself touched is not a change) */
+			}
 
 			if (!ok) {
 				printf("var_store: this save came to nothing; the store keeps what it had\n");

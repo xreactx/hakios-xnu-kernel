@@ -12,6 +12,8 @@
 	<array>
 		<string>/redwood/bin/var_store</string>
 		<string>watch</string>
+		<!-- and every 5 minutes when anything changed: an installed phone (xl standalone) never ends a run in order -->
+		<string>300</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

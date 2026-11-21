@@ -1,0 +1,4 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+# The phone for everyday use (RC_JOBS=rc.jobs.phone; what goes into an installed system_a, xl standalone): no tests,
+# no load -- only the phone's name, once (src/devname.c).
+/redwood/bin/devname
