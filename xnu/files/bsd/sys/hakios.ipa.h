@@ -30,7 +30,8 @@ bool hakios_ipa_data_setup(void);
 /* The SDM845's IPA 3.5.1 (GSI 1.3) rather than IPA 4.11: called before hakios_ipa_data_setup(). */
 void hakios_ipa_version_3_5_1(void);
 bool hakios_ipa_data_ready(void);
-void hakios_ipa_quiesce(void);    /* the run's end: our channels stopped, the IPA writes no more into our memory */
+void hakios_ipa_quiesce(void);
+void hakios_ipa_stale_stop(void);  /* a run's start: receiving channels left running from before, stopped */    /* the run's end: our channels stopped, the IPA writes no more into our memory */
 /* Whether the modem is to be asked for QMAPv4 (QMAP with checksum offload: WDA's aggregation protocol 8) rather than QMAP (5). */
 bool hakios_ipa_qmap_v4(void);
 /* One IP packet to the modem on QMAP mux `mux`. Copied. False if dropped (no room, too long). */

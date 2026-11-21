@@ -2785,6 +2785,11 @@ ipa_firmware_load(void)
 		printf("mpss: %u: the IPA's clock is not on: its firmware is not loaded (a start without the clock ends the kernel)\n", step);
 		return false;
 	}
+	if (apcs_ipc != 0) {
+		/* (the SDM845: the IPA was left running by the run before, or by Android; its receiving channels stopped first) */
+		hakios_ipa_version_3_5_1();
+		hakios_ipa_stale_stop();
+	}
 	/*
 	 * The SDM845 (no IPCC: soc_apcs_ipc), a phone with a modem: there the modem loads the IPA's GSI firmware itself
 	 * (Linux's sdm845 "modem-init"; Android's IPA driver loads it on an APQ, without a modem). Ours as well, through

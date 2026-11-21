@@ -359,6 +359,20 @@ channel_memory(struct channel *ch)
 			return false;
 		}
 	}
+	{
+		/*
+		 * Where its pages are, for a crash dump's XPU address to be matched against (TrustZone said 0x1a9d74700, between
+		 * the tables and the rings of run 223752, and no channel was left running from before: run 232008)
+		 */
+		char line[1024];
+		int at = snprintf(line, sizeof(line), "ipa: %s: rings %#llx %#llx; buffers", ch->name, ch->tre_ring.phys,
+		    ch->event_ring.phys);
+
+		for (uint32_t p = 0; p < ch->page_count && at < (int)sizeof(line) - 16; p++) {
+			at += snprintf(line + at, sizeof(line) - (size_t)at, " %llx", ch->pages[p].phys >> 12);
+		}
+		printf("%s (in 4 KB units)\n", line);
+	}
 	return true;
 }
 
@@ -908,6 +922,49 @@ bool
 hakios_ipa_data_ready(void)
 {
 	return ready;
+}
+
+/*
+ * A run's start, the IPA's clock just on and before anything of it is reprogrammed: our receiving channels as the run
+ * before (or Android) left them -- still started, the IPA delivering the modem's packets into memory that is no longer
+ * theirs, the likely cause of the crash dumps (XPU violations on BIMC_MPU3, run 223752's dump) -- stopped and reset.
+ * Their states are said either way.
+ */
+void
+hakios_ipa_stale_stop(void)
+{
+	struct channel *const receiving[] = { &modem_rx, &lan_rx };
+	uint32_t status;
+
+	if (ipa_regs == 0) {
+		PE_parse_boot_argn("soc_ipa_base", &ipa_regs_phys, sizeof(ipa_regs_phys));
+		PE_parse_boot_argn("soc_gsi_base", &gsi_phys, sizeof(gsi_phys));
+		ipa_regs = ml_io_map(ipa_regs_phys, IPA_REGS_SIZE);
+		gsi_regs = ml_io_map(gsi_phys + GSI_FROM, v35 ? GSI_SIZE_V3 : GSI_SIZE);
+	}
+	if (ipa_regs == 0 || gsi_regs == 0) {
+		return;
+	}
+	status = gsi_rd(GSI_STATUS);
+	if (!(status & 1)) {
+		printf("ipa: at the start: the GSI is not enabled (status %#x): no channel left running\n", status);
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(receiving) / sizeof(receiving[0]); i++) {
+		struct channel *ch = receiving[i];
+		uint32_t state = channel_state(ch), was = state;
+
+		if (state == CH_STATE_STARTED) {
+			(void)gsi_command(ch, false, GSI_CH_STOP, CH_STATE_STOPPED);
+			state = channel_state(ch);
+		}
+		if (state == CH_STATE_STOPPED) {
+			(void)gsi_command(ch, false, GSI_CH_RESET, CH_STATE_ALLOCATED);
+		}
+		printf("ipa: at the start: %s (channel %u) was in state %u (2 started)%s\n", ch->name, ch->id, was,
+		    was == CH_STATE_STARTED ? (channel_state(ch) == CH_STATE_ALLOCATED ? ": LEFT RUNNING, now stopped and reset" :
+		    ": LEFT RUNNING, NOT STOPPED") : "");
+	}
 }
 
 /*
