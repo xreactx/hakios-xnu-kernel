@@ -1287,6 +1287,7 @@ compose_live_log(const struct kernel_live *live, uint64_t slide)
 }
 
 static void print(const char *fmt, ...);
+static int pon_bootloader(void);
 static void flush_log(void);
 static void put_char(char c);
 
@@ -4824,20 +4825,16 @@ fb_command(char *cmd)
 			}
 		} else if (starts_with(cmd, "reboot-bootloader")) {
 			/*
-			 * Back to the phone's own fastboot, as Qualcomm's ABL does it (QcomModulePkg Reboot.c, RebootDevice):
-			 * a platform-specific reset whose data is L"ResetParam" and the reason, FASTBOOT_MODE (2). Once
-			 * HakiOS is installed in a slot, a plain reset boots it instead, with no USB (2026-11-21).
+			 * Back to the phone's own fastboot: once HakiOS is installed in a slot, a plain reset boots it
+			 * instead, with no USB (2026-11-21). The ABL looks for the reason in the PM8998's power-on block,
+			 * PON_SOFT_RB_SPARE (see pon_bootloader); UEFI's reset with data does not reach it here (this
+			 * loader runs on Mu-Silicium, whose reset ignores the reason).
 			 */
-			static struct __attribute__((packed)) { uint16_t text[12]; uint8_t reason; } data;
-			static const char param[] = "ResetParam";
+			int ok = pon_bootloader();
 
-			for (unsigned i = 0; i < sizeof(param); i++) {
-				data.text[i] = (uint16_t)param[i];
-			}
-			data.reason = 2;
-			fb_reply("OKAY", "");
+			fb_reply(ok ? "OKAY" : "FAIL", ok ? "" : "the reason could not be written: a plain reset instead");
 			BS->stall(200000);
-			ST->rt->reset_system(3 /* EfiResetPlatformSpecific */, 0, sizeof(data), &data);
+			ST->rt->reset_system(1 /* EfiResetWarm: the spare register outlives it */, 0, 0, NULL);
 			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
 			fb_reply("OKAY", "");
@@ -4847,6 +4844,74 @@ fb_command(char *cmd)
 			fb_reply("FAIL", "unknown command");
 		}
 	}
+}
+
+/*
+ * "Restart into the bootloader's fastboot", as Linux's qcom-pon reboot-mode does on SDM845 (mode-bootloader = 2):
+ * bits 7:1 of PON_SOFT_RB_SPARE (register 0x8f of the PM8998's power-on block, slave 0 peripheral 0x08) set to 2,
+ * which ABL reads at the next boot (FASTBOOT_MODE). Through the PMIC arbiter as the kernel's
+ * drivers/input/hakios.buttons.c reaches it (version 5: the observer channel of system 0 to read, the
+ * peripheral's own channel to write, if it is system 0's). Only that one register is written; nothing runs
+ * beside this (the kernel is back, the charger poll is not called from here). 1 when it reads back as written.
+ */
+static int
+pon_bootloader(void)
+{
+	const uintptr_t core = 0x0c440000, cnfg = 0x0c40a000, observer = 0x0e600000, chnls = 0x0c600000;
+	uint32_t version = *(volatile uint32_t *)core, channels, status = 0, value, wanted;
+	int channel = -1;
+
+	if (version < 0x50000000u || version >= 0x70000000u) {
+		print("pon: the PMIC arbiter is version %x, not 5: no reason written\n", (uint64_t)version);
+		return 0;
+	}
+	channels = *(volatile uint32_t *)(core + 0x004) & 0x7ff;
+	for (uint32_t n = 0; n < channels && n < 512; n++) {
+		uint32_t map = *(volatile uint32_t *)(core + 0x900 + 4 * n);
+
+		if (map != 0 && ((map >> 8) & 0xfff) == 0x008 && (*(volatile uint32_t *)(cnfg + 0x700 + 4 * n) & 7) == 0) {
+			channel = (int)n;
+		}
+	}
+	if (channel < 0) {
+		print("pon: no channel of the arbiter is the PM8998's power-on block that this system may write through\n");
+		return 0;
+	}
+	/* read it (observer channel: command 0x00, status 0x08, data 0x18; "extended register read long") */
+	for (int pass = 0; pass < 2; pass++) {
+		uintptr_t obs = observer + 0x80 * (uint32_t)channel;
+
+		*(volatile uint32_t *)(obs + 0x00) = 1u << 27 | 0x8fu << 4 | 0;
+		for (int i = 0; i < 2000 && !((status = *(volatile uint32_t *)(obs + 0x08)) & 1); i++) {
+			BS->stall(1);
+		}
+		if ((status & 0xf) != 1) {
+			print("pon: reading the spare register: status %x\n", (uint64_t)status);
+			return 0;
+		}
+		value = *(volatile uint32_t *)(obs + 0x18) & 0xff;
+		if (pass == 1) {
+			print("pon: PON_SOFT_RB_SPARE reads %x (wanted %x)\n", (uint64_t)value, (uint64_t)wanted);
+			return value == wanted;
+		}
+		wanted = (value & 0x01) | 2u << 1;
+		/* write it (the peripheral's channel: data 0x10, then the command at 0x00, status 0x08) */
+		{
+			uintptr_t ch = chnls + 0x10000 * (uint32_t)channel;
+
+			*(volatile uint32_t *)(ch + 0x10) = wanted;
+			*(volatile uint32_t *)(ch + 0x00) = 0u << 27 | 0x8fu << 4 | 0;
+			for (int i = 0; i < 2000 && !((status = *(volatile uint32_t *)(ch + 0x08)) & 1); i++) {
+				BS->stall(1);
+			}
+			if ((status & 0xf) != 1) {
+				print("pon: writing the spare register (%x over %x): status %x\n", (uint64_t)wanted, (uint64_t)value,
+				    (uint64_t)status);
+				return 0;
+			}
+		}
+	}
+	return 0;
 }
 
 /*
