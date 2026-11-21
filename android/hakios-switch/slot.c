@@ -3,7 +3,8 @@
  *
  * The other half of HakiOS's "Android" application (xnuloader/loader.c, slot_to_android), done the same way: the slot
  * being left -- here Android's, boot_b -- is given the unbootable attribute (bit 55), and the slot wanted -- HakiOS's,
- * boot_a -- has its unbootable attribute cleared and its retries set to 7 (bits 51-53), in the primary and the backup
+ * boot_a -- has its unbootable attribute cleared, its retries set to 7 (bits 51-53) and is marked successful (bit 54:
+ * ABL falls back only to a successful slot), in the primary and the backup
  * GPT of the unit that holds them (/dev/block/sde on the OnePlus 6T), both CRC-32s made again and the primary read
  * back. At the next boot ABL finds the active slot unbootable and switches to the other one itself: the type GUIDs,
  * the boot LUN, all that set_active does. HakiOS's switch to Android clears boot_b's attribute again.
@@ -216,7 +217,12 @@ run(int change)
 			return 1;
 		}
 	}
-	at = (at & ~(1ul << 55) & ~(7ul << 51)) | 7ul << 51;
+	/*
+	 * successful as well (bit 54): ABL falls back from an unbootable slot only to one marked successful -- with boot_a
+	 * bootable, retries 7 but not successful, it stopped in fastboot instead (2026-11-21); boot_b, successful, is
+	 * taken. (HakiOS does not mark its slot successful itself.)
+	 */
+	at = (at & ~(1ul << 55) & ~(7ul << 51)) | 7ul << 51 | 1ul << 54;
 	bt |= 1ul << 55;
 	for (int i = 0; i < 2; i++) {
 		R64(table[i] + 128 * a + 48) = at;
