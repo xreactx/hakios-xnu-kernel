@@ -181,10 +181,6 @@ build_line() {
 	# A run about Wi-Fi is given the radio's own address, which is this phone's and so is kept in a
 	# file that is not in the repository: fw-wifi/mac, one line, six bytes in hexadecimal with colons.
 	local args=${XL_CMDLINE--v}
-	case " $args " in
-	# (redwood's wifi= and wifi_step=; the 6T's ath10k, wifi6t=, asks for it the same way: without it, a new one each boot)
-	*" wifi="*|*" wifi_step="*|*" wifi6t="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
-	esac
 	# The phone's own boot-args: the .config's (make fajita_defconfig; tools/hakios-config.py args), else
 	# devices/$DEVICE/run.args (words, # to the line's end a comment); each one unless XL_CMDLINE already has it by name
 	local device_args=devices/${DEVICE:-redwood}/run.args a words=
@@ -199,6 +195,13 @@ build_line() {
 			esac
 		done
 	fi
+	# (redwood's wifi= and wifi_step=; the 6T's ath10k, wifi6t=, asks for it the same way: without it, a new one each boot.
+	# Checked once the device's own arguments are in: the 6T's wifi6t=1 comes from its configuration, and until
+	# 2026-11-21 this looked only at XL_CMDLINE -- every boot had a new address, and configd a new interface to name)
+	case " $args " in
+	*" wifi_mac="*) ;;
+	*" wifi="*|*" wifi_step="*|*" wifi6t="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
+	esac
 	# (the 6T's Bluetooth, bt6t=4 and up, whether from XL_CMDLINE or the configuration: the phone's own address, saved
 	# from Android -- settings get secure bluetooth_address -- into fw-bt/bdaddr, which stays out of the repository;
 	# without it the controller keeps its NVM's 39:90:21:74:07:00)
@@ -587,7 +590,10 @@ stop) not_anothers_run stop && fb oem stop | grep -q OKAY && echo "xl: asked the
 memmap) enter && fb oem memmap >/dev/null && fb oem log >/dev/null && fetch_log logs/loader.log && sed -n '/^memory map/,$p' logs/loader.log ;;
 hang) enter && fb oem hang; echo "xl: waiting for the watchdog..."; t0=$(date +%s); wait_for android 150 && echo "xl: back in Android after $(( $(date +%s) - t0 )) s" || echo "xl: not back (state: $(state))" ;;
 reboot) not_anothers_run reboot && fb reboot ;;
-reload) [ "$(state)" = loader ] && { fb reboot >/dev/null; wait_for android 120; }; enter && echo "xl: loader is up" ;;
+reload) # (from the loader: back to the phone's fastboot -- a plain reboot would start HakiOS when it is installed in a
+	# slot; a loader that does not know reboot-bootloader resets as for reboot, and the phone comes up in Android)
+	[ "$(state)" = loader ] && { fb reboot-bootloader >/dev/null; sleep 5; for ((i = 0; i < 120; i += 3)); do
+		case "$(state)" in fastboot|android) break ;; esac; sleep 3; done; }; enter && echo "xl: loader is up" ;;
 state) state ;;
 *) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0" ;;
 esac

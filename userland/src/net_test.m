@@ -429,6 +429,29 @@ wifi(void)
 	dhcp("en0");
 }
 
+/* ---- scdump: configd's dynamic store, what it holds of the network (keys and their values, flattened) ---- */
+
+static void
+scdump(void)
+{
+	SCDynamicStoreRef session = SCDynamicStoreCreate(NULL, CFSTR("net_test"), NULL, NULL);
+	NSArray *keys = session ? CFBridgingRelease(SCDynamicStoreCopyKeyList(session, CFSTR(".*/Network/.*"))) : nil;
+
+	printf("net_test: scdump: %lu keys\n", (unsigned long)keys.count);
+	for (NSString *key in [keys sortedArrayUsingSelector:@selector(compare:)]) {
+		id value = CFBridgingRelease(SCDynamicStoreCopyValue(session, (__bridge CFStringRef)key));
+		NSString *text = [[value description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+
+		while ([text containsString:@"  "]) {
+			text = [text stringByReplacingOccurrencesOfString:@"  " withString:@" "];
+		}
+		printf("net_test: scdump: %s = %.900s\n", key.UTF8String, text.UTF8String);
+	}
+	if (session != NULL) {
+		CFRelease(session);
+	}
+}
+
 /* ---- watch ------------------------------------------------------------------------------------------ */
 
 static double watch_start;
@@ -580,6 +603,21 @@ main(int argc, char **argv)
 				reach(argv[++i]);
 			} else if (strcmp(step, "wait") == 0 && i + 1 < argc) {
 				usleep((useconds_t)(atof(argv[++i]) * 1e6));
+			} else if (strcmp(step, "plist") == 0 && i + 1 < argc) {
+				/* a property list file, said in one line per 900 characters */
+				NSString *path = @(argv[++i]);
+				NSString *text = [[NSDictionary dictionaryWithContentsOfFile:path] description] ?: @"(not there, or no dictionary)";
+
+				text = [text stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+				while ([text containsString:@"  "]) {
+					text = [text stringByReplacingOccurrencesOfString:@"  " withString:@" "];
+				}
+				for (NSUInteger at = 0; at < text.length; at += 900) {
+					printf("net_test: plist %s: %s\n", path.UTF8String,
+					    [text substringWithRange:NSMakeRange(at, MIN(900, text.length - at))].UTF8String);
+				}
+			} else if (strcmp(step, "scdump") == 0) {
+				scdump();
 			} else if (strcmp(step, "wifi") == 0) {
 				wifi();
 			} else if (strcmp(step, "watch") == 0 && i + 1 < argc) {

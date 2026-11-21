@@ -1,0 +1,15 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+# Safari's connections on Wi-Fi (RC_JOBS=rc.jobs.safarinet; 2026-11-21: Safari "the server stopped responding" while
+# net_test's CFNetwork fetch of the same page works): once Wi-Fi is up, every socket of Safari and its WebKit
+# processes (and the network daemons) said as it changes (src/sockdump.c) while Safari is asked to open google.com,
+# then net_test's own fetch for comparison.
+/redwood/bin/rwtouch wait 60
+/redwood/bin/net_test show scdump plist /private/var/preferences/SystemConfiguration/NetworkInterfaces.plist plist /private/var/preferences/SystemConfiguration/preferences.plist
+/redwood/bin/sockdump 150 MobileSafari com.apple.WebKit Networking WebContent mDNSResponder nsurlsessiond networkd apsd &
+/redwood/bin/rwtouch wait 3
+/redwood/bin/battery_test open https://www.google.com/
+/redwood/bin/rwtouch wait 60
+/bin/ps -A
+/redwood/bin/net_test fetch https://www.google.com/
+/redwood/bin/rwtouch wait 60
+/redwood/bin/net_test show scdump fetch https://www.google.com/

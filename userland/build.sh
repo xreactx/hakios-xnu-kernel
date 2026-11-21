@@ -257,6 +257,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
 		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
+		# every process's sockets as they change (src/sockdump.c; XNU's libproc and proc_info headers in src/xnuhdr)
+		$DYN -Isrc/xnuhdr -o obj/sockdump src/sockdump.c
 		# the 6T's GPS fixes handed to locationd as Xcode's simulated locations are (src/gnssd.m): signed with the entitlement
 		$DYN -fobjc-arc -framework Foundation -framework CoreLocation -o obj/gnssd src/gnssd.m &&
 			{ ${LDID:-ldid} -Ssrc/gnssd.entitlements obj/gnssd 2>/dev/null ||
@@ -436,6 +438,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/metal_test ] && cp obj/metal_test root/bin/
 	[ -f obj/fps_info ] && cp obj/fps_info root/bin/
 	[ -f obj/net_test ] && cp obj/net_test root/bin/
+	[ -f obj/sockdump ] && cp obj/sockdump root/bin/
 	[ -f obj/gnssd ] && cp obj/gnssd root/bin/
 	[ -f obj/smsd ] && cp obj/smsd root/bin/
 	[ -f obj/timesyncd ] && cp obj/timesyncd root/bin/ && cp com.hakios.timesyncd.plist root/LaunchDaemons/

@@ -4816,6 +4816,23 @@ fb_command(char *cmd)
 			if (!PLAT->usb_old_driver) {
 				fb_reply("OKAY", "");
 			}
+		} else if (starts_with(cmd, "reboot-bootloader")) {
+			/*
+			 * Back to the phone's own fastboot, as Qualcomm's ABL does it (QcomModulePkg Reboot.c, RebootDevice):
+			 * a platform-specific reset whose data is L"ResetParam" and the reason, FASTBOOT_MODE (2). Once
+			 * HakiOS is installed in a slot, a plain reset boots it instead, with no USB (2026-11-21).
+			 */
+			static struct __attribute__((packed)) { uint16_t text[12]; uint8_t reason; } data;
+			static const char param[] = "ResetParam";
+
+			for (unsigned i = 0; i < sizeof(param); i++) {
+				data.text[i] = (uint16_t)param[i];
+			}
+			data.reason = 2;
+			fb_reply("OKAY", "");
+			BS->stall(200000);
+			ST->rt->reset_system(3 /* EfiResetPlatformSpecific */, 0, sizeof(data), &data);
+			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
 			fb_reply("OKAY", "");
 			BS->stall(200000);
