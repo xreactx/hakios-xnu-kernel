@@ -14,6 +14,8 @@ struct hakios_nas_state {
 	uint8_t bars;           /* 0 until registration and a valid signal reading */
 	uint16_t mcc, mnc;      /* the current PLMN (serving system TLV 0x10); 0: none told */
 	char operator_name[32]; /* its description, as the network gives it; "" when none */
+	uint16_t home_mcc, home_mnc;    /* the SIM's home network (Get Home Network 0x25); 0: not told */
+	char home_name[32];     /* its description ("AT&T"); "" when none */
 };
 
 /* Apply one complete QMI NAS frame. 1: state changed; 0: ignored; -1: malformed. */

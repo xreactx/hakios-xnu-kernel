@@ -437,6 +437,8 @@ update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter
 	if ((up > 0 || registered > 0) && shown > 0 && setter != NULL && data != NULL) {
 		BLOCK_CALL(setter, void (*)(void *, void *, int), data, shown);
 		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
+		/* (the data is set after the original posted it: it is to be posted again, or the bars never change on screen) */
+		((void (*)(id, SEL, long))objc_msgSend)(self, sel_registerName("_notifyItemChanged:"), item);
 		if (shown != cellular_last_bars) {
 			say("hakios: cellular: %d bars shown (item %ld; kernel bars %d, %d dBm, registered %d)\n", shown, item, bars, dbm, registered);
 		}
@@ -470,18 +472,59 @@ update_service_item(id self, SEL sel, long item, void *data, id sim, id other, v
 		say("hakios: cellular: service item %ld: data %p, SIM info %p, other %p; string getter %p setter %p, content type getter %p "
 		    "setter %p; the kernel's network \"%s\"\n", item, data, (void *)sim, (void *)other, g1, s1, g3, s3, name);
 	}
-	if (registered > 0 && name[0] != 0 && s1 != NULL && data != NULL) {
+	/*
+	 * (not written: the string setter's arguments are not the bars setter's -- called as (data, string) it was given the
+	 * SystemStatus data where it wanted the string, and SpringBoard died on it, run 195319; the name stays unset)
+	 */
+	if ((0) && registered > 0 && name[0] != 0 && s1 != NULL && data != NULL) {
 		CFStringRef string = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
 
 		if (string != NULL) {
 			BLOCK_CALL(s1, void (*)(void *, void *, CFStringRef), data, string);
 			((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
+			((void (*)(id, SEL, long))objc_msgSend)(self, sel_registerName("_notifyItemChanged:"), item);
 			if (strcmp(shown, name) != 0) {
 				snprintf(shown, sizeof(shown), "%s", name);
 				say("hakios: cellular: service \"%s\" shown (item %ld)\n", name, item);
 			}
 			CFRelease(string);
 		}
+	}
+}
+
+/*
+ * The data network item ("LTE" beside the bars): once the kernel's data session is up (kern.hakios.cellular_data),
+ * its type is set -- the status bar's raw data's own numbering, in which LTE is DATA_NETWORK_LTE (calibrated on
+ * screen: sb_lte=N among the boot-args tries another) -- and the item switched on and posted again.
+ */
+#define DATA_NETWORK_LTE        4
+static void (*original_update_data_network_item)(id self, SEL sel, long item, void *data, BOOL primary, void *getter, void *setter);
+
+static void
+update_data_network_item(id self, SEL sel, long item, void *data, BOOL primary, void *getter, void *setter)
+{
+	static int said, lte = -1;
+
+	if (original_update_data_network_item) {
+		original_update_data_network_item(self, sel, item, data, primary, getter, setter);
+	}
+	if (lte < 0) {
+		char args[1024] = "", *at;
+		size_t size = sizeof(args) - 1;
+
+		lte = DATA_NETWORK_LTE;
+		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "sb_lte=")) != NULL) {
+			lte = atoi(at + 7);
+		}
+	}
+	if (said++ < 4) {
+		say("hakios: cellular: data network item %ld (primary %d): the kernel's data %d; LTE shown as %d\n", item, primary,
+		    sysctl_int("kern.hakios.cellular_data"), lte);
+	}
+	if (primary && sysctl_int("kern.hakios.cellular_registered") > 0 && setter != NULL && data != NULL) {
+		BLOCK_CALL(setter, void (*)(void *, void *, int), data, lte);
+		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
+		((void (*)(id, SEL, long))objc_msgSend)(self, sel_registerName("_notifyItemChanged:"), item);
 	}
 }
 
@@ -513,9 +556,47 @@ set_signal_mode(id self, SEL sel, long mode)
 	original_set_signal_mode(self, sel, wanted);
 }
 
+/*
+ * And the number of bars that count: the view is told 0 (the data SpringBoard posts never carries the bars set in it:
+ * all four stayed grey, runs 195319 and after), so while the kernel says registered it is given the kernel's bars.
+ */
+static void (*original_set_active_bars)(id self, SEL sel, long bars);
+
+static void
+set_active_bars(id self, SEL sel, long bars)
+{
+	static long said = -1;
+	const char *name = object_getClassName(self);
+	long wanted = bars;
+
+	if (name != NULL && strstr(name, "Cellular") != NULL && sysctl_int("kern.hakios.cellular_registered") > 0) {
+		int kernel_bars = sysctl_int("kern.hakios.cellular_bars");
+
+		wanted = kernel_bars > 0 ? kernel_bars : 1;
+		if (wanted != said) {
+			said = wanted;
+			say("hakios: cellular: %s shows %ld active bars (asked %ld)\n", name, wanted, bars);
+		}
+	}
+	original_set_active_bars(self, sel, wanted);
+}
+
 static void
 signal_view_hook(void)
 {
+	{
+		Class cls = objc_getClass("_UIStatusBarSignalView");
+		Method method = cls ? class_getInstanceMethod(cls, sel_registerName("setNumberOfActiveBars:")) : NULL;
+
+		if (method != NULL) {
+			original_set_active_bars = (void (*)(id, SEL, long))method_getImplementation(method);
+			method_setImplementation(method, (IMP)set_active_bars);
+			say("hakios: cellular: -[_UIStatusBarSignalView setNumberOfActiveBars:] replaced (types \"%s\")\n",
+			    method_getTypeEncoding(method));
+		} else {
+			say("hakios: cellular: no -[_UIStatusBarSignalView setNumberOfActiveBars:]\n");
+		}
+	}
 	static const char *const classes[] = { "_UIStatusBarCellularSignalView", "_UIStatusBarSignalView" };
 
 	for (unsigned c = 0; c < sizeof(classes) / sizeof(classes[0]); c++) {
@@ -596,18 +677,31 @@ cellular_hook(void)
 
 	dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), 3 * NSEC_PER_SEC, NSEC_PER_SEC / 2);
 	dispatch_source_set_event_handler(timer, ^{
-		static int last_registered = -2, last_bars = -2;
+		static int last_registered = -2, last_bars = -2, last_data = -2;
+		static char last_name[64];
 		int registered = sysctl_int("kern.hakios.cellular_registered"), bars = sysctl_int("kern.hakios.cellular_bars");
+		int data = sysctl_int("kern.hakios.cellular_data");
+		char name[64] = "";
+		size_t size = sizeof(name) - 1;
 
-		if ((registered != last_registered || bars != last_bars) && cellular_aggregator != nil) {
-			SEL update = sel_registerName("_updateSignalStrengthItem");
+		sysctlbyname("kern.hakios.cellular_operator", name, &size, NULL, 0);
+		if ((registered != last_registered || bars != last_bars || data != last_data || strcmp(name, last_name) != 0) &&
+		    cellular_aggregator != nil) {
+			static const char *const updates[] = { "_updateSignalStrengthItem", "_updateServiceItem" };
 
 			last_registered = registered;
 			last_bars = bars;
-			if (class_getInstanceMethod(object_getClass(cellular_aggregator), update)) {
-				((void (*)(id, SEL))objc_msgSend)(cellular_aggregator, update);
-				say("hakios: cellular: the signal item asked to update (registered %d, bars %d)\n", registered, bars);
+			last_data = data;
+			snprintf(last_name, sizeof(last_name), "%s", name);
+			for (unsigned u = 0; u < sizeof(updates) / sizeof(updates[0]); u++) {
+				SEL update = sel_registerName(updates[u]);
+
+				if (class_getInstanceMethod(object_getClass(cellular_aggregator), update)) {
+					((void (*)(id, SEL))objc_msgSend)(cellular_aggregator, update);
+				}
 			}
+			say("hakios: cellular: the items asked to update (registered %d, bars %d, data %d, \"%s\")\n", registered, bars,
+			    data, name);
 		}
 	});
 	dispatch_resume(timer);

@@ -1,6 +1,7 @@
 /*
  * Small QMI NAS parser. Wire IDs and TLVs follow libqmi's qmi-service-nas.json:
- * Serving System (0x24), Get Signal Info (0x4f), Signal Info indication (0x51).
+ * Serving System (0x24), Get Signal Info (0x4f), Signal Info indication (0x51), Get Home Network (0x25: the SIM's own
+ * network and its name, for when the serving system gives none -- AT&T's does not).
  * It only consumes reports. It never changes modem registration or radio power.
  */
 #include <sys/hakios.nas.h>
@@ -36,7 +37,7 @@ hakios_nas_apply(struct hakios_nas_state *state, const void *frame, size_t lengt
 	if (state == NULL || data == NULL || length < 7) return -1;
 	if (data[0] != 2 && data[0] != 4) return 0;
 	message = le16(data + 3);
-	if (message != 0x24 && message != 0x4f && message != 0x51) return 0;
+	if (message != 0x24 && message != 0x4f && message != 0x51 && message != 0x25) return 0;
 	if ((message == 0x4f && data[0] != 2) || (message == 0x51 && data[0] != 4)) return 0;
 	payload_size = le16(data + 5);
 	if ((size_t)payload_size != length - 7) return -1;
@@ -75,6 +76,15 @@ hakios_nas_apply(struct hakios_nas_state *state, const void *frame, size_t lengt
 			next.registered = value[0] == 1;
 			next.bars = next.registered && next.has_signal ? bars_for(next.dbm) : 0;
 			serving = true;
+		} else if (message == 0x25 && type == 1 && size >= 5 && size >= (size_t)5 + value[4]) {
+			/* the home network: MCC, MNC, the description's length and bytes */
+			unsigned n = value[4] < sizeof(next.home_name) - 1 ? value[4] : sizeof(next.home_name) - 1;
+
+			next.home_mcc = le16(value);
+			next.home_mnc = le16(value + 2);
+			memcpy(next.home_name, value + 5, n);
+			next.home_name[n] = 0;
+			serving = true;
 		} else if (message == 0x24 && type == 0x10 && size >= 5 && size >= (size_t)5 + value[4]) {
 			/* the current PLMN: MCC, MNC (16 bits each), the description's length and bytes */
 			unsigned n = value[4] < sizeof(next.operator_name) - 1 ? value[4] : sizeof(next.operator_name) - 1;
@@ -102,7 +112,7 @@ hakios_nas_apply(struct hakios_nas_state *state, const void *frame, size_t lengt
 	}
 	if (!serving && !signal) return 0;
 	if (next.registered == state->registered && next.has_signal == state->has_signal && next.mcc == state->mcc && next.mnc == state->mnc &&
-	    strcmp(next.operator_name, state->operator_name) == 0 &&
+	    strcmp(next.operator_name, state->operator_name) == 0 && strcmp(next.home_name, state->home_name) == 0 &&
 	    next.radio_interface == state->radio_interface && next.dbm == state->dbm && next.bars == state->bars) return 0;
 	*state = next;
 	return 1;
@@ -164,10 +174,13 @@ int
 hakios_nas_client_poll(struct hakios_nas_client *client)
 {
 	uint8_t request[7] = {0};
-	const uint16_t messages[2] = {0x24, 0x4f};
+	const uint16_t messages[3] = {0x24, 0x4f, 0x25};
 	int error;
 	if (client == NULL || client->port == NULL || !client->connected) return -1;
-	for (unsigned i = 0; i < 2; i++) {
+	for (unsigned i = 0; i < 3; i++) {
+		if (messages[i] == 0x25 && client->state.home_name[0] != 0) {
+			continue;       /* (asked until it is told: it does not change) */
+		}
 		client->transaction++;
 		if (client->transaction == 0) client->transaction++;
 		request[1] = (uint8_t)client->transaction;

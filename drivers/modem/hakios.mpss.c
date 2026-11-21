@@ -7005,7 +7005,9 @@ nas_changed(__unused void *context, const struct hakios_nas_state *state)
 {
 	nas_changes++;
 	cellular_registered = state->registered;
-	snprintf(cellular_operator, sizeof(cellular_operator), "%s", state->registered ? state->operator_name : "");
+	/* (the serving network's name, or the SIM's home network's when it gives none: AT&T's gives none) */
+	snprintf(cellular_operator, sizeof(cellular_operator), "%s", !state->registered ? "" : state->operator_name[0] != 0 ?
+	    state->operator_name : state->home_name);
 	cellular_bars = state->bars;
 	cellular_dbm = state->has_signal ? state->dbm : 0;
 	cellular_radio = state->has_signal ? state->radio_interface : 0;

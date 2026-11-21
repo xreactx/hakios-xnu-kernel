@@ -10,6 +10,7 @@
 #import <UIKit/UIKit.h>
 #include <dlfcn.h>
 #include <notify.h>
+#include <objc/message.h>
 
 #define TOAST_FILE      @"/private/var/mobile/Library/HakiOS/toast.txt"
 #define TOAST_SECONDS   5.0
