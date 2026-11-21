@@ -1833,6 +1833,12 @@ dsp_shutdown(const char *why)
 	int32_t result;
 
 	printf("mpss: %u: %s: the modem is asked to stop, then TrustZone to shut it down\n", step, why);
+	/*
+	 * (hakios_ipa_quiesce() -- our receiving channels stopped, against the IPA's writes into this kernel's memory after it
+	 * has gone, the likely cause of the crash dumps: not called. Here, before the modem's shutdown, it stopped modem-rx
+	 * cleanly and the run's end then hung every time, runs 230654 to 231432; after it, the GSI did not answer, run
+	 * 230235. To be done at the next run's start instead, before any memory is given to the modem.)
+	 */
 	if (!leaving) {
 		link_stop();
 	}
@@ -1863,7 +1869,8 @@ dsp_shutdown(const char *why)
 	if (ipa_loaded && apcs_ipc != 0) {
 		/* (the SDM845: Linux leaves the IPA powered, mapped and its firmware running when the modem stops; the 6T
 		 * resets on IPA traffic through an unmapped stream, and on a bus error from an unclocked block) */
-		printf("mpss: %u: the IPA's firmware, its streams and its clock are left as they are\n", step);
+		printf("mpss: %u: the IPA's firmware, its streams and its clock are left as they are (our channels stopped before)\n",
+		    step);
 	} else if (ipa_loaded) {
 		ipa_firmware_stop();
 		ipa_loaded = false;

@@ -910,6 +910,43 @@ hakios_ipa_data_ready(void)
 	return ready;
 }
 
+/*
+ * The run's end: our channels stopped and reset, so that the IPA -- left running, its firmware and streams kept, as the
+ * 6T needs -- writes no more into this kernel's rings. Left started, it went on delivering the modem's packets into them
+ * after the kernel had gone; in the next run that memory is someone else's, and once it was a region the modem or
+ * TrustZone had been given: an XPU violation (BIMC_MPU3, master 0x9a, VMID 0) and a Qualcomm crash dump right as the
+ * next data path came up (run 223752's dump, TrustZone's log in OCIMEM).
+ */
+void
+hakios_ipa_quiesce(void)
+{
+	if (!ready || gsi_regs == 0) {
+		return;
+	}
+	ready = false;
+	for (unsigned i = sizeof(channels) / sizeof(channels[0]); i-- > 0;) {
+		struct channel *ch = channels[i];
+		uint32_t state;
+
+		/* (the receiving channels only: those the IPA writes into of itself; stopping modem-tx after them hung the
+		 * run's end, run 230654 -- a channel towards the IPA reads our memory only when its doorbell is rung) */
+		if (ch->to_ipa || ch != &modem_rx) {
+			continue;       /* (and only modem-rx, the modem's packets: with lan-rx stopped too the run's end hung) */
+		}
+		state = channel_state(ch);
+
+		if (state == CH_STATE_STARTED) {
+			(void)gsi_command(ch, false, GSI_CH_STOP, CH_STATE_STOPPED);
+			state = channel_state(ch);
+		}
+		if (state == CH_STATE_STOPPED || state == CH_STATE_ALLOCATED) {
+			(void)gsi_command(ch, false, GSI_CH_RESET, CH_STATE_ALLOCATED);
+		}
+		printf("ipa: %s: channel %u left %s\n", ch->name, ch->id, channel_state(ch) == CH_STATE_ALLOCATED ? "stopped and reset" :
+		    "NOT STOPPED");
+	}
+}
+
 void
 hakios_ipa_status(char *to, size_t size)
 {
