@@ -2272,20 +2272,29 @@ slot_to_android(void)
 		attr_a = *(uint64_t *)(gpt_table[0] + 128 * a + 48);
 		attr_b = *(uint64_t *)(gpt_table[0] + 128 * b + 48);
 		print("slot: boot_a attributes %x, boot_b %x\n", attr_a, attr_b);
-		if ((attr_b >> 55 & 1) || !((attr_b >> 54 & 1) || (attr_b >> 51 & 7) != 0)) {
+		/*
+		 * boot_b's own unbootable attribute is cleared: Android's way back here (android/hakios-switch, the Magisk
+		 * module's hakios-slot) sets it, as this sets boot_a's. What makes it bootable otherwise -- successful, or
+		 * retries left -- must already be there.
+		 */
+		if (!((attr_b >> 54 & 1) || (attr_b >> 51 & 7) != 0)) {
 			print("slot: boot_b is not bootable: NOTHING WRITTEN (the phone would have no slot to start)\n");
 			return;
 		}
 		attr_a |= 1ULL << 55;
+		attr_b &= ~(1ULL << 55);
 		*(uint64_t *)(gpt_table[0] + 128 * a + 48) = attr_a;
 		*(uint64_t *)(gpt_table[1] + 128 * a + 48) = attr_a;
+		*(uint64_t *)(gpt_table[0] + 128 * b + 48) = attr_b;
+		*(uint64_t *)(gpt_table[1] + 128 * b + 48) = attr_b;
 		/* the backup first: a reset in between leaves the primary as it was, and ABL reads the primary */
 		if (!gpt_write(bio, backup, gpt_table[1], bytes) || !gpt_write(bio, primary, gpt_table[0], bytes)) {
 			print("slot: A WRITE FAILED\n");
 			return;
 		}
 		bio->flush_blocks(bio);
-		if (gpt_read(bio, 1, primary, gpt_table[0], &bytes) && (*(uint64_t *)(gpt_table[0] + 128 * a + 48) >> 55 & 1)) {
+		if (gpt_read(bio, 1, primary, gpt_table[0], &bytes) && *(uint64_t *)(gpt_table[0] + 128 * a + 48) == attr_a &&
+		    *(uint64_t *)(gpt_table[0] + 128 * b + 48) == attr_b) {
 			print("slot: boot_a is marked unbootable, both tables: the bootloader starts Android's slot next\n");
 		} else {
 			print("slot: THE PRIMARY TABLE DOES NOT READ BACK AS WRITTEN\n");
