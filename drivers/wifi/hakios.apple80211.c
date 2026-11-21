@@ -44,6 +44,34 @@
 #include <sys/sockio.h>
 #include <sys/systm.h>
 
+/*
+ * The link for the rest of the system (the status bar's Wi-Fi item, userland/src/inject_sb.c), from the station's
+ * state, whoever joined (wifid, or the kernel itself with wifi_join): kern.hakios.wifi_link 1 while joined, wifi_rssi
+ * the access point's signal now, dBm (0: not joined).
+ */
+#include <sys/sysctl.h>
+
+static int
+wifi_link_sysctl SYSCTL_HANDLER_ARGS
+{
+	int value = 0;
+	struct hakios_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+
+	if (state != NULL) {
+		hakios_sta_state(state);
+		if (state->phase == HAKIOS_STA_JOINED) {
+			value = arg2 == 0 ? 1 : state->bss.rssi;
+		}
+		kfree_data(state, sizeof(*state));
+	}
+	return sysctl_handle_int(oidp, &value, 0, req);
+}
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, wifi_link, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0,
+    wifi_link_sysctl, "I", "1 while the Wi-Fi is joined");
+SYSCTL_PROC(_kern_hakios, OID_AUTO, wifi_rssi, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 1,
+    wifi_link_sysctl, "I", "the access point's signal, dBm (0: not joined)");
+
 #define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
 #define SIOCGA80211             0xc02869c9u     /* _IOWR('i', 201, struct apple80211req) */
 

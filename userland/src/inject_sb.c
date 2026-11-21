@@ -496,6 +496,11 @@ update_service_item(id self, SEL sel, long item, void *data, id sim, id other, v
  * screen: sb_lte=N among the boot-args tries another) -- and the item switched on and posted again.
  */
 #define DATA_NETWORK_LTE        4
+/* the aggregator's _data (SpringBoard 16.5): byte offsets, after itemIsEnabled[46], three strings, four ints, four
+ * strings of 100, serviceImages[2][100], operatorDirectory[1024], two content types and a bit-field word */
+#define WIFI_RAW_AT             2084
+#define WIFI_BARS_AT            2088
+#define DATA_TYPE_AT            2096
 static void (*original_update_data_network_item)(id self, SEL sel, long item, void *data, BOOL primary, void *getter, void *setter);
 
 static void
@@ -519,7 +524,32 @@ update_data_network_item(id self, SEL sel, long item, void *data, BOOL primary, 
 		say("hakios: cellular: data network item %ld (primary %d): the kernel's data %d; LTE shown as %d\n", item, primary,
 		    sysctl_int("kern.hakios.cellular_data"), lte);
 	}
-	if (primary && sysctl_int("kern.hakios.cellular_registered") > 0 && setter != NULL) {
+	if (primary && sysctl_int("kern.hakios.wifi_link") > 0 && setter != NULL) {
+		/*
+		 * On Wi-Fi (kern.hakios.wifi_link): the type is Wi-Fi (5), which the status bar draws as the Wi-Fi fan, and its
+		 * bars -- the aggregator's _data.wifiSignalStrengthBars, written in place (no setter is handed here): byte
+		 * WIFI_BARS_AT of the struct; dataNetworkType, at DATA_TYPE_AT, read back to say the offsets are right.
+		 */
+		Ivar ivar = class_getInstanceVariable(object_getClass(self), "_data");
+		int rssi = sysctl_int("kern.hakios.wifi_rssi"), wifi_bars = rssi >= -60 ? 3 : rssi >= -72 ? 2 : 1;
+
+		BLOCK_CALL(setter, void (*)(void *, unsigned int), 5u);
+		if (ivar != NULL) {
+			uint8_t *raw = (uint8_t *)(void *)self + ivar_getOffset(ivar);
+			static int checked;
+
+			if (!checked++) {
+				say("hakios: wifi item: _data at +%td: the data network type there reads %u (5 expected)\n",
+				    ivar_getOffset(ivar), *(unsigned int *)(raw + DATA_TYPE_AT));
+			}
+			if (*(unsigned int *)(raw + DATA_TYPE_AT) == 5) {
+				*(int *)(raw + WIFI_RAW_AT) = rssi;
+				*(int *)(raw + WIFI_BARS_AT) = wifi_bars;
+			}
+		}
+		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
+		((void (*)(id, SEL, long))objc_msgSend)(self, sel_registerName("_notifyItemChanged:"), item);
+	} else if (primary && sysctl_int("kern.hakios.cellular_registered") > 0 && setter != NULL) {
 		BLOCK_CALL(setter, void (*)(void *, unsigned int), (unsigned int)lte);
 		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
 		((void (*)(id, SEL, long))objc_msgSend)(self, sel_registerName("_notifyItemChanged:"), item);
@@ -691,7 +721,7 @@ cellular_hook(void)
 		static int last_registered = -2, last_bars = -2, last_data = -2;
 		static char last_name[64];
 		int registered = sysctl_int("kern.hakios.cellular_registered"), bars = sysctl_int("kern.hakios.cellular_bars");
-		int data = sysctl_int("kern.hakios.cellular_data");
+		int data = sysctl_int("kern.hakios.cellular_data") + 2 * sysctl_int("kern.hakios.wifi_link");
 		char name[64] = "";
 		size_t size = sizeof(name) - 1;
 
