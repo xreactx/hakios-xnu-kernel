@@ -303,6 +303,23 @@ hakios_net_link_state_unit(unsigned unit, bool up)
 	net_link_event(n->ifp, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF);
 }
 
+/*
+ * The interface's MTU, as its link says: a cellular session's is the carrier's (1430 on the 6T's), and iOS's DHCP client
+ * does not apply the MTU option -- at 1500, TCP offered a segment the carrier drops, and every large answer (a TLS
+ * certificate) stalled: "the server stopped responding" in Safari, while texts, DNS and NTP went through.
+ */
+void
+hakios_net_set_mtu_unit(unsigned unit, uint32_t mtu)
+{
+	struct net_if *n = net_if_unit(unit);
+
+	if (n == NULL || mtu < IF_MINMTU || mtu > ETHERMTU || ifnet_mtu(n->ifp) == mtu) {
+		return;
+	}
+	ifnet_set_mtu(n->ifp, mtu);
+	printf("net: en%u's MTU is %u (its link's)\n", n->unit, mtu);
+}
+
 void
 hakios_net_link_state(bool up)
 {

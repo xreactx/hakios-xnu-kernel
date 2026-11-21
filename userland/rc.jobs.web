@@ -1,0 +1,6 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+# The web over the 6T's mobile data (RC_JOBS=rc.jobs.web): once the data session is up (en1), a name resolved, a page
+# over plain TCP, and pages over CFNetwork's HTTPS (TLS, the trust store, trustd) -- what Safari needs below WebKit.
+/redwood/bin/rwtouch wait 60
+/redwood/bin/net_test show reach www.google.com resolve www.google.com tcp www.google.com 80
+/redwood/bin/net_test fetch https://www.google.com/ fetch https://example.com/ fetch http://example.com/

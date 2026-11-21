@@ -2993,6 +2993,7 @@ struct payload_info {
 	const uint8_t *resident;        /* ... or one the payload carries, which the loader puts there itself */
 	uint32_t resident_size;
 	const char *kernel_version;     /* kernel.ver: the version of the kernel in this payload (tools/kernel-version.py) */
+	const char *rdflash;            /* "NAME SIZE": the resident image read from that partition (a boot with no host) */
 	int usb_mode;
 };
 
@@ -3071,6 +3072,8 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->kernel_version = text;                /* printed under the banner; the kernel gets it as hakios_kver */
 		} else if (str_eq(e->name, "checkpoint")) {
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
+		} else if (str_eq(e->name, "rdflash")) {
+			pi->rdflash = text;                       /* "NAME SIZE" (hexadecimal): what "oem ramdisk flash" reads */
 		} else if (str_eq(e->name, "usb")) {
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
 		}
@@ -3136,6 +3139,7 @@ static struct {
 } SCREEN;
 static uint64_t win_base, win_size; /* XNU's physical memory window, claimed once */
 static uint64_t resident_rd_size;   /* root image kept at win_base + RESIDENT_RD_OFFSET, 0 if none */
+static int flash_rd_all(const char *name, uint64_t size, uint8_t *dest);
 static char last_result[64] = "idle";
 
 static void
@@ -3375,6 +3379,34 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			return 0;
 		}
 		resident_rd_size = pi.resident_rd;
+	}
+	/*
+	 * A boot with no host whose root is on the phone's flash (rdflash "NAME SIZE"): read here, all of it, as "oem ramdisk
+	 * flash" reads it for xl -- unless a resident image is already in place.
+	 */
+	if (pi.rdflash != NULL && resident_rd_size == 0) {
+		char name[37];
+		unsigned k = 0;
+		const char *c = pi.rdflash;
+		uint64_t size;
+
+		while (*c != 0 && *c != ' ' && k < sizeof(name) - 1) {
+			name[k++] = *c++;
+		}
+		name[k] = 0;
+		while (*c == ' ') {
+			c++;
+		}
+		size = parse_number(c, 16);
+		if (size == 0 || win_size <= RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE ||
+		    size > win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE) {
+			print("rdflash: %x bytes do not fit in the memory window\n", size);
+			return 0;
+		}
+		if (!flash_rd_all(name, size, (uint8_t *)(phys_base + RESIDENT_RD_OFFSET))) {
+			print("rdflash: the root image could not be read from the flash\n");
+			return 0;
+		}
 	}
 	/*
 	 * The payload's own resident image (a boot from the phone's boot partition, where no host sends one): put where
@@ -4210,6 +4242,18 @@ flash_rd_next(void)
 	flash_rd.bio = NULL;
 	flash_rd_say("done %x %d", flash_rd_crc(flash_rd.dest, flash_rd.size), flash_rd.ms);
 	print("ramdisk: %s read in %d ms: the resident image\n", flash_rd.name, flash_rd.ms);
+}
+
+/* All of it at once, for a boot with no host (rdflash): 1 when the resident image is in place. */
+static int
+flash_rd_all(const char *name, uint64_t size, uint8_t *dest)
+{
+	flash_rd_start(name, size, dest);
+	while (flash_rd.bio != NULL && flash_rd.done < flash_rd.size) {
+		flash_rd_next();
+	}
+	print("rdflash: %s: %s\n", name, flash_rd_result);
+	return resident_rd_size == size;
 }
 static uint8_t *usb_rx_buf, *usb_tx_buf;
 static int usb_connected;
@@ -5134,6 +5178,18 @@ efi_main(efi_handle image, efi_system_table *st)
 	/* no payload in memory (nobody put one there): the volume this loader came from may have one, as a UEFI boot loader's does */
 	if (((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
 		load_payload_from_volume();
+	}
+	/*
+	 * A boot with no host (one-shot: a payload without a "usb" entry) shows nothing of the loader's on the screen unless
+	 * the kernel's command line asks for a verbose boot (-v); the log still takes every line. (The USB loop goes quiet too.)
+	 */
+	if (parse_payload(&pi, 0) && !pi.usb_mode) {
+		int verbose = 0;
+
+		for (const char *c = pi.cmdline != NULL ? pi.cmdline : ""; *c; c++) {
+			verbose |= starts_with(c, "-v") && (c[2] == ' ' || c[2] == 0) && (c == pi.cmdline || c[-1] == ' ');
+		}
+		screen_quiet = !verbose;
 	}
 	print("== XNULOADER v3 ==\n");
 	print_banner();

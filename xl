@@ -29,6 +29,8 @@
 #   xl reload           restart the phone into a freshly built loader (after changing xnuloader/)
 #   xl memmap           the phone's memory map as its firmware reports it
 #   xl state            where is the phone right now
+#   xl standalone [boot] a boot image that needs no host (standalone.img: one-shot loader, the system image read from
+#                       system_a, no time limit); "boot" starts it from RAM (fastboot boot), nothing written
 #
 # Logs land in logs/. Environment for `run`:
 #   XL_CMDLINE  extra kernel boot-args; default "-v": the boot is shown as text on the phone's screen
@@ -173,6 +175,81 @@ enter() {
 	echo "xl: loader did not come up on USB (state: $(state))"; return 1
 }
 
+# The kernel's command line for a run, in LINE: build_line SECONDS [EPOCH] (XL_CMDLINE, the device's arguments, the phone's
+# own Wi-Fi and Bluetooth addresses; refused when it would not fit)
+build_line() {
+	# A run about Wi-Fi is given the radio's own address, which is this phone's and so is kept in a
+	# file that is not in the repository: fw-wifi/mac, one line, six bytes in hexadecimal with colons.
+	local args=${XL_CMDLINE--v}
+	case " $args " in
+	# (redwood's wifi= and wifi_step=; the 6T's ath10k, wifi6t=, asks for it the same way: without it, a new one each boot)
+	*" wifi="*|*" wifi_step="*|*" wifi6t="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
+	esac
+	# The phone's own boot-args: the .config's (make fajita_defconfig; tools/hakios-config.py args), else
+	# devices/$DEVICE/run.args (words, # to the line's end a comment); each one unless XL_CMDLINE already has it by name
+	local device_args=devices/${DEVICE:-redwood}/run.args a words=
+	if [ -f .config ]; then words=$(tools/hakios-config.py args) || return 1
+	elif [ -f "$device_args" ]; then words=$(sed 's/#.*//' "$device_args"); fi
+	# (XL_DROP="NAME ...": those of them left out altogether -- e.g. the speaker's soc_sound_* while sound=0)
+	if [ -n "$words" ]; then
+		for a in $words; do
+			case " $args " in
+			*" ${a%%=*}="*|*" $a "*) ;;
+			*) case " ${XL_DROP:-} " in *" ${a%%=*} "*) ;; *) args="$args $a" ;; esac ;;
+			esac
+		done
+	fi
+	# (the 6T's Bluetooth, bt6t=4 and up, whether from XL_CMDLINE or the configuration: the phone's own address, saved
+	# from Android -- settings get secure bluetooth_address -- into fw-bt/bdaddr, which stays out of the repository;
+	# without it the controller keeps its NVM's 39:90:21:74:07:00)
+	case " $args " in
+	*" bt6t=0 "*|*" bt6t_bdaddr="*) ;;
+	*" bt6t="*) [ -s fw-bt/bdaddr ] && args="$args bt6t_bdaddr=$(tr -d ' \n\r' < fw-bt/bdaddr)" ;;
+	esac
+	# XNU's boot-args hold 1023 characters (BOOT_LINE_LENGTH 1024 in this port's kernel and loader; Apple's 608), and the loader cuts the line there without
+	# a word: on 31 October that cut soc_apcs_ipc=0x1799000c in the middle, the audio DSP rang a doorbell at
+	# 0x179, and the phone reset into a crash dump four times. The loader puts up to 120 of its own in front
+	# (debug=0x8 serial=3, rd=md0, cpus=1, hv_wdt_pet=1, ufs_shared_pa=..., battery_shared_pa=...): a line that may not fit is refused.
+	LINE="loader_return_after=$1${2:+ epoch=$2} sb_delay=${XL_SB_DELAY:-8} $args"
+	if [ $(( ${#LINE} + 120 )) -gt 1023 ]; then
+		echo "xl: the command line is ${#LINE} characters, and the loader adds up to 120: more than XNU's 1023." >&2
+		echo "xl: it would lose: ${LINE:$(( 1023 - 120 ))}" >&2
+		echo "xl: leave out what this run does not need (XL_DROP=\"NAME ...\" for the .config's arguments)" >&2
+		return 1
+	fi
+}
+
+# A boot image that needs no host: the loader in one-shot mode with this kernel, the small image, the command line, and
+# the system image read by the loader itself from system_a (what was flashed there: userland/system.apfs), with no time
+# limit (a year) and no epoch (the firmware's clock). "xl standalone" builds standalone.img; "xl standalone boot" also
+# starts it from RAM with fastboot boot -- nothing is written -- and the cable can come out once it is running.
+standalone() { # standalone [boot]
+	local sys=userland/system.apfs part=${XL_PART:-system_a} img=standalone.img
+	[ -f "$sys" ] || { echo "xl: $sys not built"; return 1; }
+	XL_CMDLINE="${XL_CMDLINE-}" build_line 31536000 || return 1
+	printf '%s %x\0' "$part" "$(stat -c %s "$sys")" > standalone-rdflash.txt
+	xnuloader/mkpayload.py -o standalone-payload.bin loader.efi=$L kernel=$K ramdisk=${XL_RAMDISK:-userland/root.apfs} \
+	    rdflash=standalone-rdflash.txt --cmdline "$LINE" >/dev/null || { echo "xl: payload build failed"; return 1; }
+	case "$(firmware)" in
+	u-boot) tools/mkubootimg.py -d "${DEVICE:-redwood}" -l $L -p standalone-payload.bin -o $img >/dev/null ;;
+	*) ./mkxnuimg.py -p standalone-payload.bin -o $img >/dev/null ;;
+	esac || { echo "xl: image build failed ($(firmware))"; return 1; }
+	echo "xl: $img: $(( $(stat -c %s $img) / 1048576 )) MB; the root read from $part ($(stat -c %s "$sys") bytes)"
+	[ "$1" = boot ] || return 0
+	case "$(state)" in
+	android) adb reboot bootloader; wait_for fastboot 60 || { echo "xl: phone did not reach fastboot"; return 1; } ;;
+	fastboot) ;;
+	loader) fb reboot >/dev/null; wait_for android 120 && adb reboot bootloader && wait_for fastboot 60 || return 1 ;;
+	*) echo "xl: phone not reachable"; return 1 ;;
+	esac
+	local try
+	for try in 1 2; do
+		FB_TIMEOUT=60 fb boot $img | grep -q OKAY && { echo "xl: started; it runs on its own now (the cable can come out)"; return 0; }
+		sleep 3
+	done
+	echo "xl: the bootloader did not take $img"; return 1
+}
+
 fetch_log() { # fetch_log <file>
 	rm -f "$1"
 	FB_TIMEOUT=20 fb get_staged "$1" >/dev/null
@@ -218,46 +295,8 @@ run() { # run <oem command> <label>
 			echo "xl: nothing here recorded who uploaded the resident image;" \
 			     "if this run needs a particular one, upload it" >&2
 		fi
-		# A run about Wi-Fi is given the radio's own address, which is this phone's and so is kept in a
-		# file that is not in the repository: fw-wifi/mac, one line, six bytes in hexadecimal with colons.
-		local args=${XL_CMDLINE--v}
-		case " $args " in
-		# (redwood's wifi= and wifi_step=; the 6T's ath10k, wifi6t=, asks for it the same way: without it, a new one each boot)
-		*" wifi="*|*" wifi_step="*|*" wifi6t="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
-		esac
-		# The phone's own boot-args: the .config's (make fajita_defconfig; tools/hakios-config.py args), else
-		# devices/$DEVICE/run.args (words, # to the line's end a comment); each one unless XL_CMDLINE already has it by name
-		local device_args=devices/${DEVICE:-redwood}/run.args a words=
-		if [ -f .config ]; then words=$(tools/hakios-config.py args) || return 1
-		elif [ -f "$device_args" ]; then words=$(sed 's/#.*//' "$device_args"); fi
-		# (XL_DROP="NAME ...": those of them left out altogether -- e.g. the speaker's soc_sound_* while sound=0)
-		if [ -n "$words" ]; then
-			for a in $words; do
-				case " $args " in
-				*" ${a%%=*}="*|*" $a "*) ;;
-				*) case " ${XL_DROP:-} " in *" ${a%%=*} "*) ;; *) args="$args $a" ;; esac ;;
-				esac
-			done
-		fi
-		# (the 6T's Bluetooth, bt6t=4 and up, whether from XL_CMDLINE or the configuration: the phone's own address, saved
-		# from Android -- settings get secure bluetooth_address -- into fw-bt/bdaddr, which stays out of the repository;
-		# without it the controller keeps its NVM's 39:90:21:74:07:00)
-		case " $args " in
-		*" bt6t=0 "*|*" bt6t_bdaddr="*) ;;
-		*" bt6t="*) [ -s fw-bt/bdaddr ] && args="$args bt6t_bdaddr=$(tr -d ' \n\r' < fw-bt/bdaddr)" ;;
-		esac
-		# XNU's boot-args hold 1023 characters (BOOT_LINE_LENGTH 1024 in this port's kernel and loader; Apple's 608), and the loader cuts the line there without
-		# a word: on 31 October that cut soc_apcs_ipc=0x1799000c in the middle, the audio DSP rang a doorbell at
-		# 0x179, and the phone reset into a crash dump four times. The loader puts up to 120 of its own in front
-		# (debug=0x8 serial=3, rd=md0, cpus=1, hv_wdt_pet=1, ufs_shared_pa=..., battery_shared_pa=...): a line that may not fit is refused.
-		local line="loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args"
-		if [ $(( ${#line} + 120 )) -gt 1023 ]; then
-			echo "xl: the command line is ${#line} characters, and the loader adds up to 120: more than XNU's 1023." >&2
-			echo "xl: it would lose: ${line:$(( 1023 - 120 ))}" >&2
-			echo "xl: leave out what this run does not need (XL_DROP=\"NAME ...\" for the .config's arguments)" >&2
-			return 1
-		fi
-		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "loader_return_after=${XL_SECS:-8} epoch=$(date +%s) sb_delay=${XL_SB_DELAY:-8} $args" >/dev/null || return 1
+		build_line "${XL_SECS:-8}" "$(date +%s)" || return 1
+		xnuloader/mkpayload.py -o run-payload.bin kernel=$K ${rd:+ramdisk=$rd} --cmdline "$LINE" >/dev/null || return 1
 		FB_TIMEOUT=30 fb stage run-payload.bin | grep -q OKAY || {
 			echo "xl: upload failed"
 			FB_TIMEOUT=10 fb getvar version >/dev/null 2>&1 ||
@@ -524,6 +563,7 @@ not_anothers_run() { # not_anothers_run <command>
 # log, stop, reboot. Anything else would wait for nothing.
 case "$1" in
 ""|run|selftest|state|screenshot|log|stop|reboot) ;;
+standalone) [ -z "$2" ] || { flock -n $PHONE.run true 2>/dev/null || { echo "xl: a run is in progress: xl stop first" >&2; exit 1; }; } ;;
 *)	if ! flock -n $PHONE.run true 2>/dev/null; then
 		echo "xl: a run is in progress: only state, screenshot, log, stop and reboot now" >&2; exit 1
 	fi ;;
@@ -537,6 +577,7 @@ camera) camera "$2" ;;
 sound) sound "$2" ;;
 ramdisk) ramdisk "$2" ;;
 ramdisk-flash) ramdisk_flash "$2" "$3" ;;
+standalone) standalone "$2" ;;
 flash-read) flash_read "$2" "$3" "$4" "$5" ;;
 hangdump) hangdump ;;
 run) run "oem run $2" "run${2:+-cp$2}" ;;

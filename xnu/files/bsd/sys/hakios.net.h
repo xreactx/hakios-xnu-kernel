@@ -57,6 +57,7 @@ void hakios_net_input_unit(unsigned unit, const uint8_t *frame, size_t length);
 /* Frames can pass now / can no longer pass (on en0 / on en<unit>). */
 void hakios_net_link_state(bool up);
 void hakios_net_link_state_unit(unsigned unit, bool up);
+void hakios_net_set_mtu_unit(unsigned unit, uint32_t mtu);
 
 void hakios_net_init(void);            /* the links there are: each looks for its hardware (or its boot-arg) */
 /* an Apple80211 request (SIOCGA80211, SIOCSA80211) for the interface of a radio: hakios.apple80211.c */

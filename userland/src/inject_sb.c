@@ -399,6 +399,11 @@ update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter
 		say("hakios: cellular: signal item %ld: data %p, SIM info %p, getter %p, setter %p; the kernel says up %d registered %d bars %d dbm %d\n",
 		    item, data, (void *)sim, getter, setter, up, registered, bars, dbm);
 	}
+	if (sim == nil) {
+		/* (the second SIM's item -- no SIM there: left off, or iOS draws the dual-SIM layout, an empty row of dots under the bars) */
+		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, NO);
+		return;
+	}
 	/*
 	 * Force the signal item on. Darwin hides it unless its own cellular stack (CommCenter, which is
 	 * not here) says there is service, so the bars never appear on their own. The kernel knows
@@ -469,6 +474,11 @@ update_service_item(id self, SEL sel, long item, void *data, id sim, id other, v
 	if (original_update_service_item) {
 		original_update_service_item(self, sel, item, data, sim, other, g1, s1, g2, s2, g3, s3, g4, s4);
 	}
+	if (sim == nil) {
+		/* (the second SIM's item -- no SIM there: left off, or iOS draws the dual-SIM layout, an empty row of dots under the bars) */
+		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, NO);
+		return;
+	}
 	sysctlbyname("kern.hakios.cellular_operator", name, &size, NULL, 0);
 	if (said++ < 4) {
 		say("hakios: cellular: service item %ld: data %p, SIM info %p, other %p; string getter %p setter %p, content type getter %p "
@@ -510,6 +520,11 @@ update_data_network_item(id self, SEL sel, long item, void *data, BOOL primary, 
 
 	if (original_update_data_network_item) {
 		original_update_data_network_item(self, sel, item, data, primary, getter, setter);
+	}
+	if (!primary) {
+		/* (the second SIM's item -- no SIM there: left off, or iOS draws the dual-SIM layout, an empty row of dots under the bars) */
+		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, NO);
+		return;
 	}
 	if (lte < 0) {
 		char args[1024] = "", *at;

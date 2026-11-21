@@ -65,7 +65,7 @@ static struct {
 	uint32_t        modem_mask, modem_gateway;                      /* what the modem said, for the log */
 } session;
 static struct {
-	uint64_t        arp, dhcp, to_modem, from_modem, dropped_out, dropped_in, not_ip4;
+	uint64_t        arp, dhcp, to_modem, from_modem, dropped_out, dropped_in, not_ip4, mss_clamped;
 } cell_count;
 static bool cell_attached, cell_trace;
 
@@ -249,6 +249,67 @@ dhcp_answer(const uint8_t *frame, size_t length, const uint8_t *udp)
 
 /* ---- the link ----------------------------------------------------------------------------------- */
 
+/*
+ * A TCP SYN's MSS held to what the carrier carries (the session's MTU less 40), as Android clamps it (iptables TCPMSS):
+ * AT&T's tunnel takes 1430-byte packets, the stack offered 1460-byte segments (en1's MTU is 1500 -- configd does not
+ * take the DHCP answer's), and the servers' full-sized answers were dropped on the way with nothing said: connections
+ * opened and nothing came back, Safari's "the server stopped responding" (run 122003: 4489 packets out, 566 in, 87
+ * bytes each). The TCP checksum is mended incrementally (RFC 1624).
+ */
+static void
+clamp_mss(uint8_t *ip, size_t length, uint32_t mtu)
+{
+	size_t ihl, thl;
+	uint8_t *tcp;
+	uint16_t limit = (uint16_t)((mtu >= 576 && mtu <= 1500 ? mtu : 1500) - 40);
+
+	if (length < 20 || (ip[0] >> 4) != 4 || ip[9] != 6 || (ip[6] & 0x1f) != 0 || ip[7] != 0) {
+		return;
+	}
+	ihl = (size_t)(ip[0] & 0xf) * 4;
+	if (ihl < 20 || length < ihl + 20) {
+		return;
+	}
+	tcp = ip + ihl;
+	thl = (size_t)(tcp[12] >> 4) * 4;
+	if (!(tcp[13] & 0x02) || thl < 20 || length < ihl + thl) {
+		return;                                 /* not a SYN */
+	}
+	for (size_t o = 20; o + 1 < thl;) {
+		uint8_t kind = tcp[o];
+
+		if (kind == 0) {
+			break;
+		}
+		if (kind == 1) {
+			o++;
+			continue;
+		}
+		if (tcp[o + 1] < 2 || o + tcp[o + 1] > thl) {
+			break;
+		}
+		if (kind == 2 && tcp[o + 1] == 4) {
+			uint16_t mss = (uint16_t)(tcp[o + 2] << 8 | tcp[o + 3]);
+
+			if (mss > limit) {
+				uint32_t sum = (uint16_t)~(tcp[16] << 8 | tcp[17]);
+
+				sum += (uint16_t)~mss;
+				sum += limit;
+				sum = (sum & 0xffff) + (sum >> 16);
+				sum = (sum & 0xffff) + (sum >> 16);
+				tcp[o + 2] = (uint8_t)(limit >> 8);
+				tcp[o + 3] = (uint8_t)limit;
+				tcp[16] = (uint8_t)(~sum >> 8);
+				tcp[17] = (uint8_t)~sum;
+				cell_count.mss_clamped++;
+			}
+			break;
+		}
+		o += tcp[o + 1];
+	}
+}
+
 /* A frame from the stack: answered here, or its IP packet to the modem. */
 static bool
 cell_transmit(mbuf_t packet, size_t length)
@@ -268,6 +329,7 @@ cell_transmit(mbuf_t packet, size_t length)
 	} else if (type == 0x0800 && dhcp_request(frame, length, &udp)) {
 		ok = session.up && dhcp_answer(frame, length, udp);
 	} else if (type == 0x0800) {
+		clamp_mss(frame + 14, length - 14, session.mtu);
 		ok = session.up && hakios_ipa_transmit(CELL_MUX, frame + 14, length - 14);
 		if (ok) {
 			cell_count.to_modem++;
@@ -609,8 +671,8 @@ cell_poll(void)
 
 		hakios_ipa_status(line, sizeof(line));
 		printf("cell: so far %llu packets to the modem, %llu from it; dropped %llu out, %llu in; %llu not IPv4; ARP %llu, DHCP %llu; "
-		    "IPA: %s\n", cell_count.to_modem, cell_count.from_modem, cell_count.dropped_out, cell_count.dropped_in, cell_count.not_ip4,
-		    cell_count.arp, cell_count.dhcp, line);
+		    "%llu SYNs' MSS clamped; IPA: %s\n", cell_count.to_modem, cell_count.from_modem, cell_count.dropped_out, cell_count.dropped_in,
+		    cell_count.not_ip4, cell_count.arp, cell_count.dhcp, cell_count.mss_clamped, line);
 	}
 	return got;
 }
@@ -656,6 +718,9 @@ hakios_cell_session(bool up, uint32_t address, uint32_t mask, uint32_t gateway, 
 	    dns1 >> 24, (dns1 >> 16) & 0xff, (dns1 >> 8) & 0xff, dns1 & 0xff, dns2 >> 24, (dns2 >> 16) & 0xff, (dns2 >> 8) & 0xff, dns2 & 0xff,
 	    mtu, cell_attached ? "" : " (no en1: the IPA's data path is not up)");
 	if (cell_attached) {
+		if (session.up && session.mtu != 0) {
+			hakios_net_set_mtu_unit(CELL_UNIT, session.mtu);
+		}
 		hakios_net_link_state_unit(CELL_UNIT, session.up);
 	}
 }

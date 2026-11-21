@@ -2538,13 +2538,7 @@ static struct block apps_smmu_context = { "apps smmu, the IPA's context", 0, 0x1
 #define SMMU_SGFSYNR0           0x050
 #define SMMU_SGFSYNR1           0x054
 #define SMMU_CBAR(n)            (4 * (n))
-/*
- * (and the context's VMID, bits 7:0: HLOS's, 3. With 0 the IPA's accesses through it -- its page tables walked by the
- * SMMU too -- came to the memory's protection with VMID 0 and, now and then, met an XPU that wanted HLOS's: a violation
- * on BIMC_MPU3 and a Qualcomm crash dump, masters 0x9a and 0x88, at the tables' pages, runs 223752 and 232718)
- */
-#define SMMU_CBAR_VMID_HLOS     3u
-#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12 | SMMU_CBAR_VMID_HLOS)
+#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)   /* (VMID 3 in bits 7:0 tried 2026-11-20 against the crash dumps: no help) */
 #define SMMU_CBA2R(n)           (0x800 + 4 * (n))
 #define SMMU_CBA2R_64_BIT       1
 #define SMMU_CB_SCTLR           0x00
