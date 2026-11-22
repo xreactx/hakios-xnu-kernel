@@ -1478,6 +1478,14 @@ stream_stop(void)
 	}
 	wr(csid_base + CSID_TPG_CTRL, 0);
 	wr(csid_base + CSID_RDI0_CTRL, 0);              /* halt at the frame's boundary */
+	/*
+	 * ... and that boundary waited for: the frame being written ends (the sensor is still streaming: callers turn it
+	 * off after this), up to two of the slowest mode's frames (the IMX371's 2304x1728, 33 ms; 14 a second when it is
+	 * dark: 70 ms). The write master was disabled 2 ms after the halt, mid-frame, with the sensor already off, and the
+	 * SMMU context and the clocks went next: crash-162002 (run 161831), a config NOC error seconds after the front
+	 * camera's stream stopped (a write still in flight, out untranslated or cut off with its clock).
+	 */
+	spin_us(150000);
 	wr(csid_base + CSID_RDI0_CFG0, rd(csid_base + CSID_RDI0_CFG0) & ~(1u << 31));
 	wr(ife_base + WM0_CFG, 0);
 	wr(ife_base + IFE_REG_UPDATE, 0x2);
@@ -1501,8 +1509,8 @@ capture_tpg(void)
 		return;
 	}
 	if (!smmu_up() || !csid_reset() || !ife_config() || !csid_config(-1, 0, false)) {
+		blocks_off();           /* (clocks before the SMMU context: see paths_down) */
 		smmu_down();
-		blocks_off();
 		return;
 	}
 	streaming = true;
@@ -1523,9 +1531,9 @@ capture_tpg(void)
 	}
 	show_paths("after");
 	stream_stop();
+	blocks_off();                   /* the IFE's clocks before its SMMU context (see paths_down) */
 	smmu_faults();
 	smmu_down();
-	blocks_off();
 	for (vm_offset_t line = frames; line < frames + frames_bytes; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r" (line));
 	}
@@ -1546,6 +1554,14 @@ capture_tpg(void)
 /* ---- power up, ask, power down ---------------------------------------------------------------------------------- */
 
 static const struct sensor *up;         /* the sensor powered up now, if one is */
+
+/*
+ * The paths down in the order Linux's camera stack takes them: the stream halted at a frame's end (stream_stop), the
+ * PHY and the camera's clocks off -- the IFE can no longer write -- and only then its SMMU context given back. The
+ * context went first before (smmu_down before blocks_off): a write the IFE still had in flight would have gone out
+ * untranslated, to 0x4xxxxxxx, which is not memory on this SoC. (Defined below the pieces it calls.)
+ */
+static void paths_down(void);
 
 static void
 power_down(void)
@@ -2096,6 +2112,18 @@ phy_off(void)
 }
 
 static void
+paths_down(void)
+{
+	stream_stop();
+	phy_off();
+	phy_clocks_off();
+	blocks_off();
+	pll3_down();
+	smmu_faults();
+	smmu_down();
+}
+
+static void
 show_phy(void)
 {
 	say("cam6t: csiphy%u status: %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n", phy_n, rd(csiphy_base + CSIPHY_STATUS(0)),
@@ -2209,15 +2237,10 @@ capture_sensor(unsigned i)
 	say("cam6t: %s\n", h->frames ? "WRITE MASTER 0 SAYS A FRAME OF THE SENSOR IS IN MEMORY" : "no frame done in 3 s");
 	show_phy();
 	show_paths("after");
+	stream_stop();                  /* (at a frame's end, the sensor still sending: see stream_stop) */
 	(void)write_table(s, "off");
 out:
-	stream_stop();
-	phy_off();
-	smmu_faults();
-	smmu_down();
-	phy_clocks_off();
-	blocks_off();
-	pll3_down();
+	paths_down();
 	focus_off();
 	power_down();
 	for (vm_offset_t line = frames; line < frames + frames_bytes; line += 64) {
@@ -2454,19 +2477,18 @@ darwin_stop(const char *why)
 	}
 	lck_mtx_unlock(&darwin_lock);
 	wakeup(&darwin_frames_done);
+	if (csid_base != 0) {
+		show_paths("at the end");
+	}
+	/* the stream halted at a frame's end while the sensor still sends, then the sensor off, then the paths' clocks,
+	 * the SMMU context last (paths_down) */
+	if (csid_base != 0) {
+		stream_stop();
+	}
 	if (up != NULL) {
 		(void)write_table(s, "off");
 	}
-	if (csid_base != 0) {
-		show_paths("at the end");
-		stream_stop();
-	}
-	phy_off();
-	smmu_faults();
-	smmu_down();
-	phy_clocks_off();
-	blocks_off();
-	pll3_down();
+	paths_down();
 	focus_off();
 	power_down();
 	darwin_drain_readers();
@@ -3078,10 +3100,10 @@ hakios_cam6t_quiesce(void)
 			stream_stop();
 		}
 		phy_off();
-		smmu_down();
 		phy_clocks_off();
 		blocks_off();
 		pll3_down();
+		smmu_down();            /* (after the clocks: see paths_down) */
 		pll2_down();
 		gdsc_off();
 	}

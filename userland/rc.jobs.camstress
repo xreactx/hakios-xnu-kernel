@@ -1,0 +1,45 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+# The front camera opened, streamed and closed 40 times (RC_JOBS=rc.jobs.camstress): crash-162002, a config-NOC
+# error right after the IMX371's stream stopped -- does the teardown fault when repeated?
+/redwood/bin/rwtouch wait 40
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/camera_test raw 12 sensor 2
+/redwood/bin/rwtouch wait 30
