@@ -267,6 +267,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -o obj/timesyncd src/timesyncd.c
 		# Wi-Fi before cellular (src/netrank.c): en1 ranked last among configd's services
 		$DYN -framework CoreFoundation -framework SystemConfiguration -o obj/netrank src/netrank.c
+		# where the battery goes, a line a minute (src/powerlog.c)
+		$DYN -o obj/powerlog src/powerlog.c
 		# the 6T's received texts shown as alerts (src/smsd.c)
 		# (SpringBoard shows a CFUserNotification only for the entitlement com.apple.springboard.CFUserNotification)
 		$DYN -fobjc-arc -framework CoreFoundation -framework Foundation -framework Contacts -o obj/smsd src/smsd.c src/mms.c src/calld_contacts.m &&
@@ -449,6 +451,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/smsd ] && cp obj/smsd root/bin/
 	[ -f obj/timesyncd ] && cp obj/timesyncd root/bin/ && cp com.hakios.timesyncd.plist root/LaunchDaemons/
 	[ -f obj/netrank ] && cp obj/netrank root/bin/ && cp com.hakios.netrank.plist root/LaunchDaemons/
+	[ -f obj/powerlog ] && cp obj/powerlog root/bin/ && cp com.hakios.powerlog.plist root/LaunchDaemons/
 	[ -f obj/calld ] && cp obj/calld root/bin/
 	[ -f obj/battery_test ] && cp obj/battery_test root/bin/
 	[ -f obj/keychain_test ] && cp obj/keychain_test root/bin/
