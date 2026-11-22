@@ -2497,6 +2497,35 @@ darwin_stop(const char *why)
 	    darwin_given, darwin_writes_late);
 }
 
+/*
+ * Nothing that votes through RPMh before the loader's core is done with it: the first command slot of the
+ * application processor's RSC is also UEFI's RPMh driver's, and the loader's core runs UEFI's timer events for a run's
+ * first 24 s (xnuloader's NOTE_SECONDS). The touch screen's driver (synaptics_after), the buttons, cpufreq and the GPU
+ * wait for that; Darwin's camera sessions did not -- a session starts when the device is first read, and iOS opens the
+ * front camera early in the boot, then BOB, LVS1 and the CSIPHYs' LDOs were voted through the same slot UEFI may be
+ * writing: a mixed command, one request's regulator with the other's level. crash-162002 and crash-191934 (a config NOC
+ * error, twice about 25 s into the run, each just after an early front-camera session). So the first session waits
+ * until cam6t_rpmh_after seconds (26) since this driver started.
+ */
+static uint64_t driver_started;
+static uint32_t rpmh_after_s = 26;
+
+static void
+rpmh_window_wait(void)
+{
+	uint64_t want, now = mach_absolute_time();
+
+	nanoseconds_to_absolutetime((uint64_t)rpmh_after_s * NSEC_PER_SEC, &want);
+	want += driver_started;
+	if (now < want) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(want - now, &ns);
+		say("cam6t: the first session waits %llu ms, until the loader's core is done with the RPMh slot\n", ns / 1000000);
+		delay_for_interval((uint32_t)(ns / 1000000) + 1, NSEC_PER_MSEC);
+	}
+}
+
 static bool
 darwin_start(void)
 {
@@ -2506,6 +2535,7 @@ darwin_start(void)
 	uint16_t id = 0;
 	char res[8];
 
+	rpmh_window_wait();
 	darwin_frames_done = darwin_given = darwin_writes_late = 0;
 	darwin_odd_frames = 0;
 	cap_width = m->width;
@@ -3050,6 +3080,8 @@ hakios_cam6t_init(void)
 	if (level == 0) {
 		return;
 	}
+	driver_started = mach_absolute_time();
+	(void)PE_parse_boot_argn("cam6t_rpmh_after", &rpmh_after_s, sizeof(rpmh_after_s));
 	which_given = PE_parse_boot_argn("cam6t_sensor", &which, sizeof(which));
 	(void)PE_parse_boot_argn("cam6t_after", &after_s, sizeof(after_s));
 	(void)PE_parse_boot_argn("cam6t_xo", &use_xo, sizeof(use_xo));
