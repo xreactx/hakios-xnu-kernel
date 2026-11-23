@@ -2286,6 +2286,10 @@ step_gmu_firmware(void)
 #define GMU_DCACHE_CONFIG       GMU_WORD(0x4c01)
 #define GMU_SYS_BUS_CONFIG      GMU_WORD(0x4c0f)
 #define GMU_PWR_COL_INTER_FRAME_CTRL GMU_WORD(0x50c0)
+#define GMU_PWR_COL_INTER_FRAME_HYST GMU_WORD(0x50c1)   /* a6xx_gmu.xml 0x1f8c1; the idle hysteresis for IFPC */
+#define GMU_IFPC_ENABLE         (1u << 0)               /* of inter_frame_ctrl: the firmware's inter-frame power collapse */
+#define GMU_HM_POWER_COLLAPSE_ENABLE (1u << 1)          /* ... collapsing the GX (3D-core) head switch with it */
+#define GMU_PWR_COL_HYST        0x000a1680              /* a6xx_gmu.c: 0x1680 XO cycles (~300 us) idle, 0xa after */
 #define GMU_RPMH_CTRL           GMU_WORD(0x50e8)
 #define GMU_RPMH_CTRL_ALL       0xf11           /* the RPMh interface, and every vote the firmware may cast */
 #define GMU_CX_FAL_INTF         GMU_WORD(0x50f0)
@@ -2492,6 +2496,11 @@ gmu_start_630(void)
 	put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
 	put(&gmu, "dcache_config", GMU_DCACHE_CONFIG, 1);
 	put(&gmu, "pwr_col_inter_frame_ctrl", GMU_PWR_COL_INTER_FRAME_CTRL, 0x9c40400);
+	/*
+	 * The firmware's inter-frame power collapse (IFPC) is NOT armed here: writing the enable bits before the
+	 * HFI handshake (step 16) faults the a630's GMU processor (CM3_FAULT, gmu2host 0x800000) -- the same fault
+	 * the slumber path hits. It is armed instead once the GPU is fully up, inlined in the keep path below.
+	 */
 	set(&gmu, "rpmh_ctrl", GMU_RPMH_CTRL, GMU_RPMH_CTRL_ALL);
 	put(&gmu, "gmu2host_intr_clr", GMU_GMU2HOST_INTR_CLR, 0xffffffff);
 	/* a6xx_gmu_start() */
@@ -4876,6 +4885,24 @@ hakios_adreno_init(void)
 			to_memory(core_scratch.memory, 4096);
 			PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
 			PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
+			if (a630) {
+				uint32_t ifpc = 0;
+
+				/*
+				 * Now the 3D core is up and the HFI is quiet, arm the firmware's inter-frame power collapse:
+				 * the GX (3D-core) rail comes down on its own between frames, so at screen off it no longer
+				 * sits up idle. Setting these bits before the HFI handshake faults the a630's GMU (CM3_FAULT),
+				 * so it is deliberately left until here. Off by default (adreno_ifpc=1 to try it) while the
+				 * a630 GMU's reaction to autonomous collapse is still being proven -- worst case a GPU reset.
+				 */
+				PE_parse_boot_argn("adreno_ifpc", &ifpc, sizeof(ifpc));
+				if (ifpc) {
+					put(&gmu, "pwr_col_inter_frame_hyst", GMU_PWR_COL_INTER_FRAME_HYST, GMU_PWR_COL_HYST);
+					set(&gmu, "pwr_col_inter_frame_ctrl (IFPC on)", GMU_PWR_COL_INTER_FRAME_CTRL,
+					    GMU_IFPC_ENABLE | GMU_HM_POWER_COLLAPSE_ENABLE);
+					printf("adreno: IFPC ARMED (adreno_ifpc=1): the firmware may collapse the GX rail between frames\n");
+				}
+			}
 			gpu_kept = true;
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU\n");
