@@ -126,6 +126,60 @@ psci_smp_init(void)
 	}
 }
 
+/*
+ * A read-only look at what the firmware's PSCI implementation offers, for the CPU idle
+ * power-collapse work (screen-off power). It changes nothing: every call here only asks --
+ * the version, and PSCI_FEATURES for the calls that matter -- so it is safe to run as it is.
+ * Gated behind cpu_psci_probe=1 and off by default; the answers go to the console (-> the
+ * logdump partition), the only way off the phone. What we are after:
+ *   - is CPU_SUSPEND implemented at all on this TrustZone, and
+ *   - which power_state format it wants (original vs extended StateID), and
+ *   - whether OS-initiated mode is on offer (PSCI_SET_SUSPEND_MODE present), which decides
+ *     whether we could ever ask for a cluster state ourselves or must leave that to the firmware.
+ * The SDM845's device tree exposes only power-DOWN idle states (0x40000003 core, 0x40000004
+ * rail, 0x400000f4 cluster -- all StateType=powerdown), no retention, so a collapsing idle here
+ * will have to warm-boot through the reset vector; this probe is the harmless first confirmation.
+ */
+#define PSCI_VERSION_FN         0x84000000u
+#define PSCI_FEATURES_FN        0x8400000Au
+#define PSCI_SET_SUSPEND_MODE   0x8400000Fu
+#define PSCI_CPU_SUSPEND_64     0xC4000001u
+#define PSCI_SYSTEM_SUSPEND_64  0xC400000Eu
+
+void
+psci_smp_probe(void)
+{
+	uint32_t enable = 0;
+	int64_t version, f_suspend, f_sysp, f_on, f_off, f_setmode;
+
+	if (!PE_parse_boot_argn("cpu_psci_probe", &enable, sizeof(enable)) || enable == 0) {
+		return;
+	}
+
+	version = psci_call(PSCI_VERSION_FN, 0, 0, 0);
+	printf("psci: probe: version %lld.%lld, called with %s\n",
+	    (version >> 16) & 0xffff, version & 0xffff, psci_smp_hvc ? "hvc" : "smc");
+
+	f_suspend = psci_call(PSCI_FEATURES_FN, PSCI_CPU_SUSPEND_64, 0, 0);
+	f_sysp    = psci_call(PSCI_FEATURES_FN, PSCI_SYSTEM_SUSPEND_64, 0, 0);
+	f_on      = psci_call(PSCI_FEATURES_FN, PSCI_CPU_ON, 0, 0);
+	f_off     = psci_call(PSCI_FEATURES_FN, PSCI_CPU_OFF, 0, 0);
+	f_setmode = psci_call(PSCI_FEATURES_FN, PSCI_SET_SUSPEND_MODE, 0, 0);
+
+	if (f_suspend < 0) {
+		printf("psci: probe: CPU_SUSPEND is NOT supported (%lld, %s) -- idle power-collapse is not on offer here\n",
+		    f_suspend, psci_error(f_suspend));
+	} else {
+		/* PSCI_FEATURES flags for CPU_SUSPEND: bit1 = power_state format (0 original, 1 extended StateID). */
+		printf("psci: probe: CPU_SUSPEND supported, flags 0x%llx -- power_state format: %s StateID\n",
+		    f_suspend, (f_suspend & 2) ? "extended" : "original");
+	}
+	printf("psci: probe: SYSTEM_SUSPEND=%lld (%s), CPU_ON=%lld, CPU_OFF=%lld\n",
+	    f_sysp, f_sysp < 0 ? psci_error(f_sysp) : "supported", f_on, f_off);
+	printf("psci: probe: SET_SUSPEND_MODE=%lld -- OS-initiated mode %s\n",
+	    f_setmode, f_setmode < 0 ? "not available (platform-coordinated only)" : "is available");
+}
+
 /* A processor other than the boot processor says how far it has come. */
 void
 psci_smp_cpu_reached(uint32_t stage)

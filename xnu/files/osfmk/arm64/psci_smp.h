@@ -16,6 +16,7 @@ __BEGIN_DECLS
 #define PSCI_SMP_CPU_OFF        4       /* it has switched itself off, or is about to */
 
 extern void             psci_smp_init(void);
+extern void             psci_smp_probe(void);           /* cpu_psci_probe=1: a read-only look at the firmware's PSCI */
 extern kern_return_t    psci_smp_start_cpu(int cpu);
 extern void             psci_smp_cpu_reached(uint32_t stage);
 extern void             psci_smp_cpu_running(void);

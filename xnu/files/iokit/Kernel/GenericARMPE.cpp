@@ -29,6 +29,7 @@ extern uint32_t processor_avail_count;
 
 /* osfmk/arm64/psci_smp.c and gic_v3_irq.c */
 void psci_smp_init(void);
+void psci_smp_probe(void);
 kern_return_t psci_smp_start_cpu(int cpu);
 void psci_smp_cpu_running(void);
 void psci_smp_cpu_off(void) __dead2;
@@ -254,6 +255,7 @@ GenericARMPE::start(IOService * provider)
 		ml_set_max_cpus(count);
 		if (count > 1) {
 			psci_smp_init();
+			psci_smp_probe();       /* cpu_psci_probe=1: read-only, asks the firmware what PSCI it offers */
 		}
 		/*
 		 * The slower cores (an L2 access penalty, the loader's "small-core") are started 28 seconds
