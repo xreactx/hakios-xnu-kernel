@@ -207,11 +207,74 @@ static _Atomic uint32_t psci_idle_fallbacks;    /* CPU_SUSPEND returned without 
 static int64_t          psci_idle_last_error;
 static uint8_t          psci_idle_collapsed[MAX_CPUS];  /* set across a collapse, for the resume path */
 
+/*
+ * Phase 1 production idle collapse (separate from the self-test above).
+ *   cpu_psci_idle=1       turn it on (0: off, the default)
+ *   cpu_psci_idle_core=C  the one core to collapse in the real idle path (default 1, a big core)
+ */
+#define PSCI_END_OF_ALL_TIME    0xFFFFFFFFFFFFFFFFULL  /* rtclock.h EndOfAllTime: no finite timer pending */
+#define PSCI_PROD_DEFAULT_CORE  1                       /* logical cpu 1 = phys 0x600, a big core that stays online */
+#define PSCI_PROD_LOG_EVERY     512u                    /* throttle the hot-path breadcrumb to the log */
+
+static bool             psci_prod_enabled;              /* cpu_psci_idle=1 (one core) or 2 (all non-boot cores) */
+static bool             psci_prod_all;                  /* cpu_psci_idle=2: every non-boot core, not just one */
+static int              psci_prod_core = PSCI_PROD_DEFAULT_CORE;
+static _Atomic uint32_t psci_prod_suspends;             /* collapses attempted from the real idle path */
+static _Atomic uint32_t psci_prod_fallbacks;            /* CPU_SUSPEND returned without collapsing */
+static _Atomic uint32_t psci_prod_skipped;              /* gated out: a finite timer deadline was pending */
+
+/*
+ * The collapse itself, shared by the self-test and the Phase 1 production path. A powered-down
+ * core loses its caches, so everything it will read on the way back must be in memory first;
+ * 0x40000003 keeps L2 up, so the point of unification is enough (the reset vector reads cpu data
+ * and page tables with its cache off, and those are kept clean by the running cores already).
+ * On success control does NOT return here -- the core warm-boots in arm_init_idle_cpu() ->
+ * cpu_idle_exit(TRUE). It returns only when the firmware did not collapse the core, with the
+ * PSCI status (<= 0); the caller then idles the ordinary way.
+ */
+static int64_t
+psci_cpu_powerdown(int cpu)
+{
+	int64_t status;
+
+	psci_idle_collapsed[cpu] = 1;
+	CleanPoU_Dcache();
+	__builtin_arm_dsb(DSB_SY);
+
+	status = psci_call(PSCI_CPU_SUSPEND, PSCI_IDLE_PD_STATE,
+	    ml_static_vtop((vm_offset_t)&LowResetVectorBase), 0);
+
+	/* Only here if the firmware did NOT power the core down: the call returns in place with an error. */
+	psci_idle_collapsed[cpu] = 0;
+	psci_idle_last_error = status;
+	return status;
+}
+
 void
 psci_smp_idle_selftest_init(void)
 {
-	uint32_t n = 0, c = 0;
+	uint32_t n = 0, c = 0, on = 0;
 
+	/* Production path. cpu_psci_idle=1: one chosen core (Phase 1). cpu_psci_idle=2: all non-boot cores (Phase 2). */
+	if (PE_parse_boot_argn("cpu_psci_idle", &on, sizeof(on)) && on != 0) {
+		uint32_t pc = PSCI_PROD_DEFAULT_CORE;
+
+		if (on >= 2) {
+			psci_prod_all = true;
+			psci_prod_enabled = true;
+			printf("psci: idle power-collapse ON for every non-boot core (CPU_SUSPEND power_state 0x%x), "
+			    "each only when it has no finite timer deadline\n", PSCI_IDLE_PD_STATE);
+		} else if (PE_parse_boot_argn("cpu_psci_idle_core", &pc, sizeof(pc)) && (int)pc == master_cpu) {
+			printf("psci: idle refused: core %u is the boot processor\n", pc);
+		} else {
+			psci_prod_core = (int)pc;
+			psci_prod_enabled = true;
+			printf("psci: idle power-collapse ON for core %d (CPU_SUSPEND power_state 0x%x), "
+			    "only when it has no finite timer deadline\n", psci_prod_core, PSCI_IDLE_PD_STATE);
+		}
+	}
+
+	/* Phase 0 self-test (independent; shares cpu_psci_idle_core only when the production path is off). */
 	if (!PE_parse_boot_argn("cpu_psci_idle_test", &n, sizeof(n)) || n == 0) {
 		return;
 	}
@@ -230,6 +293,56 @@ psci_smp_idle_selftest_init(void)
 		printf("psci: idle self-test armed: %u collapses on core %d (CPU_SUSPEND power_state 0x%x)\n",
 		    psci_idle_test_total, os_atomic_load(&psci_idle_test_core, relaxed), PSCI_IDLE_PD_STATE);
 	}
+}
+
+/*
+ * The real idle path collapses an idle core with CPU_SUSPEND instead of a bare WFI, to cut its
+ * screen-off draw: one chosen core with cpu_psci_idle=1 (Phase 1), or every non-boot core with
+ * cpu_psci_idle=2 (Phase 2). Returns true when it handled the idle (collapsed-and-resumed, or
+ * fell back to WFI itself); false means the caller should do the ordinary WFI.
+ *
+ * It collapses ONLY when the core has no finite timer deadline pending (rtcPop == EndOfAllTime):
+ * a powered-down core loses its per-core architected timer and can be woken only by an interrupt
+ * at its redistributor -- a device IRQ, or the reschedule SGI another core sends (gic_send_sgi) --
+ * so a pending local deadline would simply be missed until some unrelated interrupt arrived. That
+ * same test is the residency gate: with no finite deadline the expected residency is effectively
+ * unbounded, well past this state's ~1.9ms min-residency. A finite deadline falls through to WFI
+ * (a broadcast-timer substitute, needed to collapse with a deadline pending, is a later phase).
+ */
+bool
+psci_smp_idle(int cpu, uint64_t rtcPop)
+{
+	int64_t status;
+	uint32_t n;
+
+	if (!psci_prod_enabled || cpu == master_cpu) {
+		return false;                   /* off, or the boot processor (never collapsed): ordinary WFI */
+	}
+	if (!psci_prod_all && cpu != psci_prod_core) {
+		return false;                   /* single-core mode and not the chosen core: ordinary WFI */
+	}
+	if (rtcPop != PSCI_END_OF_ALL_TIME) {
+		os_atomic_inc(&psci_prod_skipped, relaxed);
+		return false;                   /* a finite deadline we would lose across the power-down: WFI */
+	}
+
+	n = os_atomic_inc_orig(&psci_prod_suspends, relaxed) + 1;
+	if ((n % PSCI_PROD_LOG_EVERY) == 0) {
+		/* A throttled breadcrumb to the log: a climbing count with no faults is the proof it works. */
+		kprintf("psci: idle core %d: suspends=%u resumes=%u fallbacks=%u skipped=%u\n",
+		    cpu, n, os_atomic_load(&psci_idle_resumes, relaxed),
+		    os_atomic_load(&psci_prod_fallbacks, relaxed),
+		    os_atomic_load(&psci_prod_skipped, relaxed));
+	}
+
+	status = psci_cpu_powerdown(cpu);
+
+	/* Only here if it did not collapse: count it and idle the ordinary way. */
+	os_atomic_inc(&psci_prod_fallbacks, relaxed);
+	kprintf("psci: idle core %d CPU_SUSPEND returned %lld (%s) -- did not collapse\n",
+	    cpu, status, psci_error(status));
+	__builtin_arm_wfi();
+	return true;
 }
 
 bool
@@ -272,22 +385,9 @@ psci_smp_idle_collapse(int cpu)
 	kprintf("psci: idle self-test: core %d collapse #%u\n", cpu, done + 1);
 	os_atomic_inc(&psci_idle_suspends, relaxed);
 
-	/*
-	 * A powered-down core loses its caches, so everything it will read on the way back (the flag
-	 * below among it) must be in memory first. 0x40000003 keeps L2 up, so the point of unification
-	 * is enough. The reset vector reads the cpu data and page tables with its own cache off; those
-	 * are cleaned on every CPU_ON already and the running cores keep them clean.
-	 */
-	psci_idle_collapsed[cpu] = 1;
-	CleanPoU_Dcache();
-	__builtin_arm_dsb(DSB_SY);
+	status = psci_cpu_powerdown(cpu);
 
-	status = psci_call(PSCI_CPU_SUSPEND, PSCI_IDLE_PD_STATE,
-	    ml_static_vtop((vm_offset_t)&LowResetVectorBase), 0);
-
-	/* Only here if the firmware did NOT power the core down: the call returns in place with an error. */
-	psci_idle_collapsed[cpu] = 0;
-	psci_idle_last_error = status;
+	/* Only here if the firmware did NOT power the core down: the call returned in place with an error. */
 	os_atomic_inc(&psci_idle_fallbacks, relaxed);
 	kprintf("psci: idle self-test: core %d CPU_SUSPEND returned %lld (%s) -- did not collapse\n",
 	    cpu, status, psci_error(status));

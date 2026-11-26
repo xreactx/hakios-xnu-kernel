@@ -2417,7 +2417,7 @@ index b9549da357b4..cca31ea32502 100644
  #else
  #define __USES_V_CRYPTO_INTRINSICS 0
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
-index 94e91306b143..c4e4c6d00190 100644
+index 94e91306b143..6b85e69782d7 100644
 --- a/osfmk/arm64/cpu.c
 +++ b/osfmk/arm64/cpu.c
 @@ -41,6 +41,9 @@
@@ -2444,19 +2444,22 @@ index 94e91306b143..c4e4c6d00190 100644
  		platform_cache_idle_enter();
  #endif
  
-@@ -587,6 +595,17 @@ cpu_idle(void)
+@@ -587,6 +595,20 @@ cpu_idle(void)
  		__builtin_arm_dsb(DSB_SY);
  #if HAS_RETENTION_STATE
  		arm64_retention_wfi();
 +#elif defined(GENERIC_PSCI_SMP)
 +		/*
-+		 * HakiOS CPU idle power-collapse self-test (Phase 0). On the core under test this
-+		 * collapses it with PSCI CPU_SUSPEND instead of a bare WFI and warm-boots it back
-+		 * through the reset vector; on every other core, and once the test is done, it does
-+		 * nothing and we fall through to the ordinary WFI. On a successful collapse control
-+		 * does not return here: the core resumes in arm_init_idle_cpu()/cpu_idle_exit().
++		 * HakiOS CPU idle power-collapse. Both paths are off by default and collapse the core
++		 * with PSCI CPU_SUSPEND instead of a bare WFI, warm-booting it back through the reset
++		 * vector (on a successful collapse control does not return here: the core resumes in
++		 * arm_init_idle_cpu()/cpu_idle_exit()). psci_smp_idle_collapse() is the Phase 0 bounded
++		 * self-test on one core; psci_smp_idle() is the Phase 1 production path that collapses
++		 * one chosen big core whenever it idles with no finite timer deadline pending. On every
++		 * other core, and when both are off, we fall through to the ordinary WFI.
 +		 */
-+		if (!psci_smp_idle_collapse(cpu_data_ptr->cpu_number)) {
++		if (!psci_smp_idle_collapse(cpu_data_ptr->cpu_number) &&           /* Phase 0 self-test, default off */
++		    !psci_smp_idle(cpu_data_ptr->cpu_number, cpu_data_ptr->rtcPop)) {/* Phase 1 production, default off */
 +			__builtin_arm_wfi();
 +		}
  #else

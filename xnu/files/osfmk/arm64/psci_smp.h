@@ -19,9 +19,10 @@ extern void             psci_smp_init(void);
 extern void             psci_smp_probe(void);           /* cpu_psci_probe=1: a read-only look at the firmware's PSCI */
 extern kern_return_t    psci_smp_start_cpu(int cpu);
 
-/* CPU idle power-collapse self-test (Phase 0): cpu_psci_idle_test=N, cpu_psci_idle_core=C. See psci_smp.c. */
+/* CPU idle power-collapse (Phase 0 self-test cpu_psci_idle_test=N; Phase 1 cpu_psci_idle=1, cpu_psci_idle_core=C). See psci_smp.c. */
 extern void             psci_smp_idle_selftest_init(void);      /* boot processor, once: parse the boot-args */
-extern bool             psci_smp_idle_collapse(int cpu);        /* cpu_idle(): true if it handled the idle (collapsed or fell back) */
+extern bool             psci_smp_idle_collapse(int cpu);        /* cpu_idle(): Phase 0 self-test; true if it handled the idle */
+extern bool             psci_smp_idle(int cpu, uint64_t rtcPop);/* cpu_idle(): Phase 1 production; true if it handled the idle */
 extern void             psci_smp_idle_resumed(int cpu);         /* the warm-boot path (arm_init_idle_cpu) */
 extern void             psci_smp_cpu_reached(uint32_t stage);
 extern void             psci_smp_cpu_running(void);
