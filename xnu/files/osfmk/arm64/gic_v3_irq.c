@@ -517,4 +517,44 @@ gic_v3_irq_cpu_init(void)
 	    (void *)gicd_base, cpu, (void *)gicr, gic_intid_vtimer);
 }
 
+/*
+ * Bring the per-core GIC interface back after a PSCI power-collapse (psci_smp_idle_resumed()). A
+ * core that was powered down loses its system-register CPU interface, and the redistributor has
+ * had ProcessorSleep set for it by the hardware; the distributor and the redistributor's own state
+ * (which PPIs/SGIs are enabled) outlive the core, so only the core's side is restored here. This
+ * is the subset of gic_v3_irq_cpu_init() that the fresh-core bring-up does but the idle-resume
+ * path does not -- and that one would skip entirely (gicr_cpu_base[cpu] is already set).
+ */
+void
+gic_v3_irq_cpu_resume(void)
+{
+	int cpu = cpu_number();
+	vm_offset_t gicr = gicr_cpu_base[cpu];
+	uint32_t waker;
+
+	if (gicr == 0) {
+		return;         /* this core never initialised its interface: nothing to restore */
+	}
+
+	/* System-register CPU interface */
+	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | 1);
+	__builtin_arm_isb(ISB_SY);
+
+	/* Wake the redistributor: the hardware set ProcessorSleep when the core went down */
+	waker = gic_read32(gicr + GICR_WAKER);
+	if (waker & GICR_WAKER_PROCSLEEP) {
+		gic_write32(gicr + GICR_WAKER, waker & ~GICR_WAKER_PROCSLEEP);
+		while (gic_read32(gicr + GICR_WAKER) & GICR_WAKER_CHILDASLEEP) {
+			/* spin until the redistributor is awake */
+		}
+	}
+
+	/* CPU interface: accept all priorities, no preemption grouping, nothing active, Group 1 on */
+	__builtin_arm_wsr64("ICC_AP1R0_EL1", 0);
+	__builtin_arm_wsr64("ICC_PMR_EL1", 0xff);
+	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
+	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+	__builtin_arm_isb(ISB_SY);
+}
+
 #endif /* GENERIC_GIC_V3_IRQ */

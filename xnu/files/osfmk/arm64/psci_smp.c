@@ -180,6 +180,132 @@ psci_smp_probe(void)
 	    f_setmode, f_setmode < 0 ? "not available (platform-coordinated only)" : "is available");
 }
 
+/*
+ * Phase 0 self-test for CPU idle power-collapse. On one chosen core, a bounded number of times,
+ * the idle path collapses the core with PSCI CPU_SUSPEND (power-down, 0x40000003 -- the core only,
+ * L2 and the cluster stay up) in place of a bare WFI, and the core warm-boots back through the
+ * reset vector: reset_vector -> resume_idle_cpu -> arm_init_idle_cpu -> cpu_idle_exit, with the
+ * idle thread's registers reloaded from its kernel stack (Idle_load_context). It proves that
+ * resume path end to end before the hot idle path is ever changed for real.
+ *
+ * Off by default, never the boot processor (losing that one would take the log with it), and it
+ * stops after N. The core prints a line before each collapse, so a resume that never comes back
+ * leaves the attempt that hung as the last line in the log; seeing collapse #k+1 after #k is
+ * itself the proof that resume #k succeeded (the core got back to the idle loop to ask again).
+ *   cpu_psci_idle_test=N    collapse N times on the chosen core, then stop (0: off)
+ *   cpu_psci_idle_core=C    the core to test (default 1; refused if it is the boot processor)
+ */
+#define PSCI_CPU_SUSPEND        0xC4000001u
+#define PSCI_IDLE_PD_STATE      0x40000003u     /* sdm845 device tree: per-core power-down */
+
+static uint32_t         psci_idle_test_total;   /* N from the boot-arg; 0 = the self-test is off */
+static _Atomic int      psci_idle_test_core = -1;/* the core to test; -1 = the first non-boot core that deep-idles claims it */
+static bool             psci_idle_test_reported;
+static _Atomic uint32_t psci_idle_suspends;     /* collapses attempted */
+static _Atomic uint32_t psci_idle_resumes;      /* warm-boots completed */
+static _Atomic uint32_t psci_idle_fallbacks;    /* CPU_SUSPEND returned without collapsing */
+static int64_t          psci_idle_last_error;
+static uint8_t          psci_idle_collapsed[MAX_CPUS];  /* set across a collapse, for the resume path */
+
+void
+psci_smp_idle_selftest_init(void)
+{
+	uint32_t n = 0, c = 0;
+
+	if (!PE_parse_boot_argn("cpu_psci_idle_test", &n, sizeof(n)) || n == 0) {
+		return;
+	}
+	if (PE_parse_boot_argn("cpu_psci_idle_core", &c, sizeof(c))) {
+		if ((int)c == master_cpu) {
+			printf("psci: idle self-test refused: core %u is the boot processor\n", c);
+			return;
+		}
+		os_atomic_store(&psci_idle_test_core, (int)c, relaxed);
+	}
+	psci_idle_test_total = n;
+	if (os_atomic_load(&psci_idle_test_core, relaxed) < 0) {
+		printf("psci: idle self-test armed: %u collapses on the first non-boot core to deep-idle "
+		    "(CPU_SUSPEND power_state 0x%x)\n", psci_idle_test_total, PSCI_IDLE_PD_STATE);
+	} else {
+		printf("psci: idle self-test armed: %u collapses on core %d (CPU_SUSPEND power_state 0x%x)\n",
+		    psci_idle_test_total, os_atomic_load(&psci_idle_test_core, relaxed), PSCI_IDLE_PD_STATE);
+	}
+}
+
+bool
+psci_smp_idle_collapse(int cpu)
+{
+	uint32_t done;
+	int64_t status;
+	int target;
+
+	if (psci_idle_test_total == 0) {
+		return false;                   /* the self-test is off */
+	}
+	target = os_atomic_load(&psci_idle_test_core, relaxed);
+	if (target < 0) {
+		/* Auto mode: the first non-boot core to reach a deep idle claims the whole test. */
+		if (cpu == master_cpu) {
+			return false;
+		}
+		if (os_atomic_cmpxchg(&psci_idle_test_core, -1, cpu, acq_rel)) {
+			kprintf("psci: idle self-test: core %d claimed the test\n", cpu);
+			target = cpu;
+		} else {
+			target = os_atomic_load(&psci_idle_test_core, relaxed);
+		}
+	}
+	if (cpu != target) {
+		return false;                   /* not the core under test: the caller does a normal WFI */
+	}
+	done = os_atomic_load(&psci_idle_suspends, relaxed);
+	if (done >= psci_idle_test_total) {
+		if (!psci_idle_test_reported) {
+			psci_idle_test_reported = true;
+			kprintf("psci: idle self-test DONE on core %d: suspends=%u resumes=%u fallbacks=%u last_error=%lld\n",
+			    cpu, done, os_atomic_load(&psci_idle_resumes, relaxed),
+			    os_atomic_load(&psci_idle_fallbacks, relaxed), psci_idle_last_error);
+		}
+		return false;                   /* finished: a normal WFI from now on */
+	}
+
+	kprintf("psci: idle self-test: core %d collapse #%u\n", cpu, done + 1);
+	os_atomic_inc(&psci_idle_suspends, relaxed);
+
+	/*
+	 * A powered-down core loses its caches, so everything it will read on the way back (the flag
+	 * below among it) must be in memory first. 0x40000003 keeps L2 up, so the point of unification
+	 * is enough. The reset vector reads the cpu data and page tables with its own cache off; those
+	 * are cleaned on every CPU_ON already and the running cores keep them clean.
+	 */
+	psci_idle_collapsed[cpu] = 1;
+	CleanPoU_Dcache();
+	__builtin_arm_dsb(DSB_SY);
+
+	status = psci_call(PSCI_CPU_SUSPEND, PSCI_IDLE_PD_STATE,
+	    ml_static_vtop((vm_offset_t)&LowResetVectorBase), 0);
+
+	/* Only here if the firmware did NOT power the core down: the call returns in place with an error. */
+	psci_idle_collapsed[cpu] = 0;
+	psci_idle_last_error = status;
+	os_atomic_inc(&psci_idle_fallbacks, relaxed);
+	kprintf("psci: idle self-test: core %d CPU_SUSPEND returned %lld (%s) -- did not collapse\n",
+	    cpu, status, psci_error(status));
+	__builtin_arm_wfi();                    /* idle the ordinary way instead */
+	return true;
+}
+
+void
+psci_smp_idle_resumed(int cpu)
+{
+	if (cpu < 0 || cpu >= MAX_CPUS || !psci_idle_collapsed[cpu]) {
+		return;                         /* not a core coming back from a power-collapse */
+	}
+	psci_idle_collapsed[cpu] = 0;
+	gic_v3_irq_cpu_resume();                /* the GIC CPU interface is gone; bring it back before anything needs it */
+	os_atomic_inc(&psci_idle_resumes, relaxed);
+}
+
 /* A processor other than the boot processor says how far it has come. */
 void
 psci_smp_cpu_reached(uint32_t stage)

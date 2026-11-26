@@ -2118,7 +2118,7 @@ index 0316792a3f42..b9c195b09cd1 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..f91095c98d26 100644
+index e26a1d70f470..4c1f71a59a43 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -73,6 +73,9 @@
@@ -2277,6 +2277,22 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
+@@ -821,6 +854,15 @@ arm_init_idle_cpu(
+ 		arm_debug_set(NULL);
+ 	}
+ 
++#if defined(GENERIC_PSCI_SMP)
++	/*
++	 * A core coming back from a PSCI power-collapse (the idle self-test) has lost its GIC CPU
++	 * interface; restore it before the timer is re-enabled and interrupts are wanted again.
++	 * On any other wake this does nothing.
++	 */
++	psci_smp_idle_resumed(cpu_data_ptr->cpu_number);
++#endif
++
+ 	fiq_context_init(FALSE);
+ 
+ 	cpu_idle_exit(TRUE);
 diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
 index 39daaf8db949..64ceb1a5f201 100644
 --- a/osfmk/arm/model_dep.c
@@ -2401,10 +2417,20 @@ index b9549da357b4..cca31ea32502 100644
  #else
  #define __USES_V_CRYPTO_INTRINSICS 0
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
-index 94e91306b143..0ec1323086b7 100644
+index 94e91306b143..c4e4c6d00190 100644
 --- a/osfmk/arm64/cpu.c
 +++ b/osfmk/arm64/cpu.c
-@@ -568,7 +568,12 @@ cpu_idle(void)
+@@ -41,6 +41,9 @@
+ #include <arm/cpu_data.h>
+ #include <arm/cpuid.h>
+ #include <arm/caches_internal.h>
++#if defined(GENERIC_PSCI_SMP)
++#include <arm64/psci_smp.h>
++#endif
+ #include <arm/cpu_data_internal.h>
+ #include <arm/cpu_internal.h>
+ #include <arm/misc_protos.h>
+@@ -568,7 +571,12 @@ cpu_idle(void)
  #endif /* MONOTONIC */
  
  	if (wfi) {
@@ -2418,6 +2444,24 @@ index 94e91306b143..0ec1323086b7 100644
  		platform_cache_idle_enter();
  #endif
  
+@@ -587,6 +595,17 @@ cpu_idle(void)
+ 		__builtin_arm_dsb(DSB_SY);
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
++#elif defined(GENERIC_PSCI_SMP)
++		/*
++		 * HakiOS CPU idle power-collapse self-test (Phase 0). On the core under test this
++		 * collapses it with PSCI CPU_SUSPEND instead of a bare WFI and warm-boots it back
++		 * through the reset vector; on every other core, and once the test is done, it does
++		 * nothing and we fall through to the ordinary WFI. On a successful collapse control
++		 * does not return here: the core resumes in arm_init_idle_cpu()/cpu_idle_exit().
++		 */
++		if (!psci_smp_idle_collapse(cpu_data_ptr->cpu_number)) {
++			__builtin_arm_wfi();
++		}
+ #else
+ 		__builtin_arm_wfi();
+ #endif
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
 index e76e7e70ab9c..828a51171c7e 100644
 --- a/osfmk/arm64/machine_routines.c
