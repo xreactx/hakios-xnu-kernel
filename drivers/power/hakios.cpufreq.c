@@ -743,6 +743,146 @@ ddr_later_thread(__unused void *arg, __unused wait_result_t wr)
 	ddr_raise();
 }
 
+/*
+ * Stage 0 read-only probe for APSS cluster/system power-collapse + RPMh sleep (screen-off power:
+ * the ~760mA is the apps subsystem never entering RPMh sleep, so cx/mx/ddr stay at active corners).
+ * Boot-arg cpu_psci_cluster_probe=1. It CHANGES NOTHING -- it only reads and reports what decides
+ * whether a cluster collapse would drop the rails:
+ *   - the apps_rsc SLEEP (slot sets 2..4) and WAKE (5..7) command slots: what the boot firmware
+ *     pre-programmed RPMh to vote when the cluster goes down, and to restore on the way back;
+ *   - the command database's resources by name/type/address, so a slot's address reads as a rail
+ *     (cx, mx, ebi/ddr, ...);
+ *   - the SoC sleep statistics (aosd/cxsd/ddr counts) in the always-on processor's message RAM --
+ *     the direct measure of whether the SoC ever deep-sleeps (the baseline here, the success metric
+ *     for Stage 1). Output goes through tell() -> the loader log -> logdump; run it tethered
+ *     (the counts/slots are set at boot, well before the ~30s userland launchd panic).
+ */
+#define SLEEP_STATS_PHYS        0x0c3f0000UL    /* sdm845 AOP MSGRAM rpmh sleep-stats; = soc_aoss (0xc300000) + 0xf0000 */
+#define SLEEP_STATS_SIZE        0x1000UL
+
+static void
+cmd_db_resources(void)
+{
+	const struct cmd_db_header *db = (const struct cmd_db_header *)ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);
+
+	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
+		tell("cluster-probe: no command database at %#lx\n", (unsigned long)CMD_DB_PHYS);
+		return;
+	}
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slave = &db->slave[s];
+		const struct cmd_db_entry *entry;
+
+		if (slave->count == 0 || slave->count > 512 || slave->header_offset >= CMD_DB_SIZE - 0x1000) {
+			continue;
+		}
+		entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
+		for (unsigned i = 0; i < slave->count; i++) {
+			char name[9] = { 0 };
+
+			memcpy(name, entry[i].id, 8);
+			tell("cluster-probe: resource %-8s type %u address %#x\n", name, slave->id, entry[i].address);
+		}
+	}
+}
+
+static void
+cluster_sleep_probe(void)
+{
+	vm_offset_t rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	volatile uint32_t *stats;
+
+	tell("cluster-probe: apps_rsc %#lx all command slots (0,1 active / 2..4 sleep / 5..7 wake / 8 control) --\n", (unsigned long)RSC_PHYS);
+	for (unsigned t = 0; t < RSC_TCS_COUNT; t++) {
+		uint32_t enabled = *(volatile uint32_t *)(rsc + RSC_TCS(t, 0x1c));
+
+		for (unsigned c = 0; c < RSC_CMDS; c++) {
+			uint32_t address = *(volatile uint32_t *)(rsc + RSC_TCS(t, 0x34 + 20 * c));
+			uint32_t data = *(volatile uint32_t *)(rsc + RSC_TCS(t, 0x38 + 20 * c));
+
+			if (address == 0 && data == 0) {
+				continue;
+			}
+			tell("cluster-probe: %s slot %u cmd %u%s: address %#x data %#x\n",
+			    t < 2 ? "ACTIVE" : t < 5 ? "SLEEP" : t < 8 ? "WAKE" : "control", t, c,
+			    enabled & (1u << c) ? " (on)" : "", address, data);
+		}
+	}
+
+	cmd_db_resources();
+
+	/* Raw window so the real aosd/cxsd/ddr layout can be located ("aosd"/"cxsd" strings, then counts). */
+	stats = (volatile uint32_t *)ml_io_map(SLEEP_STATS_PHYS, SLEEP_STATS_SIZE);
+	tell("cluster-probe: sleep-stats raw window at %#lx --\n", SLEEP_STATS_PHYS);
+	for (unsigned i = 0; i < 64; i += 4) {
+		tell("cluster-probe: +%#05x: %08x %08x %08x %08x\n",
+		    i * 4, stats[i], stats[i + 1], stats[i + 2], stats[i + 3]);
+	}
+}
+
+/*
+ * Stage A of APSS RPMh sleep (screen-off power). Boot-arg cpu_rpmh_sleep=1. Programs the apps_rsc
+ * SLEEP (slot set 2) and WAKE (slot set 5) command slots -- found empty by the Stage 0 probe,
+ * because programming them is the OS's job (Linux: rpmh_flush) and HakiOS never did it. This stage
+ * programs a NULL set: SLEEP == WAKE == a copy of the current ACTIVE votes (slot 0). It is INERT at
+ * runtime -- the RSC applies the sleep/wake sets only on a cluster/system power-collapse, which
+ * HakiOS does not yet do (that is Stage B) -- so even when Stage B later triggers them the rails do
+ * not change, letting the collapse+wake path be tested apart from the vote-lowering (Stage C). This
+ * stage only reads slot 0 and writes the (unused) slots 2 and 5, then reads them back to verify.
+ */
+static void
+rpmh_tcs_write(vm_offset_t rsc, unsigned slot, const uint32_t *msgid, const uint32_t *addr, const uint32_t *data, uint32_t mask, unsigned n)
+{
+	for (unsigned c = 0; c < n; c++) {
+		*(volatile uint32_t *)(rsc + RSC_TCS(slot, 0x30 + 20 * c)) = msgid[c];
+		*(volatile uint32_t *)(rsc + RSC_TCS(slot, 0x34 + 20 * c)) = addr[c];
+		*(volatile uint32_t *)(rsc + RSC_TCS(slot, 0x38 + 20 * c)) = data[c];
+	}
+	*(volatile uint32_t *)(rsc + RSC_TCS(slot, 0x1c)) = mask;       /* which commands of this slot set are valid (no AMC trigger: the HW applies them on power-collapse) */
+}
+
+static void
+rpmh_sleep_program(void)
+{
+	vm_offset_t rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	uint32_t msgid[RSC_CMDS], addr[RSC_CMDS], data[RSC_CMDS], mask = 0;
+	unsigned n = 0;
+
+	/* The processors' current ACTIVE votes (slot set 0): what WAKE must restore, and what SLEEP copies for now. */
+	for (unsigned c = 0; c < RSC_CMDS; c++) {
+		uint32_t a = *(volatile uint32_t *)(rsc + RSC_TCS(0, 0x34 + 20 * c));
+		uint32_t d = *(volatile uint32_t *)(rsc + RSC_TCS(0, 0x38 + 20 * c));
+
+		if (a == 0 && d == 0) {
+			continue;
+		}
+		msgid[n] = *(volatile uint32_t *)(rsc + RSC_TCS(0, 0x30 + 20 * c));
+		addr[n] = a;
+		data[n] = d;
+		mask |= 1u << n;
+		n++;
+	}
+	if (n == 0) {
+		tell("rpmh-sleep: no active votes in slot 0 to copy; nothing programmed\n");
+		return;
+	}
+
+	rpmh_tcs_write(rsc, 2, msgid, addr, data, mask, n);    /* SLEEP = copy of active (null set) */
+	rpmh_tcs_write(rsc, 5, msgid, addr, data, mask, n);    /* WAKE  = copy of active (restore)  */
+	tell("rpmh-sleep: programmed %u command(s) into SLEEP (slot 2) + WAKE (slot 5), mask %#x -- NULL set (sleep==active), inert until a collapse\n", n, mask);
+
+	for (unsigned slot = 2; slot <= 5; slot += 3) {
+		tell("rpmh-sleep: readback %s slot %u enable %#x\n", slot == 2 ? "SLEEP" : "WAKE", slot,
+		    *(volatile uint32_t *)(rsc + RSC_TCS(slot, 0x1c)));
+		for (unsigned c = 0; c < n; c++) {
+			tell("rpmh-sleep:   slot %u cmd %u: msgid %#x addr %#x data %#x\n", slot, c,
+			    *(volatile uint32_t *)(rsc + RSC_TCS(slot, 0x30 + 20 * c)),
+			    *(volatile uint32_t *)(rsc + RSC_TCS(slot, 0x34 + 20 * c)),
+			    *(volatile uint32_t *)(rsc + RSC_TCS(slot, 0x38 + 20 * c)));
+		}
+	}
+}
+
 void
 hakios_cpufreq_init(void)
 {
@@ -750,6 +890,28 @@ hakios_cpufreq_init(void)
 	uint32_t enabled = 0, membench = 0, cores[EPSS_DOMAINS] = { 0 }, before, here;
 
 	load_start();
+
+	{
+		uint32_t probe = 0, sleep = 0;
+		vm_offset_t phys = 0;
+
+		if ((PE_parse_boot_argn("cpu_psci_cluster_probe", &probe, sizeof(probe)) && probe != 0) ||
+		    (PE_parse_boot_argn("cpu_rpmh_sleep", &sleep, sizeof(sleep)) && sleep != 0)) {
+			if (PE_parse_boot_argn("soc_cmd_db", &phys, sizeof(phys)) && phys != 0) {
+				cmd_db_phys = phys;
+			}
+			phys = 0;
+			if (PE_parse_boot_argn("soc_rsc", &phys, sizeof(phys)) && phys != 0) {
+				rsc_phys = phys;
+			}
+			if (probe != 0) {
+				cluster_sleep_probe();
+			}
+			if (sleep != 0) {
+				rpmh_sleep_program();
+			}
+		}
+	}
 	enabled = 2;
 	PE_parse_boot_argn("ddr", &enabled, sizeof(enabled));
 	if (enabled == 1) {
