@@ -263,6 +263,75 @@ psci_cpu_powerdown(int cpu, uint32_t state)
 	return status;
 }
 
+/*
+ * Broadcast / wake timer for the deep (local-timer-stop) states. The per-core architected timers
+ * are lost when a core collapses to 0x40000004 or the cluster state, so the system needs an
+ * always-on timer to wake it. SDM845's memory-mapped timer (timer@0x17c90000) frame 0 at
+ * 0x17ca0000 is in an always-on domain and survives the collapse; its physical compare, armed
+ * before the last core goes down, fires GIC SPI 7 (intid 39) to wake the system through the
+ * (still-powered at cluster level) GIC. The frame shares the system counter, so a mach_absolute
+ * deadline (what rtcPop holds) is directly comparable -- here we arm a short relative wake to
+ * prove the mechanism before wiring the real deadline.
+ */
+#define BCAST_TIMER_PHYS        0x17ca0000u
+#define BCAST_TIMER_SIZE        0x1000u
+#define BCAST_TIMER_SPI         (32u + 7u)      /* sdm845 dtsi: frame@0x17ca0000 physical-timer interrupt = GIC_SPI 7 */
+#define BCAST_CNTPCT_LO         0x00
+#define BCAST_CNTPCT_HI         0x04
+#define BCAST_CNTFRQ            0x10
+#define BCAST_CNTP_CVAL_LO      0x20
+#define BCAST_CNTP_CVAL_HI      0x24
+#define BCAST_CNTP_CTL          0x2c            /* bit0 enable, bit1 imask */
+
+static vm_offset_t      psci_bcast_base;
+static uint32_t         psci_bcast_freq;
+
+static void
+psci_bcast_disarm(void)
+{
+	if (psci_bcast_base != 0) {
+		*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTP_CTL) = 0;
+		__builtin_arm_dsb(DSB_SY);
+	}
+}
+
+static void
+psci_bcast_arm(uint64_t ticks)
+{
+	uint64_t now;
+
+	if (psci_bcast_base == 0) {
+		return;
+	}
+	now = ((uint64_t)*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTPCT_HI) << 32) |
+	    *(volatile uint32_t *)(psci_bcast_base + BCAST_CNTPCT_LO);
+	now += ticks;
+	*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTP_CVAL_HI) = (uint32_t)(now >> 32);
+	*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTP_CVAL_LO) = (uint32_t)now;
+	*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTP_CTL) = 1;   /* enable, unmasked */
+	__builtin_arm_dsb(DSB_SY);
+}
+
+static void
+psci_bcast_wake(void *context __unused, uint32_t intid __unused)
+{
+	psci_bcast_disarm();            /* the wake has happened; stop it re-firing */
+}
+
+static void
+psci_bcast_init(void)
+{
+	psci_bcast_base = ml_io_map(BCAST_TIMER_PHYS, BCAST_TIMER_SIZE);
+	psci_bcast_disarm();
+	psci_bcast_freq = *(volatile uint32_t *)(psci_bcast_base + BCAST_CNTFRQ);
+	if (gic_v3_spi_attach(BCAST_TIMER_SPI, false, psci_bcast_wake, NULL) != KERN_SUCCESS) {
+		printf("psci: broadcast timer: could not attach GIC SPI %u -- deep-idle wake unavailable\n", BCAST_TIMER_SPI);
+		psci_bcast_base = 0;
+		return;
+	}
+	printf("psci: broadcast timer at %#x, %u Hz, wake on GIC SPI %u\n", BCAST_TIMER_PHYS, psci_bcast_freq, BCAST_TIMER_SPI);
+}
+
 void
 psci_smp_idle_selftest_init(void)
 {
@@ -275,21 +344,29 @@ psci_smp_idle_selftest_init(void)
 		if (on >= 3) {
 			int64_t m;
 
-			psci_prod_all = true;
-			psci_prod_cluster = true;
-			psci_prod_incl_boot = true;
-			psci_prod_enabled = true;
-			if (on >= 4) {
-				psci_prod_force = true;         /* ignore the timer gate: force the collapse even with a pending deadline */
-			}
 			/* OS-initiated mode: without it the firmware denies a domain/cluster state request. */
 			m = psci_call(PSCI_SET_SUSPEND_MODE, PSCI_SUSPEND_MODE_OSI, 0, 0);
 			psci_osi_enabled = (m == 0);
 			printf("psci: SET_SUSPEND_MODE(OS-initiated) -> %lld (%s)\n",
 			    m, psci_osi_enabled ? "OSI on" : "stayed platform-coordinated");
+			psci_bcast_init();                      /* the always-on wake for the deep states */
+
+			/*
+			 * Turn collapse ON only now that OSI and the broadcast timer are ready: set the
+			 * flags, publish them, and set the gate (psci_prod_enabled) LAST -- otherwise a core
+			 * could enter the collapse during this setup, before a wake exists, and hang.
+			 */
+			psci_prod_all = true;
+			psci_prod_cluster = true;
+			psci_prod_incl_boot = true;
+			if (on >= 4) {
+				psci_prod_force = true;         /* ignore the timer gate: force the collapse even with a pending deadline */
+			}
 			printf("psci: idle power-collapse ON for EVERY core incl boot; last-man-down asks for the cluster "
 			    "state (0x%x), the rest for the per-core rail state (0x%x)%s\n",
 			    PSCI_CLUSTER_PD_STATE, PSCI_PERCORE_RAIL_STATE, psci_prod_force ? ", FORCED (ignores pending timers)" : "");
+			__builtin_arm_dsb(DSB_SY);
+			psci_prod_enabled = true;
 		} else if (on >= 2) {
 			psci_prod_all = true;
 			psci_prod_enabled = true;
@@ -380,8 +457,17 @@ psci_smp_idle(int cpu, uint64_t rtcPop)
 		 */
 		uint32_t num = (uint32_t)ml_get_max_cpu_number() + 1;
 		uint32_t down = os_atomic_inc_orig(&psci_cpus_down, relaxed) + 1;
+		bool last = down >= num;
 
-		status = psci_cpu_powerdown(cpu, down >= num ? PSCI_CLUSTER_PD_STATE : PSCI_PERCORE_RAIL_STATE);
+		if (last) {
+			/* The whole APSS is going down: arm the always-on broadcast timer so the system has a
+			 * wake (the per-core timers are gone). A short relative wake for now, to prove it. */
+			psci_bcast_arm(psci_bcast_freq ? psci_bcast_freq / 10 : 0);     /* ~100 ms */
+		}
+		status = psci_cpu_powerdown(cpu, last ? PSCI_CLUSTER_PD_STATE : PSCI_PERCORE_RAIL_STATE);
+		if (last) {
+			psci_bcast_disarm();                    /* only reached if it did NOT collapse */
+		}
 		os_atomic_dec(&psci_cpus_down, relaxed);        /* only reached if it did NOT collapse (resume does the decrement otherwise) */
 	} else {
 		status = psci_cpu_powerdown(cpu, PSCI_IDLE_PD_STATE);
@@ -454,6 +540,7 @@ psci_smp_idle_resumed(int cpu)
 	psci_idle_collapsed[cpu] = 0;
 	if (psci_prod_cluster) {
 		os_atomic_dec(&psci_cpus_down, relaxed);        /* this core is back up: balance the last-man-down count */
+		psci_bcast_disarm();                            /* woke (by the broadcast timer or anything else): stop it */
 	}
 	gic_v3_irq_cpu_resume();                /* the GIC CPU interface is gone; bring it back before anything needs it */
 	os_atomic_inc(&psci_idle_resumes, relaxed);

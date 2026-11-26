@@ -37,6 +37,7 @@ extern void             gic_v3_irq_signal_stop(uint32_t phys_id);
 extern void             gic_v3_irq_quiesce(void);
 extern void             gic_v3_irq_cpu_shutdown(void);
 extern void             gic_v3_irq_cpu_resume(void);    /* restore the per-core CPU interface after a power-collapse */
+extern kern_return_t    gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
 
 __END_DECLS
 
