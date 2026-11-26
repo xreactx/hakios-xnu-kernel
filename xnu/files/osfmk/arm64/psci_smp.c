@@ -197,7 +197,7 @@ psci_smp_probe(void)
  */
 #define PSCI_CPU_SUSPEND        0xC4000001u
 #define PSCI_IDLE_PD_STATE      0x40000003u     /* sdm845 device tree: per-core power-down */
-#define PSCI_CLUSTER_PD_STATE   0x400000F4u     /* sdm845 device tree: cluster/system domain state (last-man-down; the RSC applies its sleep votes) */
+#define PSCI_CLUSTER_PD_STATE   0x4100c244u     /* sdm845 mainline dtsi: cluster-sleep-0 domain state (last-man-down; apps_rsc is in cluster_pd, so the RSC applies its sleep votes) */
 
 static uint32_t         psci_idle_test_total;   /* N from the boot-arg; 0 = the self-test is off */
 static _Atomic int      psci_idle_test_core = -1;/* the core to test; -1 = the first non-boot core that deep-idles claims it */
