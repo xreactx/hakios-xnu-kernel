@@ -848,11 +848,16 @@ rpmh_sleep_program(void)
 	uint32_t msgid[RSC_CMDS], addr[RSC_CMDS], data[RSC_CMDS], sleep_data[RSC_CMDS], mask = 0;
 	unsigned n = 0;
 
-	/* The processors' current ACTIVE votes (slot set 0): WAKE restores these; SLEEP releases them
-	 * (data 0) so that, once the cluster is down, RPMh/AOP can drop the shared rails -- this is what
-	 * the downstream rpmh_flush() does (sleep_val = released, wake_val = the active vote). These are
-	 * the apps BCM bus/DDR-bandwidth votes; with the CPUs collapsed the apps needs no bandwidth, so
-	 * releasing them is correct and lets the aggregate reach cxsd/aosd. */
+	/*
+	 * The processors' current ACTIVE votes (slot set 0): WAKE restores these; SLEEP releases them so
+	 * that, once the cluster is down, RPMh/AOP can drop the shared NoC/rails and reach cxsd/aosd
+	 * (what the downstream rpmh_flush does). On this board the apps votes are interconnect BCMs
+	 * (CN0/SN0/SN3/SN11). Each vote is a BCM TCS command: bit30 = COMMIT, bit29 = VALID, and the
+	 * bandwidth (vote_x[27:14], vote_y[13:0]) in the low bits. A proper "release" requests ZERO
+	 * bandwidth while keeping the command VALID -- NOT a fully-zeroed word, which clears the valid
+	 * bit, malforms the BCM command, and browns out the NoC (seen as a Qualcomm ramdump). So the
+	 * sleep vote keeps the commit/valid flags (data & 0x60000000) and zeroes the bandwidth.
+	 */
 	for (unsigned c = 0; c < RSC_CMDS; c++) {
 		uint32_t a = *(volatile uint32_t *)(rsc + RSC_TCS(0, 0x34 + 20 * c));
 		uint32_t d = *(volatile uint32_t *)(rsc + RSC_TCS(0, 0x38 + 20 * c));
@@ -862,8 +867,8 @@ rpmh_sleep_program(void)
 		}
 		msgid[n] = *(volatile uint32_t *)(rsc + RSC_TCS(0, 0x30 + 20 * c));
 		addr[n] = a;
-		data[n] = d;               /* WAKE: restore the active vote */
-		sleep_data[n] = 0;         /* SLEEP: release the vote */
+		data[n] = d;                       /* WAKE: restore the active vote */
+		sleep_data[n] = d & 0x60000000u;   /* SLEEP: keep COMMIT(bit30)+VALID(bit29), request 0 bandwidth */
 		mask |= 1u << n;
 		n++;
 	}
