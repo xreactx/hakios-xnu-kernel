@@ -845,10 +845,14 @@ static void
 rpmh_sleep_program(void)
 {
 	vm_offset_t rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
-	uint32_t msgid[RSC_CMDS], addr[RSC_CMDS], data[RSC_CMDS], mask = 0;
+	uint32_t msgid[RSC_CMDS], addr[RSC_CMDS], data[RSC_CMDS], sleep_data[RSC_CMDS], mask = 0;
 	unsigned n = 0;
 
-	/* The processors' current ACTIVE votes (slot set 0): what WAKE must restore, and what SLEEP copies for now. */
+	/* The processors' current ACTIVE votes (slot set 0): WAKE restores these; SLEEP releases them
+	 * (data 0) so that, once the cluster is down, RPMh/AOP can drop the shared rails -- this is what
+	 * the downstream rpmh_flush() does (sleep_val = released, wake_val = the active vote). These are
+	 * the apps BCM bus/DDR-bandwidth votes; with the CPUs collapsed the apps needs no bandwidth, so
+	 * releasing them is correct and lets the aggregate reach cxsd/aosd. */
 	for (unsigned c = 0; c < RSC_CMDS; c++) {
 		uint32_t a = *(volatile uint32_t *)(rsc + RSC_TCS(0, 0x34 + 20 * c));
 		uint32_t d = *(volatile uint32_t *)(rsc + RSC_TCS(0, 0x38 + 20 * c));
@@ -858,7 +862,8 @@ rpmh_sleep_program(void)
 		}
 		msgid[n] = *(volatile uint32_t *)(rsc + RSC_TCS(0, 0x30 + 20 * c));
 		addr[n] = a;
-		data[n] = d;
+		data[n] = d;               /* WAKE: restore the active vote */
+		sleep_data[n] = 0;         /* SLEEP: release the vote */
 		mask |= 1u << n;
 		n++;
 	}
@@ -867,9 +872,9 @@ rpmh_sleep_program(void)
 		return;
 	}
 
-	rpmh_tcs_write(rsc, 2, msgid, addr, data, mask, n);    /* SLEEP = copy of active (null set) */
-	rpmh_tcs_write(rsc, 5, msgid, addr, data, mask, n);    /* WAKE  = copy of active (restore)  */
-	tell("rpmh-sleep: programmed %u command(s) into SLEEP (slot 2) + WAKE (slot 5), mask %#x -- NULL set (sleep==active), inert until a collapse\n", n, mask);
+	rpmh_tcs_write(rsc, 2, msgid, addr, sleep_data, mask, n);       /* SLEEP = votes released (data 0) */
+	rpmh_tcs_write(rsc, 5, msgid, addr, data, mask, n);            /* WAKE  = restore active votes      */
+	tell("rpmh-sleep: programmed %u command(s): SLEEP (slot 2) releases the apps votes, WAKE (slot 5) restores them, mask %#x -- applied by the RSC on cluster collapse/wake\n", n, mask);
 
 	for (unsigned slot = 2; slot <= 5; slot += 3) {
 		tell("rpmh-sleep: readback %s slot %u enable %#x\n", slot == 2 ? "SLEEP" : "WAKE", slot,
