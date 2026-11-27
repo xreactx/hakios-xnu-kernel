@@ -42,6 +42,7 @@
 #if defined(GENERIC_GIC_V3_IRQ)
 
 #define GICD_CTLR               0x0000
+#define GICD_TYPER              0x0004      /* [4:0] ITLinesNumber: max SPI = 32*(N+1)-1 */
 #define GICD_CTLR_ENABLE_G1NS   (1u << 1)
 #define GICD_CTLR_ARE_NS        (1u << 4)
 #define GICD_CTLR_RWP           (1u << 31)
@@ -124,6 +125,8 @@ void gic_v3_spi_detach(uint32_t intid);
 uint64_t gic_v3_spi_count(uint32_t intid);
 void gic_v3_irq_cpu_shutdown(void);
 bool gic_v3_irq_cpu_sleep(void);
+void gic_v3_dist_save(void);
+void gic_v3_dist_restore(void);
 void gic_v3_irq_signal(uint32_t phys_id);
 void gic_v3_irq_signal_stop(uint32_t phys_id);
 
@@ -516,6 +519,82 @@ gic_v3_irq_cpu_init(void)
 	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
 	kprintf("gic: v3, distributor %p, cpu %d's redistributor %p, virtual timer on PPI %d\n",
 	    (void *)gicd_base, cpu, (void *)gicr, gic_intid_vtimer);
+}
+
+/*
+ * Save / restore the GIC DISTRIBUTOR across a whole-cluster power-collapse. In the SDM845
+ * cluster-sleep state the GIC distributor loses power (the OnePlus downstream wraps its system
+ * sleep in gic_v3_dist_save/restore for exactly this reason), so its SPI configuration must be
+ * saved before the last core goes down and written back by the first core to wake. The per-core
+ * redistributor + CPU interface are handled separately (gic_v3_irq_cpu_resume). The SGIs/PPIs live
+ * in the redistributor, so only the SPI range (intid 32..) is saved here.
+ */
+#define GIC_DIST_MAX_INTID      1020u       /* SPIs are 32..1019; cap the save arrays here */
+static uint32_t dist_igroupr[GIC_DIST_MAX_INTID / 32];
+static uint32_t dist_isenabler[GIC_DIST_MAX_INTID / 32];
+static uint32_t dist_igrpmodr[GIC_DIST_MAX_INTID / 32];
+static uint32_t dist_icfgr[GIC_DIST_MAX_INTID / 16];
+static uint8_t  dist_ipriority[GIC_DIST_MAX_INTID];
+static uint64_t dist_irouter[GIC_DIST_MAX_INTID];
+static uint32_t dist_ctlr_saved;
+static uint32_t dist_num_intid;             /* 0 until a save has happened: restore is then a no-op */
+
+void
+gic_v3_dist_save(void)
+{
+	uint32_t num, n, i;
+
+	if (gicd_base == 0) {
+		return;
+	}
+	num = 32u * ((gic_read32(gicd_base + GICD_TYPER) & 0x1f) + 1);
+	if (num > GIC_DIST_MAX_INTID) {
+		num = GIC_DIST_MAX_INTID;
+	}
+	dist_ctlr_saved = gic_read32(gicd_base + GICD_CTLR);
+	for (n = 1; n * 32 < num; n++) {        /* 32-bit-per-32-intid banks; SPIs start at reg index 1 */
+		dist_igroupr[n]  = gic_read32(gicd_base + GICD_IGROUPR(n));
+		dist_isenabler[n] = gic_read32(gicd_base + GICD_ISENABLER(n));
+		dist_igrpmodr[n] = gic_read32(gicd_base + GICD_IGRPMODR(n));
+	}
+	for (n = 2; n * 16 < num; n++) {        /* ICFGR: 2 bits per intid, 16 per reg; SPIs from reg 2 */
+		dist_icfgr[n] = gic_read32(gicd_base + GICD_ICFGR(n));
+	}
+	for (i = 32; i < num; i++) {
+		dist_ipriority[i] = *(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(i));
+		dist_irouter[i]   = *(volatile uint64_t *)(gicd_base + GICD_IROUTER(i));
+	}
+	__builtin_arm_dsb(DSB_SY);
+	dist_num_intid = num;                   /* publish last: a reader sees a complete save */
+}
+
+void
+gic_v3_dist_restore(void)
+{
+	uint32_t num = dist_num_intid, n, i;
+
+	if (gicd_base == 0 || num == 0) {
+		return;                         /* nothing was ever saved */
+	}
+	/* Affinity routing + Group 1 on first: IROUTER writes need ARE_NS set. */
+	gic_write32(gicd_base + GICD_CTLR, GICD_CTLR_ENABLE_G1NS | GICD_CTLR_ARE_NS);
+	gic_distributor_settle();
+	for (n = 2; n * 16 < num; n++) {
+		gic_write32(gicd_base + GICD_ICFGR(n), dist_icfgr[n]);
+	}
+	for (i = 32; i < num; i++) {
+		*(volatile uint8_t *)(gicd_base + GICD_IPRIORITYR(i)) = dist_ipriority[i];
+		*(volatile uint64_t *)(gicd_base + GICD_IROUTER(i)) = dist_irouter[i];
+	}
+	for (n = 1; n * 32 < num; n++) {
+		gic_write32(gicd_base + GICD_IGROUPR(n), dist_igroupr[n]);
+		gic_write32(gicd_base + GICD_IGRPMODR(n), dist_igrpmodr[n]);
+	}
+	__builtin_arm_dsb(DSB_SY);
+	for (n = 1; n * 32 < num; n++) {        /* enables last, once the config is in place */
+		gic_write32(gicd_base + GICD_ISENABLER(n), dist_isenabler[n]);
+	}
+	gic_distributor_settle();
 }
 
 /*

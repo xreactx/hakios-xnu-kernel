@@ -233,6 +233,7 @@ static _Atomic uint32_t psci_prod_suspends;             /* collapses attempted f
 static _Atomic uint32_t psci_prod_fallbacks;            /* CPU_SUSPEND returned without collapsing */
 static _Atomic uint32_t psci_prod_skipped;              /* gated out: a finite timer deadline was pending */
 static _Atomic uint32_t psci_cpus_down;                 /* cluster mode: cores currently collapsed; the one that makes it == all cores asks for the cluster state */
+static _Atomic uint32_t psci_dist_down;                 /* set by the last-man after a cluster collapse saved the GIC distributor; the first core to wake restores it */
 static bool             psci_osi_enabled;               /* PSCI OS-initiated mode turned on (needed to request the cluster state) */
 
 /*
@@ -417,15 +418,12 @@ psci_bcast_cover(uint64_t rtcPop)
  * correct without per-core deadline tracking: no deadline can be missed because every core is back
  * up to evaluate its own, and the only cost is an occasional early wake that immediately re-idles.
  */
+/* Send a cpu_signal SGI to every core still collapsed (except this one), to bring the whole cluster
+ * back up. Used on a broadcast-timer wake and on the first core's wake from a cluster collapse. */
 static void
-psci_bcast_wake(void *context __unused, uint32_t intid __unused)
+psci_wake_other_collapsed(void)
 {
 	int me = cpu_number(), max_cpu = ml_get_max_cpu_number();
-
-	psci_bcast_spin_lock();
-	psci_bcast_deadline = 0;
-	psci_bcast_disarm();            /* the wake has happened; stop it re-firing */
-	psci_bcast_spin_unlock();
 
 	for (int cpu = 0; cpu <= max_cpu; cpu++) {
 		cpu_data_t *cdp;
@@ -438,6 +436,67 @@ psci_bcast_wake(void *context __unused, uint32_t intid __unused)
 			gic_v3_irq_signal(cdp->cpu_phys_id);
 		}
 	}
+}
+
+static void
+psci_bcast_wake(void *context __unused, uint32_t intid __unused)
+{
+	psci_bcast_spin_lock();
+	psci_bcast_deadline = 0;
+	psci_bcast_disarm();            /* the wake has happened; stop it re-firing */
+	psci_bcast_spin_unlock();
+
+	psci_wake_other_collapsed();
+}
+
+/*
+ * apps_rsc CONTROL TCS: the real wake for a whole-cluster collapse. In the cluster-sleep state the
+ * GIC (and the broadcast SPI with it) is powered down, so the system is woken by the RSC/PDC
+ * always-on timer instead. The OS arms it by writing the next wakeup -- a qtimer tick value -- into
+ * the RSC's CONTROL TCS (OnePlus downstream setup_wakeup() -> rpmh_write_control()): two command
+ * words, cmd0 = (hi & 0xFFFFFF) | VALID, cmd1 = lo. On this board (tcs-config 2 active / 3 sleep /
+ * 3 wake / 1 control) the control TCS is slot 8, with the usual per-command registers; the Stage-0
+ * probe found it empty. No trigger is needed -- the RSC/PDC hardware consumes it on sleep entry.
+ */
+#define RSC_PHYS                0x179e0000u     /* soc_rsc: apps_rsc DRV-2, the one HakiOS uses */
+#define RSC_SIZE                0x10000u
+#define RSC_TCS(n, reg)         (0xd00u + 0x2a0u * (n) + (reg))
+#define RSC_CONTROL_TCS         8u
+#define RSC_CMD_MSGID(c)        (0x30u + 20u * (c))
+#define RSC_CMD_ADDR(c)         (0x34u + 20u * (c))
+#define RSC_CMD_DATA(c)         (0x38u + 20u * (c))
+#define PDC_TIME_VALID          (1u << 31)
+#define PDC_TIME_UPPER_MASK     0xFFFFFFu
+
+static vm_offset_t      psci_rsc_base;
+
+static void
+psci_rsc_init(void)
+{
+	psci_rsc_base = ml_io_map(RSC_PHYS, RSC_SIZE);
+	printf("psci: apps_rsc at %#x mapped; cluster wake = CONTROL TCS %u + GIC distributor save/restore\n",
+	    RSC_PHYS, RSC_CONTROL_TCS);
+}
+
+/* Arm the RSC/PDC wakeup at qtimer value cval (the broadcast frame's CVAL = the next deadline). */
+static void
+psci_rsc_program_wakeup(uint64_t cval)
+{
+	uint32_t lo = (uint32_t)cval, hi = (uint32_t)(cval >> 32);
+
+	if (psci_rsc_base == 0) {
+		return;
+	}
+	/* command 0: upper time + valid bit */
+	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_MSGID(0))) = 0;
+	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_ADDR(0))) = 0;
+	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_DATA(0))) =
+	    (hi & PDC_TIME_UPPER_MASK) | PDC_TIME_VALID;
+	/* command 1: lower time */
+	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_MSGID(1))) = 0;
+	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_ADDR(1))) = 0;
+	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_DATA(1))) = lo;
+	__builtin_arm_dsb(DSB_SY);
 }
 
 static void
@@ -471,7 +530,8 @@ psci_smp_idle_selftest_init(void)
 			psci_osi_enabled = (m == 0);
 			printf("psci: SET_SUSPEND_MODE(OS-initiated) -> %lld (%s)\n",
 			    m, psci_osi_enabled ? "OSI on" : "stayed platform-coordinated");
-			psci_bcast_init();                      /* the always-on wake for the deep states */
+			psci_bcast_init();                      /* the always-on wake for the per-core deep states */
+			psci_rsc_init();                        /* the apps_rsc map, for the cluster wakeup (CONTROL TCS) */
 
 			/*
 			 * Turn collapse ON only now that OSI and the broadcast timer are ready: set the
@@ -618,12 +678,25 @@ psci_smp_idle(int cpu, uint64_t rtcPop)
 			}
 			psci_bcast_spin_unlock();
 		}
+		if (want_cluster) {
+			/*
+			 * The whole GIC is about to lose power with the cluster. Arm the RSC/PDC always-on
+			 * timer with the next deadline (the broadcast frame's CVAL we just set) so the PDC
+			 * re-powers the APSS, and save the distributor so the first core to wake can restore it.
+			 * psci_dist_down tells that core the distributor really went down.
+			 */
+			psci_rsc_program_wakeup(psci_bcast_deadline);
+			gic_v3_dist_save();
+			os_atomic_store(&psci_dist_down, 1, release);
+		}
 		status = psci_cpu_powerdown(cpu, want_cluster ? PSCI_CLUSTER_PD_STATE : PSCI_PERCORE_RAIL_STATE);
 		/*
 		 * Only here if it did NOT collapse (a successful collapse returns through the resume path,
 		 * which does the decrement). Back this core out of the down-count; if it was the last one
-		 * still notionally down, nothing is left to wake, so drop the broadcast too.
+		 * still notionally down, nothing is left to wake, so drop the broadcast too. The cluster did
+		 * not go down, so the distributor is intact -- clear the flag we may have set.
 		 */
+		os_atomic_store(&psci_dist_down, 0, relaxed);
 		if (os_atomic_dec(&psci_cpus_down, relaxed) == 0) {
 			psci_bcast_spin_lock();
 			psci_bcast_deadline = 0;
@@ -699,7 +772,12 @@ psci_smp_idle_resumed(int cpu)
 		return;                         /* not a core coming back from a power-collapse */
 	}
 	psci_idle_collapsed[cpu] = 0;
+	bool first_cluster_waker = false;
 	if (psci_prod_cluster) {
+		/* The first core to wake after the whole cluster went down owns the distributor restore. */
+		if (os_atomic_cmpxchg(&psci_dist_down, 1, 0, acq_rel)) {
+			first_cluster_waker = true;
+		}
 		/*
 		 * This core is back up: balance the last-man-down count. Drop the broadcast only once the
 		 * LAST core is up -- a lone device-IRQ wake must not strip the timer out from under the
@@ -713,6 +791,12 @@ psci_smp_idle_resumed(int cpu)
 		}
 	}
 	gic_v3_irq_cpu_resume();                /* the GIC CPU interface is gone; bring it back before anything needs it */
+	if (first_cluster_waker) {
+		/* The GIC distributor lost power in the cluster state: restore it (now this core's CPU
+		 * interface is up so the SGIs below can go out), then kick the other cores back up. */
+		gic_v3_dist_restore();
+		psci_wake_other_collapsed();
+	}
 	os_atomic_inc(&psci_idle_resumes, relaxed);
 }
 
