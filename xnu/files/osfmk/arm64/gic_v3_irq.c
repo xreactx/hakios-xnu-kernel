@@ -546,7 +546,7 @@ gic_v3_irq_cpu_sleep(void)
 
 	waker = gic_read32(gicr + GICR_WAKER);
 	gic_write32(gicr + GICR_WAKER, waker | GICR_WAKER_PROCSLEEP);
-	for (tries = 0; tries < (1 << 20); tries++) {
+	for (tries = 0; tries < (1 << 14); tries++) {   /* a few ms at most; failing fast keeps the WFI fallback cheap */
 		if (gic_read32(gicr + GICR_WAKER) & GICR_WAKER_CHILDASLEEP) {
 			return true;    /* quiescent: a pending IRQ will now raise a WakeRequest */
 		}

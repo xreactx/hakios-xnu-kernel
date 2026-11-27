@@ -216,6 +216,7 @@ static uint8_t          psci_idle_collapsed[MAX_CPUS];  /* set across a collapse
  *   cpu_psci_idle_core=C  the one core to collapse in the real idle path (default 1, a big core)
  */
 #define PSCI_END_OF_ALL_TIME    0xFFFFFFFFFFFFFFFFULL  /* rtclock.h EndOfAllTime: no finite timer pending */
+#define PSCI_QUIESCE_FAILED     (-1000)                 /* distinct from any PSCI error (0..-9): the GICR_WAKER quiesce backed out, no CPU_SUSPEND issued */
 #define PSCI_PROD_DEFAULT_CORE  1                       /* logical cpu 1 = phys 0x600, a big core that stays online */
 #define PSCI_PROD_LOG_EVERY     512u                    /* throttle the hot-path breadcrumb to the log */
 
@@ -225,6 +226,8 @@ static bool             psci_prod_cluster;              /* cpu_psci_idle=3 (Stag
 static bool             psci_prod_incl_boot;            /* cpu_psci_idle=3 (Stage B): collapse the boot cpu too, so the whole APSS can go down */
 static bool             psci_prod_force;                /* cpu_psci_idle=4 (Stage B experiment): collapse even with a finite timer pending, to test whether the firmware programs the wake */
 static bool             psci_prod_nocluster;            /* cpu_psci_nocluster=1: all cores collapse to the per-core rail state, NEVER request the cluster state (safe per-core-only measurement) */
+static bool             psci_prod_wakesleep;            /* cpu_psci_wakesleep=1: do the GICR_WAKER ProcessorSleep handshake before a deep collapse (experimental; off by default -- the firmware appears to manage it, and forcing it blocked every collapse) */
+static _Atomic uint32_t psci_quiesce_fails;             /* collapses skipped because the redistributor would not reach ChildrenAsleep */
 static int              psci_prod_core = PSCI_PROD_DEFAULT_CORE;
 static _Atomic uint32_t psci_prod_suspends;             /* collapses attempted from the real idle path */
 static _Atomic uint32_t psci_prod_fallbacks;            /* CPU_SUSPEND returned without collapsing */
@@ -252,18 +255,24 @@ psci_cpu_powerdown(int cpu, uint32_t state)
 	psci_idle_collapsed[cpu] = 1;
 	if (deep) {
 		CleanPoC_Dcache();              /* cluster/system state may drop L2: flush to coherency */
-		/*
-		 * Put the redistributor into ProcessorSleep so a pending interrupt raises a WakeRequest
-		 * -- the only thing that re-powers the APSS once the whole cluster is down. If it cannot
-		 * quiesce (an interrupt is pending), do not power down: back out to WFI.
-		 */
-		if (!gic_v3_irq_cpu_sleep()) {
-			psci_idle_collapsed[cpu] = 0;
-			psci_idle_last_error = -1;
-			return -1;
-		}
 	} else {
 		CleanPoU_Dcache();
+	}
+
+	/*
+	 * Experimental (cpu_psci_wakesleep=1, off by default): put the redistributor into
+	 * ProcessorSleep so a pending interrupt raises a WakeRequest. In practice the firmware appears
+	 * to manage this itself -- forcing it here only blocked every collapse (ChildrenAsleep never
+	 * asserted) -- so it is gated off; when on, a failed quiesce backs out to WFI rather than
+	 * powering down deaf.
+	 */
+	if (deep && psci_prod_wakesleep) {
+		if (!gic_v3_irq_cpu_sleep()) {
+			os_atomic_inc(&psci_quiesce_fails, relaxed);
+			psci_idle_collapsed[cpu] = 0;
+			psci_idle_last_error = PSCI_QUIESCE_FAILED;
+			return PSCI_QUIESCE_FAILED;
+		}
 	}
 	__builtin_arm_dsb(DSB_SY);
 
@@ -271,7 +280,7 @@ psci_cpu_powerdown(int cpu, uint32_t state)
 	    ml_static_vtop((vm_offset_t)&LowResetVectorBase), 0);
 
 	/* Only here if the firmware did NOT power the core down: the call returns in place with an error. */
-	if (deep) {
+	if (deep && psci_prod_wakesleep) {
 		gic_v3_irq_cpu_resume();        /* undo the ProcessorSleep quiesce so the WFI fallback can still take IRQs */
 	}
 	psci_idle_collapsed[cpu] = 0;
@@ -476,15 +485,19 @@ psci_smp_idle_selftest_init(void)
 				psci_prod_force = true;         /* ignore the timer gate: force the collapse even with a pending deadline */
 			}
 			{
-				uint32_t nc = 0;
+				uint32_t nc = 0, ws = 0;
 				if (PE_parse_boot_argn("cpu_psci_nocluster", &nc, sizeof(nc)) && nc != 0) {
 					psci_prod_nocluster = true;     /* per-core-only: never request the cluster state */
 				}
+				if (PE_parse_boot_argn("cpu_psci_wakesleep", &ws, sizeof(ws)) && ws != 0) {
+					psci_prod_wakesleep = true;     /* experimental GICR_WAKER handshake before each deep collapse */
+				}
 			}
-			printf("psci: idle power-collapse ON for EVERY core incl boot (GICR_WAKER ProcessorSleep handshake); "
-			    "last-man-down asks for %s, the rest for the per-core rail state (0x%x)%s\n",
+			printf("psci: idle power-collapse ON for EVERY core incl boot; last-man-down asks for %s, the rest "
+			    "for the per-core rail state (0x%x)%s%s\n",
 			    psci_prod_nocluster ? "the per-core rail state too (NO cluster)" : "the cluster state (0x4100c244)",
-			    PSCI_PERCORE_RAIL_STATE, psci_prod_force ? ", FORCED (ignores pending timers)" : "");
+			    PSCI_PERCORE_RAIL_STATE, psci_prod_force ? ", FORCED (ignores pending timers)" : "",
+			    psci_prod_wakesleep ? ", GICR_WAKER handshake ON" : "");
 			__builtin_arm_dsb(DSB_SY);
 			psci_prod_enabled = true;
 		} else if (on >= 2) {
