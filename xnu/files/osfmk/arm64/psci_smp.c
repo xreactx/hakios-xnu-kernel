@@ -224,6 +224,7 @@ static bool             psci_prod_all;                  /* cpu_psci_idle>=2: eve
 static bool             psci_prod_cluster;              /* cpu_psci_idle=3 (Stage B): request the cluster/system state, not the per-core one */
 static bool             psci_prod_incl_boot;            /* cpu_psci_idle=3 (Stage B): collapse the boot cpu too, so the whole APSS can go down */
 static bool             psci_prod_force;                /* cpu_psci_idle=4 (Stage B experiment): collapse even with a finite timer pending, to test whether the firmware programs the wake */
+static bool             psci_prod_nocluster;            /* cpu_psci_nocluster=1: all cores collapse to the per-core rail state, NEVER request the cluster state (safe per-core-only measurement) */
 static int              psci_prod_core = PSCI_PROD_DEFAULT_CORE;
 static _Atomic uint32_t psci_prod_suspends;             /* collapses attempted from the real idle path */
 static _Atomic uint32_t psci_prod_fallbacks;            /* CPU_SUSPEND returned without collapsing */
@@ -246,11 +247,23 @@ psci_cpu_powerdown(int cpu, uint32_t state)
 {
 	int64_t status;
 
+	bool deep = (state != PSCI_IDLE_PD_STATE);      /* rail/cluster states fully power the core off */
+
 	psci_idle_collapsed[cpu] = 1;
-	if (state == PSCI_IDLE_PD_STATE) {
-		CleanPoU_Dcache();
-	} else {
+	if (deep) {
 		CleanPoC_Dcache();              /* cluster/system state may drop L2: flush to coherency */
+		/*
+		 * Put the redistributor into ProcessorSleep so a pending interrupt raises a WakeRequest
+		 * -- the only thing that re-powers the APSS once the whole cluster is down. If it cannot
+		 * quiesce (an interrupt is pending), do not power down: back out to WFI.
+		 */
+		if (!gic_v3_irq_cpu_sleep()) {
+			psci_idle_collapsed[cpu] = 0;
+			psci_idle_last_error = -1;
+			return -1;
+		}
+	} else {
+		CleanPoU_Dcache();
 	}
 	__builtin_arm_dsb(DSB_SY);
 
@@ -258,6 +271,9 @@ psci_cpu_powerdown(int cpu, uint32_t state)
 	    ml_static_vtop((vm_offset_t)&LowResetVectorBase), 0);
 
 	/* Only here if the firmware did NOT power the core down: the call returns in place with an error. */
+	if (deep) {
+		gic_v3_irq_cpu_resume();        /* undo the ProcessorSleep quiesce so the WFI fallback can still take IRQs */
+	}
 	psci_idle_collapsed[cpu] = 0;
 	psci_idle_last_error = status;
 	return status;
@@ -459,9 +475,16 @@ psci_smp_idle_selftest_init(void)
 			if (on >= 4) {
 				psci_prod_force = true;         /* ignore the timer gate: force the collapse even with a pending deadline */
 			}
-			printf("psci: idle power-collapse ON for EVERY core incl boot; last-man-down asks for the cluster "
-			    "state (0x%x), the rest for the per-core rail state (0x%x)%s\n",
-			    PSCI_CLUSTER_PD_STATE, PSCI_PERCORE_RAIL_STATE, psci_prod_force ? ", FORCED (ignores pending timers)" : "");
+			{
+				uint32_t nc = 0;
+				if (PE_parse_boot_argn("cpu_psci_nocluster", &nc, sizeof(nc)) && nc != 0) {
+					psci_prod_nocluster = true;     /* per-core-only: never request the cluster state */
+				}
+			}
+			printf("psci: idle power-collapse ON for EVERY core incl boot (GICR_WAKER ProcessorSleep handshake); "
+			    "last-man-down asks for %s, the rest for the per-core rail state (0x%x)%s\n",
+			    psci_prod_nocluster ? "the per-core rail state too (NO cluster)" : "the cluster state (0x4100c244)",
+			    PSCI_PERCORE_RAIL_STATE, psci_prod_force ? ", FORCED (ignores pending timers)" : "");
 			__builtin_arm_dsb(DSB_SY);
 			psci_prod_enabled = true;
 		} else if (on >= 2) {
@@ -564,15 +587,17 @@ psci_smp_idle(int cpu, uint64_t rtcPop)
 		 */
 		uint32_t num = (uint32_t)ml_get_max_cpu_number() + 1;
 		uint32_t down = os_atomic_inc_orig(&psci_cpus_down, relaxed) + 1;
-		bool last = down >= num;
+		bool all_down = down >= num;
+		/* The last man asks for the cluster state -- unless cpu_psci_nocluster=1, which keeps
+		 * every core on the per-core rail state (safe per-core-only measurement, no cluster). */
+		bool want_cluster = all_down && !psci_prod_nocluster;
 
-		if (last && psci_bcast_freq != 0) {
+		if (all_down && psci_bcast_freq != 0) {
 			/*
-			 * The whole APSS is about to go down. If some core already registered a deadline, the
-			 * broadcast is armed to it and covers the wake. If NONE did (every core idle with no
-			 * finite timer -- real suspend), a device IRQ via the GIC/PDC is the intended wake, but
-			 * as a bring-up safety net arm a far backstop wake so an untested wake path can never
-			 * hang the system silently; a real deadline, being sooner, always wins the min.
+			 * The whole APSS is down. If some core already registered a deadline the broadcast is
+			 * armed to it and covers the wake; if NONE did (every core idle with no finite timer)
+			 * arm a far backstop wake as a bring-up safety net so an untested wake path can never
+			 * hang the system silently. A real deadline, being sooner, always wins the min.
 			 */
 			psci_bcast_spin_lock();
 			if (psci_bcast_deadline == 0) {
@@ -580,7 +605,7 @@ psci_smp_idle(int cpu, uint64_t rtcPop)
 			}
 			psci_bcast_spin_unlock();
 		}
-		status = psci_cpu_powerdown(cpu, last ? PSCI_CLUSTER_PD_STATE : PSCI_PERCORE_RAIL_STATE);
+		status = psci_cpu_powerdown(cpu, want_cluster ? PSCI_CLUSTER_PD_STATE : PSCI_PERCORE_RAIL_STATE);
 		/*
 		 * Only here if it did NOT collapse (a successful collapse returns through the resume path,
 		 * which does the decrement). Back this core out of the down-count; if it was the last one

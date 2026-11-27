@@ -123,6 +123,7 @@ void gic_v3_spi_unmask(uint32_t intid);
 void gic_v3_spi_detach(uint32_t intid);
 uint64_t gic_v3_spi_count(uint32_t intid);
 void gic_v3_irq_cpu_shutdown(void);
+bool gic_v3_irq_cpu_sleep(void);
 void gic_v3_irq_signal(uint32_t phys_id);
 void gic_v3_irq_signal_stop(uint32_t phys_id);
 
@@ -518,9 +519,51 @@ gic_v3_irq_cpu_init(void)
 }
 
 /*
+ * Quiesce this core's redistributor just before a PSCI power-collapse. GICv3 requires the CPU
+ * interface Group enables to be off and GICR_WAKER.ProcessorSleep set (then ChildrenAsleep observed
+ * high) before the core powers down: only in that quiescent state does the redistributor raise a
+ * WakeRequest to the power controller when an interrupt becomes pending -- which is what re-powers
+ * the APSS when the WHOLE cluster is down and no sibling core is left to deliver the wake. (With a
+ * sibling still up the firmware wakes us anyway, which is why per-core collapse worked without this.)
+ * Returns true once quiesced; false if ChildrenAsleep would not assert (an interrupt is pending), in
+ * which case the interface is restored and the caller must NOT power down -- it idles with WFI.
+ * gic_v3_irq_cpu_resume() undoes this (clears ProcessorSleep, re-enables the interface) on the way
+ * back, both after a real collapse and on the no-collapse fallback.
+ */
+bool
+gic_v3_irq_cpu_sleep(void)
+{
+	vm_offset_t gicr = gicr_cpu_base[cpu_number()];
+	uint32_t waker;
+	int tries;
+
+	if (gicr == 0) {
+		return false;           /* this core never initialised its interface */
+	}
+	/* The redistributor cannot reach ChildrenAsleep while the CPU interface is still accepting. */
+	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 0);
+	__builtin_arm_isb(ISB_SY);
+
+	waker = gic_read32(gicr + GICR_WAKER);
+	gic_write32(gicr + GICR_WAKER, waker | GICR_WAKER_PROCSLEEP);
+	for (tries = 0; tries < (1 << 20); tries++) {
+		if (gic_read32(gicr + GICR_WAKER) & GICR_WAKER_CHILDASLEEP) {
+			return true;    /* quiescent: a pending IRQ will now raise a WakeRequest */
+		}
+	}
+
+	/* Could not quiesce (a pending/active interrupt): back out so we do not power down deaf. */
+	gic_write32(gicr + GICR_WAKER, gic_read32(gicr + GICR_WAKER) & ~GICR_WAKER_PROCSLEEP);
+	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+	__builtin_arm_isb(ISB_SY);
+	return false;
+}
+
+/*
  * Bring the per-core GIC interface back after a PSCI power-collapse (psci_smp_idle_resumed()). A
  * core that was powered down loses its system-register CPU interface, and the redistributor has
- * had ProcessorSleep set for it by the hardware; the distributor and the redistributor's own state
+ * had ProcessorSleep set for it (by gic_v3_irq_cpu_sleep() before the collapse); the distributor
+ * and the redistributor's own state
  * (which PPIs/SGIs are enabled) outlive the core, so only the core's side is restored here. This
  * is the subset of gic_v3_irq_cpu_init() that the fresh-core bring-up does but the idle-resume
  * path does not -- and that one would skip entirely (gicr_cpu_base[cpu] is already set).
