@@ -2,13 +2,13 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **456 arguments**: 384 read by the kernel, 15 by the loader, 69 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **505 arguments**: 432 read by the kernel, 15 by the loader, 70 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
 Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl kern.bootargs`).
 
-## GPU and display (89)
+## GPU and display (90)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -17,6 +17,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `adreno_dirty` | K | `hakios.adreno.c` | `CONFIG_ADRENO_DIRTY` |  |
 | `adreno_fine` | K | `hakios.adreno.c` | `CONFIG_ADRENO_FINE` |  |
 | `adreno_gfx` | K | `hakios.adreno.c` | `CONFIG_ADRENO_GFX` |  |
+| `adreno_ifpc` | K | `hakios.adreno.c` | `CONFIG_ADRENO_IFPC` |  |
 | `adreno_keep` | K | `hakios.adreno.c` | `CONFIG_ADRENO_KEEP` |  |
 | `adreno_only` | K | `hakios.adreno.c` | `CONFIG_ADRENO_ONLY` |  |
 | `adreno_pause` | K | `hakios.adreno.c` | `CONFIG_ADRENO_PAUSE` |  |
@@ -145,16 +146,44 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `wifi_watch` | K | `hakios.wifi.c` | `CONFIG_WIFI_WATCH` |  |
 | `wifi_wide` | K | `lx_80211.c` | `CONFIG_WIFI_WIDE` | implied by wifi=1 |
 
-## Cellular (72)
+## Cellular (107)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
+| `call` | K | `hakios.mpss.c` | `CONFIG_CALL` |  |
+| `call_answer` | K | `hakios.mpss.c` | `CONFIG_CALL_ANSWER` |  |
+| `call_secs` | K | `hakios.mpss.c` | `CONFIG_CALL_SECS` |  |
+| `call_to` | K | `hakios.mpss.c` | `CONFIG_CALL_TO` |  |
 | `cell_dns` | K | `hakios.cell.c` | `CONFIG_CELL_DNS` |  |
 | `cell_fake` | K | `hakios.cell.c` | `CONFIG_CELL_FAKE` |  |
 | `cell_ping` | K | `hakios.cell.c` | `CONFIG_CELL_PING` |  |
 | `cell_ping_size` | K | `hakios.cell.c` | `CONFIG_CELL_PING_SIZE` |  |
 | `cell_ping_to` | K | `hakios.cell.c` | `CONFIG_CELL_PING_TO` |  |
+| `data_sub` | K | `hakios.mpss.c` | `CONFIG_DATA_SUB` |  |
+| `dcm_ind_family` | K | `hakios.mpss.c` | `CONFIG_DCM_IND_FAMILY` |  |
+| `dcm_noll` | K | `hakios.mpss.c` | `CONFIG_DCM_NOLL` |  |
+| `dcm_old` | K | `hakios.mpss.c` | `CONFIG_DCM_OLD` |  |
+| `dumps` | K | `hakios.mpss.c` | `CONFIG_DUMPS` |  |
+| `f3` | K | `hakios.mpss.c` | `CONFIG_F3` |  |
+| `f3_all` | K | `hakios.mpss.c` | `CONFIG_F3_ALL` |  |
+| `f3_allranges` | K | `hakios.mpss.c` | `CONFIG_F3_ALLRANGES` |  |
+| `f3_android` | K | `hakios.mpss.c` | `CONFIG_F3_ANDROID` |  |
+| `f3_bare` | K | `hakios.mpss.c` | `CONFIG_F3_BARE` |  |
+| `f3_first` | K | `hakios.mpss.c` | `CONFIG_F3_FIRST` |  |
+| `f3_id` | K | `hakios.mpss.c` | `CONFIG_F3_ID` |  |
+| `f3_min` | K | `hakios.mpss.c` | `CONFIG_F3_MIN` |  |
+| `f3_ranges_first` | K | `hakios.mpss.c` | `CONFIG_F3_RANGES_FIRST` |  |
+| `f3_raw` | K | `hakios.mpss.c` | `CONFIG_F3_RAW` |  |
+| `f3_rsp` | K | `hakios.mpss.c` | `CONFIG_F3_RSP` |  |
+| `f3_ssid` | K | `hakios.mpss.c` | `CONFIG_F3_SSID` |  |
 | `gnss` | K | `hakios.mpss.c` | `CONFIG_GNSS` |  |
+| `ims_forward` | K | `hakios.cell.c` | `CONFIG_IMS_FORWARD` |  |
+| `ims_pdn` | K | `hakios.mpss.c` | `CONFIG_IMS_PDN` |  |
+| `ims_tech` | K | `hakios.mpss.c` | `CONFIG_IMS_TECH` |  |
+| `ims_untyped` | K | `hakios.mpss.c` | `CONFIG_IMS_UNTYPED` |  |
+| `imsa_noind` | K | `hakios.mpss.c` | `CONFIG_IMSA_NOIND` |  |
+| `ipa_header_free` | K | `hakios.mpss.c` | `CONFIG_IPA_HEADER_FREE` |  |
+| `ipa_meta` | K | `hakios.mpss.c` | `CONFIG_IPA_META` |  |
 | `modem` | K | `hakios.mpss.c` | `CONFIG_MODEM` |  |
 | `modem_after` | K | `hakios.mpss.c` | `CONFIG_MODEM_AFTER` |  |
 | `modem_again` | K | `hakios.mpss.c` | `CONFIG_MODEM_AGAIN` |  |
@@ -173,6 +202,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `modem_ipa_fw_at` | K | `hakios.mpss.c` | `CONFIG_MODEM_IPA_FW_AT` |  |
 | `modem_ipa_gsi_enable` | K | `hakios.mpss.c` | `CONFIG_MODEM_IPA_GSI_ENABLE` |  |
 | `modem_ipa_item` | K | `hakios.mpss.c` | `CONFIG_MODEM_IPA_ITEM` |  |
+| `modem_ipa_map_1g` | K | `hakios.mpss.c` | `CONFIG_MODEM_IPA_MAP_1G` |  |
 | `modem_ipa_no_aggr` | K | `hakios.ipa.c` | `CONFIG_MODEM_IPA_NO_AGGR` |  |
 | `modem_ipa_no_probe` | K | `hakios.mpss.c` | `CONFIG_MODEM_IPA_NO_PROBE` |  |
 | `modem_ipa_quiet` | K | `hakios.mpss.c` | `CONFIG_MODEM_IPA_QUIET` |  |
@@ -206,6 +236,10 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `modem_stop` | K | `hakios.mpss.c` | `CONFIG_MODEM_STOP` |  |
 | `modem_wait` | K | `hakios.mpss.c` | `CONFIG_MODEM_WAIT` |  |
 | `modem_wda_off` | K | `hakios.mpss.c` | `CONFIG_MODEM_WDA_OFF` |  |
+| `pdc` | K | `hakios.mpss.c` | `CONFIG_PDC` |  |
+| `pdc_use` | K | `hakios.mpss.c` | `CONFIG_PDC_USE` |  |
+| `profiles` | K | `hakios.mpss.c` | `CONFIG_PROFILES` |  |
+| `sms` | K | `hakios.mpss.c` | `CONFIG_SMS` |  |
 | `sms_to` | K | `hakios.mpss.c` | `CONFIG_SMS_TO` |  |
 | `soc_apcs_ipc` | K | `hakios.adsp.c`, `hakios.mpss.c`, `hakios.slpi.c` | `CONFIG_SOC_APCS_IPC` |  |
 | `soc_gsi_base` | K | `hakios.ipa.c` | `CONFIG_SOC_GSI_BASE` |  |
@@ -221,8 +255,10 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `soc_pas_ipa` | K | `hakios.mpss.c` | `CONFIG_SOC_PAS_IPA` |  |
 | `soc_pas_mpss` | K | `hakios.mpss.c` | `CONFIG_SOC_PAS_MPSS` |  |
 | `soc_smem` | K | `hakios.adsp.c`, `hakios.mpss.c`, `hakios.slpi.c`, `hakios.socinfo.c` | `CONFIG_SOC_SMEM` |  |
+| `voice_domain` | K | `hakios.mpss.c` | `CONFIG_VOICE_DOMAIN` |  |
+| `volte` | K | `hakios.mpss.c` | `CONFIG_VOLTE` |  |
 
-## Audio and battery (47)
+## Audio and battery (48)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -273,6 +309,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `sound_secs` | K | `hakios.sound.c` | `CONFIG_SOUND_SECS` |  |
 | `speaker_probe` | K | `hakios.speaker.c` | `CONFIG_SPEAKER_PROBE` |  |
 | `virtio_sound` | K | `hakios.virtio_sound.c` | `CONFIG_VIRTIO_SOUND` |  |
+| `voice` | K | `hakios.mic.c` | `CONFIG_VOICE` |  |
 
 ## Cameras (13)
 
@@ -390,13 +427,15 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `thermal_tm0` | K | `hakios.thermal.c` | `CONFIG_THERMAL_TM0` |  |
 | `thermal_tm1` | K | `hakios.thermal.c` | `CONFIG_THERMAL_TM1` |  |
 
-## CPU, memory and boot (26)
+## CPU, memory and boot (29)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
 | `applog` | K | `(patch)` | `CONFIG_APPLOG` |  |
 | `applog_name` | K | `(patch)` | `CONFIG_APPLOG_NAME` |  |
 | `bootcpu` | KL | `loader.c`, `loader_return.c` | `CONFIG_BOOTCPU` |  |
+| `cpu_psci_cluster_probe` | K | `hakios.cpufreq.c` | `CONFIG_CPU_PSCI_CLUSTER_PROBE` |  |
+| `cpu_rpmh_sleep` | K | `hakios.cpufreq.c` | `CONFIG_CPU_RPMH_SLEEP` |  |
 | `cpufreq` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ` |  |
 | `cpufreq_osm` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ_OSM` |  |
 | `cpufreq_osm_mhz` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ_OSM_MHZ` |  |
@@ -407,6 +446,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ddr_vote` | K | `hakios.cpufreq.c` | `CONFIG_DDR_VOTE` |  |
 | `epoch` | K | `GenericARMPE.cpp` |  | xl (the host's clock) |
 | `hv_wdt_pet` | K | `loader_return.c` |  | the loader, when it has armed the watchdog (the runner also passes it) |
+| `inject_apps` | K | `(patch)` | `CONFIG_INJECT_APPS` |  |
 | `loader_return_after` | KL | `loader.c`, `loader_return.c` |  | xl (XL_SECS) |
 | `machine_name` | K | `GenericARMPE.cpp` | `CONFIG_MACHINE_NAME` |  |
 | `membench` | K | `hakios.cpufreq.c` | `CONFIG_MEMBENCH` |  |
@@ -444,7 +484,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ufs` | L | `loader.c` | `CONFIG_UFS` |  |
 | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
 
-## User space (90)
+## User space (99)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -473,10 +513,17 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `cam6t_focus` | K | `hakios.cam6t.c` | `CONFIG_CAM6T_FOCUS` |  |
 | `cam6t_gain` | K | `hakios.cam6t.c` | `CONFIG_CAM6T_GAIN` |  |
 | `cam6t_mode` | K | `hakios.cam6t.c` | `CONFIG_CAM6T_MODE` |  |
+| `cam6t_rpmh_after` | K | `hakios.cam6t.c` | `CONFIG_CAM6T_RPMH_AFTER` |  |
 | `cam6t_sensor` | K | `hakios.cam6t.c` | `CONFIG_CAM6T_SENSOR` |  |
 | `cam6t_settle` | K | `hakios.cam6t.c` | `CONFIG_CAM6T_SETTLE` |  |
 | `cam6t_xo` | K | `hakios.cam6t.c` | `CONFIG_CAM6T_XO` |  |
 | `cc_fade` | U | `inject_sb.c` | `CONFIG_CC_FADE` |  |
+| `cpu_psci_idle` | K | `psci_smp.c` | `CONFIG_CPU_PSCI_IDLE` |  |
+| `cpu_psci_idle_core` | K | `psci_smp.c` | `CONFIG_CPU_PSCI_IDLE_CORE` |  |
+| `cpu_psci_idle_test` | K | `psci_smp.c` | `CONFIG_CPU_PSCI_IDLE_TEST` |  |
+| `cpu_psci_nocluster` | K | `psci_smp.c` | `CONFIG_CPU_PSCI_NOCLUSTER` |  |
+| `cpu_psci_probe` | K | `psci_smp.c` | `CONFIG_CPU_PSCI_PROBE` |  |
+| `cpu_psci_wakesleep` | K | `psci_smp.c` | `CONFIG_CPU_PSCI_WAKESLEEP` |  |
 | `fastrpc_log` | K | `hakios.slpi.c` | `CONFIG_FASTRPC_LOG` |  |
 | `fastrpc_mem` | K | `hakios.slpi.c` | `CONFIG_FASTRPC_MEM` |  |
 | `gl` | U | `inject.c`, `inject_sb.c` | `CONFIG_GL` |  |
@@ -497,6 +544,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `metal_skip` | U | `HakiosMetalCA.m` | `CONFIG_METAL_SKIP` |  |
 | `metal_trace` | U | `HakiosMetalCA.m` | `CONFIG_METAL_TRACE` |  |
 | `metal_watch` | U | `inject.c` | `CONFIG_METAL_WATCH` |  |
+| `pas_settle` | K | `hakios.platform.c` | `CONFIG_PAS_SETTLE` |  |
 | `pmi_charger` | K | `hakios.pmi_charger.c` | `CONFIG_PMI_CHARGER` |  |
 | `pmi_charger_after` | K | `hakios.pmi_charger.c` | `CONFIG_PMI_CHARGER_AFTER` |  |
 | `pmi_charger_every` | K | `hakios.pmi_charger.c` | `CONFIG_PMI_CHARGER_EVERY` |  |
@@ -507,6 +555,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `pmi_haptics_tap_ms` | K | `hakios.pmi_haptics.c` | `CONFIG_PMI_HAPTICS_TAP_MS` |  |
 | `root_apfs` | U | `init.c` | `CONFIG_ROOT_APFS` |  |
 | `sb_delay` | U | `inject_sb.c` |  | xl (XL_SB_DELAY) |
+| `sb_lte` | U | `inject_sb.c` | `CONFIG_SB_LTE` |  |
 | `slider` | K | `hakios.slider.c` | `CONFIG_SLIDER` |  |
 | `slim` | K | `hakios.slim.c` | `CONFIG_SLIM` |  |
 | `slpi` | K | `hakios.slpi.c` | `CONFIG_SLPI` |  |

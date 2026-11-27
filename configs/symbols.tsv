@@ -3,6 +3,7 @@ ADRENO_BLIND	arg	adreno_blind	GPU and display	k	hakios.adreno.c
 ADRENO_DIRTY	arg	adreno_dirty	GPU and display	k	hakios.adreno.c	
 ADRENO_FINE	arg	adreno_fine	GPU and display	k	hakios.adreno.c	the newest step waits like that before every single access
 ADRENO_GFX	arg	adreno_gfx	GPU and display	k	hakios.adreno.c	
+ADRENO_IFPC	arg	adreno_ifpc	GPU and display	k	hakios.adreno.c	
 ADRENO_KEEP	arg	adreno_keep	GPU and display	k	hakios.adreno.c	
 ADRENO_ONLY	arg	adreno_only	GPU and display	k	hakios.adreno.c	step K alone (what steps 6 to 10 need, they check for themselves: within one session of the loader, power and clocks stay as an earlier run left them)
 ADRENO_PAUSE	arg	adreno_pause	GPU and display	k	hakios.adreno.c	how long the newest step waits after announcing a group of accesses (default 2200)
@@ -79,12 +80,17 @@ CA_METALLIB	arg	ca_metallib	User space	u	inject.c
 CA_PROF	arg	ca_prof	User space	u	HakiosMetalCA.m	
 CA_VBL	arg	ca_vbl	User space	u	inject.c	CoreAnimation's frame clock from the display driver's refresh notifications
 CAENV	arg	caenv	User space	u	inject.c,inject_sb.c	CoreAnimation's switches here as in the window server (inject.c), set before QuartzCore reads them
+CALL	arg	call	Cellular	k	hakios.mpss.c	
+CALL_ANSWER	arg	call_answer	Cellular	k	hakios.mpss.c	an incoming call is answered (Answer Call 0x22) after some 4 s, and hung up after call_secs
+CALL_SECS	arg	call_secs	Cellular	k	hakios.mpss.c	
+CALL_TO	arg	call_to	Cellular	k	hakios.mpss.c	dial it (Dial Call 0x20, TLV 1 = the number as text) some 10 s after the modem is registered
 CAM6T	arg	cam6t	Loader	kl	hakios.cam6t.c,loader.c	
 CAM6T_AFTER	arg	cam6t_after	User space	k	hakios.cam6t.c	when (seconds after the driver starts; 10): the steps that are not Darwin's (1 to 5) were run at 50, away
 CAM6T_EXPOSURE	arg	cam6t_exposure	User space	k	hakios.cam6t.c	
 CAM6T_FOCUS	arg	cam6t_focus	User space	k	hakios.cam6t.c	
 CAM6T_GAIN	arg	cam6t_gain	User space	k	hakios.cam6t.c	
 CAM6T_MODE	arg	cam6t_mode	User space	k	hakios.cam6t.c	
+CAM6T_RPMH_AFTER	arg	cam6t_rpmh_after	User space	k	hakios.cam6t.c	
 CAM6T_SENSOR	arg	cam6t_sensor	User space	k	hakios.cam6t.c	
 CAM6T_SETTLE	arg	cam6t_settle	User space	k	hakios.cam6t.c	
 CAM6T_XO	arg	cam6t_xo	User space	k	hakios.cam6t.c	
@@ -106,15 +112,40 @@ CELL_FAKE	arg	cell_fake	Cellular	k	hakios.cell.c
 CELL_PING	arg	cell_ping	Cellular	k	hakios.cell.c	the data path tried without Darwin -- once the session is up, ten ICMP echoes from the session's
 CELL_PING_SIZE	arg	cell_ping_size	Cellular	k	hakios.cell.c	
 CELL_PING_TO	arg	cell_ping_to	Cellular	k	hakios.cell.c	
+CPU_PSCI_CLUSTER_PROBE	arg	cpu_psci_cluster_probe	CPU, memory and boot	k	hakios.cpufreq.c	
+CPU_PSCI_IDLE	arg	cpu_psci_idle	User space	k	psci_smp.c	turn it on (0: off, the default)
+CPU_PSCI_IDLE_CORE	arg	cpu_psci_idle_core	User space	k	psci_smp.c	the core to test (default 1; refused if it is the boot processor)
+CPU_PSCI_IDLE_TEST	arg	cpu_psci_idle_test	User space	k	psci_smp.c	collapse N times on the chosen core, then stop (0: off)
+CPU_PSCI_NOCLUSTER	arg	cpu_psci_nocluster	User space	k	psci_smp.c	
+CPU_PSCI_PROBE	arg	cpu_psci_probe	User space	k	psci_smp.c	
+CPU_PSCI_WAKESLEEP	arg	cpu_psci_wakesleep	User space	k	psci_smp.c	
+CPU_RPMH_SLEEP	arg	cpu_rpmh_sleep	CPU, memory and boot	k	hakios.cpufreq.c	
 CPUFREQ_OSM	arg	cpufreq_osm	CPU, memory and boot	k	hakios.cpufreq.c	
 CPUFREQ_OSM_MHZ	arg	cpufreq_osm_mhz	CPU, memory and boot	k	hakios.cpufreq.c	
 CPUFREQ_OSM_SMALL_MHZ	arg	cpufreq_osm_small_mhz	CPU, memory and boot	k	hakios.cpufreq.c	
 CPULOAD	arg	cpuload	CPU, memory and boot	k	hakios.cpufreq.c	every MS milliseconds, how busy each of our cores was meanwhile, in percent, to the loader's log (tools/frames.py shows it per gesture)
 CPUMASK	arg	cpumask	Loader	l	loader.c	
+DATA_SUB	arg	data_sub	Cellular	k	hakios.mpss.c	
+DCM_IND_FAMILY	arg	dcm_ind_family	Cellular	k	hakios.mpss.c	
+DCM_NOLL	arg	dcm_noll	Cellular	k	hakios.mpss.c	
+DCM_OLD	arg	dcm_old	Cellular	k	hakios.mpss.c	
 DDR	arg	ddr	CPU, memory and boot	k	hakios.cpufreq.c	the memory's bus clock managers ("BCM") in the command database the boot loader left, with what is needed to vote for bandwidth on them -- only read
 DDR_REST	arg	ddr_rest	CPU, memory and boot	k	hakios.cpufreq.c	
 DDR_VOTE	arg	ddr_vote	CPU, memory and boot	k	hakios.cpufreq.c	
 DISPLAY_PROBE	arg	display_probe	GPU and display	k	hakios.adreno.c	before any step: read what the firmware left the display controller doing (display_probe() below; two clocks are turned on, nothing else written)
+DUMPS	arg	dumps	Cellular	k	hakios.mpss.c	
+F3	arg	f3	Cellular	k	hakios.mpss.c	
+F3_ALL	arg	f3_all	Cellular	k	hakios.mpss.c	
+F3_ALLRANGES	arg	f3_allranges	Cellular	k	hakios.mpss.c	
+F3_ANDROID	arg	f3_android	Cellular	k	hakios.mpss.c	
+F3_BARE	arg	f3_bare	Cellular	k	hakios.mpss.c	
+F3_FIRST	arg	f3_first	Cellular	k	hakios.mpss.c	
+F3_ID	arg	f3_id	Cellular	k	hakios.mpss.c	
+F3_MIN	arg	f3_min	Cellular	k	hakios.mpss.c	
+F3_RANGES_FIRST	arg	f3_ranges_first	Cellular	k	hakios.mpss.c	
+F3_RAW	arg	f3_raw	Cellular	k	hakios.mpss.c	
+F3_RSP	arg	f3_rsp	Cellular	k	hakios.mpss.c	
+F3_SSID	arg	f3_ssid	Cellular	k	hakios.mpss.c	
 FASTRPC_LOG	arg	fastrpc_log	User space	k	hakios.slpi.c	
 FASTRPC_MEM	hex	fastrpc_mem	User space	k	hakios.slpi.c	
 FB_AUTO	arg	fb_auto	GPU and display	k	MiniIOMobileFramebuffer.cpp	
@@ -183,6 +214,14 @@ GPU_EXACT	arg	gpu_exact	GPU and display	k	hakios.adreno.c
 GPU_KEEP	arg	gpu_keep	GPU and display	k	hakios.gpu.cpp	
 GPU_LOG	arg	gpu_log	GPU and display	k	hakios.adreno.c	
 HAPTIC_EFFECT	arg	haptic_effect	Haptics and torch	k	hakios.haptic.c	
+IMS_FORWARD	arg	ims_forward	Cellular	k	hakios.cell.c	
+IMS_PDN	arg	ims_pdn	Cellular	k	hakios.mpss.c	
+IMS_TECH	arg	ims_tech	Cellular	k	hakios.mpss.c	
+IMS_UNTYPED	arg	ims_untyped	Cellular	k	hakios.mpss.c	
+IMSA_NOIND	arg	imsa_noind	Cellular	k	hakios.mpss.c	
+INJECT_APPS	arg	inject_apps	CPU, memory and boot	k	(patch)	
+IPA_HEADER_FREE	arg	ipa_header_free	Cellular	k	hakios.mpss.c	
+IPA_META	arg	ipa_meta	Cellular	k	hakios.mpss.c	
 M2V_UTRACE	arg	m2v_utrace	User space	u	HakiosMetalCA.m	Turnip's GPU trace of every render pass (u_trace) into a file, printed during the run
 MACHINE_NAME	arg	machine_name	CPU, memory and boot	k	GenericARMPE.cpp	
 MEMBENCH	arg	membench	CPU, memory and boot	k	hakios.cpufreq.c	
@@ -221,6 +260,7 @@ MODEM_IPA_FW	arg	modem_ipa_fw	Cellular	k	hakios.mpss.c
 MODEM_IPA_FW_AT	arg	modem_ipa_fw_at	Cellular	k	hakios.mpss.c	
 MODEM_IPA_GSI_ENABLE	arg	modem_ipa_gsi_enable	Cellular	k	hakios.mpss.c	
 MODEM_IPA_ITEM	arg	modem_ipa_item	Cellular	k	hakios.mpss.c	
+MODEM_IPA_MAP_1G	arg	modem_ipa_map_1g	Cellular	k	hakios.mpss.c	
 MODEM_IPA_NO_AGGR	arg	modem_ipa_no_aggr	Cellular	k	hakios.ipa.c	
 MODEM_IPA_NO_PROBE	arg	modem_ipa_no_probe	Cellular	k	hakios.mpss.c	
 MODEM_IPA_QUIET	arg	modem_ipa_quiet	Cellular	k	hakios.mpss.c	
@@ -254,6 +294,9 @@ MODEM_STEP	arg	modem_step	Cellular	k	hakios.mpss.c	the steps once the root is th
 MODEM_STOP	arg	modem_stop	Cellular	k	hakios.mpss.c	
 MODEM_WAIT	arg	modem_wait	Cellular	k	hakios.mpss.c	
 MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c	
+PAS_SETTLE	arg	pas_settle	User space	k	hakios.platform.c	
+PDC	arg	pdc	Cellular	k	hakios.mpss.c	
+PDC_USE	arg	pdc_use	Cellular	k	hakios.mpss.c	
 PMI_CHARGER	arg	pmi_charger	User space	k	hakios.pmi_charger.c	reading only: which blocks answer and what they say they are, then every pmi_charger_every=S seconds (30) one line: the charger's state, its input
 PMI_CHARGER_AFTER	arg	pmi_charger_after	User space	k	hakios.pmi_charger.c	
 PMI_CHARGER_EVERY	arg	pmi_charger_every	User space	k	hakios.pmi_charger.c	
@@ -266,6 +309,7 @@ PMIC_LIST	arg	pmic_list	Chip, thermal and PMIC	k	hakios.pmic.c	only the clock, n
 PRESS_POWER	arg	press_power	Touch and buttons	k	hakios.buttons.c	a short press of the power key that many seconds after boot, and another ten seconds later, given to Darwin as the key's own are (hakios_touch_post):
 PRESS_POWER_MS	arg	press_power_ms	Touch and buttons	k	hakios.buttons.c	
 PRIVS	arg	privs	Security stand-ins	k	kern_minimac.c	
+PROFILES	arg	profiles	Cellular	k	hakios.mpss.c	
 RD	arg	rd	CPU, memory and boot	kl	(patch),loader.c	
 REC_MB	arg	rec_mb	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 REC_RING	arg	rec_ring	GPU and display	k	MiniIOMobileFramebuffer.cpp	
@@ -279,6 +323,7 @@ REGTRACE	arg	regtrace	CPU, memory and boot	k	(patch)
 RETURN_CPU	arg	return_cpu	CPU, memory and boot	k	loader_return.c	
 RETURN_PANIC	arg	return_panic	CPU, memory and boot	k	loader_return.c	
 ROOT_APFS	arg	root_apfs	User space	u	init.c	the root is to be the Darwin root volume on /dev/DEV -- the phone's flash, read only
+SB_LTE	arg	sb_lte	User space	u	inject_sb.c	
 SERIAL	arg	serial	Loader	l	loader.c	
 SLIDER	arg	slider	User space	k	hakios.slider.c	a look, reading only: the three pins' setup and levels at the start, then every 50 ms, and each change said with its time
 SLIM	arg	slim	User space	k	hakios.slim.c	the QMI part alone; slim=2: the NGD as well; slim=3: the codec's clock and reset too
@@ -296,6 +341,7 @@ SLPI_STEP	arg	slpi_step	User space	k	hakios.slpi.c
 SLPI_WAIT	arg	slpi_wait	User space	k	hakios.slpi.c	
 SMALL_CORES	arg	small_cores	CPU, memory and boot	k	(patch)	
 SMALL_CORES_AFTER	arg	small_cores_after	CPU, memory and boot	k	GenericARMPE.cpp	
+SMS	arg	sms	Cellular	k	hakios.mpss.c	
 SMS_TO	arg	sms_to	Cellular	k	hakios.mpss.c	
 SOC_ADSP_CX	hex	soc_adsp_cx	Audio and battery	k	hakios.adsp.c	
 SOC_ADSP_MEM	hex	soc_adsp_mem	Audio and battery	k	hakios.adsp.c	
@@ -383,6 +429,9 @@ VBLUR	arg	vblur	GPU and display	u	eagl.c
 VIRTIO_BLK	arg	virtio_blk	Storage and APFS	k	hakios.virtio_blk.c	
 VIRTIO_INPUT	arg	virtio_input	Touch and buttons	k	hakios.virtio_input.c	
 VIRTIO_SOUND	arg	virtio_sound	Audio and battery	k	hakios.virtio_sound.c	
+VOICE	arg	voice	Audio and battery	k	hakios.mic.c	
+VOICE_DOMAIN	arg	voice_domain	Cellular	k	hakios.mpss.c	set once (Set System Selection Preference 0x33, TLV 0x23) when it differs
+VOLTE	arg	volte	Cellular	k	hakios.mpss.c	
 WALLPAPER_CACHE	arg	wallpaper_cache	User space	u	inject_sb.c	the window that shows the wallpaper rasterized by the window server (CALayer's shouldRasterize), drawn from one texture instead of composed again
 WALLPAPER_FREEZE	arg	wallpaper_freeze	User space	u	inject_sb.c	the wallpaper as one still picture
 WIFI10	arg	wifi10	User space	k	hakios.wlfw10.c	the indications ath10k wants (firmware ready, MSA ready); the firmware's status
