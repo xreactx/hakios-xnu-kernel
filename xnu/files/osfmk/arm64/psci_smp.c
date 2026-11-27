@@ -217,6 +217,7 @@ static uint8_t          psci_idle_collapsed[MAX_CPUS];  /* set across a collapse
  */
 #define PSCI_END_OF_ALL_TIME    0xFFFFFFFFFFFFFFFFULL  /* rtclock.h EndOfAllTime: no finite timer pending */
 #define PSCI_QUIESCE_FAILED     (-1000)                 /* distinct from any PSCI error (0..-9): the GICR_WAKER quiesce backed out, no CPU_SUSPEND issued */
+#define PSCI_MIN_RES_US_DEFAULT 10000u                  /* cpu_psci_min_res_us default: 10 ms, the cluster-sleep-0 min-residency */
 #define PSCI_PROD_DEFAULT_CORE  1                       /* logical cpu 1 = phys 0x600, a big core that stays online */
 #define PSCI_PROD_LOG_EVERY     512u                    /* throttle the hot-path breadcrumb to the log */
 
@@ -231,7 +232,8 @@ static _Atomic uint32_t psci_quiesce_fails;             /* collapses skipped bec
 static int              psci_prod_core = PSCI_PROD_DEFAULT_CORE;
 static _Atomic uint32_t psci_prod_suspends;             /* collapses attempted from the real idle path */
 static _Atomic uint32_t psci_prod_fallbacks;            /* CPU_SUSPEND returned without collapsing */
-static _Atomic uint32_t psci_prod_skipped;              /* gated out: a finite timer deadline was pending */
+static _Atomic uint32_t psci_prod_skipped;              /* gated out: a finite timer deadline was too soon (residency gate) */
+static uint64_t         psci_min_res_ticks;             /* residency gate: collapse only if the expected idle clears this (mach-absolute ticks) */
 static _Atomic uint32_t psci_cpus_down;                 /* cluster mode: cores currently collapsed; the one that makes it == all cores asks for the cluster state */
 static _Atomic uint32_t psci_dist_down;                 /* set by the last-man after a cluster collapse saved the GIC distributor; the first core to wake restores it */
 static bool             psci_osi_enabled;               /* PSCI OS-initiated mode turned on (needed to request the cluster state) */
@@ -528,6 +530,16 @@ psci_smp_idle_selftest_init(void)
 			psci_bcast_init();                      /* the always-on wake for the per-core deep states */
 			psci_rsc_init();                        /* the apps_rsc map, for the cluster wakeup (CONTROL TCS) */
 
+			/* Residency gate threshold (ticks). cpu_psci_min_res_us overrides the 10 ms default. */
+			{
+				uint32_t us = PSCI_MIN_RES_US_DEFAULT;
+				uint32_t hz = psci_bcast_freq ? psci_bcast_freq : 19200000u;
+				(void)PE_parse_boot_argn("cpu_psci_min_res_us", &us, sizeof(us));
+				psci_min_res_ticks = (uint64_t)us * hz / 1000000u;
+				printf("psci: residency gate = %u us (%llu ticks @ %u Hz): collapse only if the expected idle is at least this\n",
+				    us, psci_min_res_ticks, hz);
+			}
+
 			/*
 			 * Turn collapse ON only now that OSI and the broadcast timer are ready: set the
 			 * flags, publish them, and set the gate (psci_prod_enabled) LAST -- otherwise a core
@@ -623,16 +635,22 @@ psci_smp_idle(int cpu, uint64_t rtcPop)
 	}
 	if (rtcPop != PSCI_END_OF_ALL_TIME) {
 		/*
-		 * A finite deadline. The cluster path can keep it across the power-down by arming the
-		 * always-on broadcast timer (tick broadcast); the shallow paths have no such wake, so they
-		 * must fall back to WFI. Either way, if we cannot cover the deadline we do not power down.
+		 * A finite deadline. RESIDENCY GATE: a collapse pays a large fixed cost -- a CleanPoC cache
+		 * flush, and (cluster) a GIC distributor save+restore of ~640 SPIs -- so entering for a short
+		 * window loses far more energy than it saves and, done on every periodic tick, thrashes the
+		 * SoC hot. Only collapse if the expected idle (deadline - now) clears the state's
+		 * min-residency (cpu_psci_min_res_us, default 10 ms = the cluster min-residency). Then the
+		 * cluster path keeps the deadline across the power-down via the broadcast timer; the shallow
+		 * paths have no such wake and fall back to WFI regardless.
 		 */
-		bool covered = psci_prod_cluster && psci_bcast_cover(rtcPop);
+		uint64_t now = mach_absolute_time();
+		bool long_enough = (rtcPop > now) && ((rtcPop - now) >= psci_min_res_ticks);
+		bool covered = long_enough && psci_prod_cluster && psci_bcast_cover(rtcPop);
 
 		if (!covered) {
 			os_atomic_inc(&psci_prod_skipped, relaxed);
 			if (!psci_prod_force) {
-				return false;   /* deadline we would lose across the power-down: WFI (unless forced, to test the firmware wake) */
+				return false;   /* too-soon deadline (or no broadcast): WFI, not worth the collapse (unless forced) */
 			}
 		}
 	}
