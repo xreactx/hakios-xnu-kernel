@@ -450,21 +450,21 @@ psci_bcast_wake(void *context __unused, uint32_t intid __unused)
 }
 
 /*
- * apps_rsc CONTROL TCS: the real wake for a whole-cluster collapse. In the cluster-sleep state the
- * GIC (and the broadcast SPI with it) is powered down, so the system is woken by the RSC/PDC
- * always-on timer instead. The OS arms it by writing the next wakeup -- a qtimer tick value -- into
- * the RSC's CONTROL TCS (OnePlus downstream setup_wakeup() -> rpmh_write_control()): two command
- * words, cmd0 = (hi & 0xFFFFFF) | VALID, cmd1 = lo. On this board (tcs-config 2 active / 3 sleep /
- * 3 wake / 1 control) the control TCS is slot 8, with the usual per-command registers; the Stage-0
- * probe found it empty. No trigger is needed -- the RSC/PDC hardware consumes it on sleep entry.
+ * apps_rsc control (HIDDEN) TCS: the real wake for a whole-cluster collapse. In the cluster-sleep
+ * state the GIC (and the broadcast SPI with it) is powered down, so the system is woken by the
+ * RSC/PDC always-on timer. The OS arms it by writing the next wakeup -- a qtimer tick value -- into
+ * the RSC's control TCS (OnePlus downstream setup_wakeup() -> rpmh_write_control() -> the mailbox
+ * driver's __tcs_write_hidden()). The control TCS is NOT a normal TCS slot: it is the "hidden" TCS,
+ * two DATA-only registers at the DRV register base (drv->base, i.e. RSC_PHYS without the 0xd00 TCS
+ * offset): cmd0 at +0x38 = (hi & 0xFFFFFF) | VALID, cmd1 at +0x38+0x08 = lo. Data only -- no
+ * addr/msgid, no trigger; the RSC/PDC hardware (its PDC sequence is already set up by the firmware)
+ * consumes it on sleep entry. (An earlier version wrote the normal TCS slot 8 at 0xd00+0x2a0*8,
+ * which is why the cluster never woke.)
  */
-#define RSC_PHYS                0x179e0000u     /* soc_rsc: apps_rsc DRV-2, the one HakiOS uses */
+#define RSC_PHYS                0x179e0000u     /* soc_rsc: apps_rsc DRV-2 register base (drv->base) */
 #define RSC_SIZE                0x10000u
-#define RSC_TCS(n, reg)         (0xd00u + 0x2a0u * (n) + (reg))
-#define RSC_CONTROL_TCS         8u
-#define RSC_CMD_MSGID(c)        (0x30u + 20u * (c))
-#define RSC_CMD_ADDR(c)         (0x34u + 20u * (c))
-#define RSC_CMD_DATA(c)         (0x38u + 20u * (c))
+#define RSC_HIDDEN_CMD0_DATA    0x38u           /* drv->base + 0x38: control-TCS command-0 data */
+#define RSC_HIDDEN_CMD_SHIFT    0x08u           /* stride between the hidden TCS's two data words */
 #define PDC_TIME_VALID          (1u << 31)
 #define PDC_TIME_UPPER_MASK     0xFFFFFFu
 
@@ -474,8 +474,8 @@ static void
 psci_rsc_init(void)
 {
 	psci_rsc_base = ml_io_map(RSC_PHYS, RSC_SIZE);
-	printf("psci: apps_rsc at %#x mapped; cluster wake = CONTROL TCS %u + GIC distributor save/restore\n",
-	    RSC_PHYS, RSC_CONTROL_TCS);
+	printf("psci: apps_rsc at %#x mapped; cluster wake = hidden-TCS wakeup (+0x%x) + GIC distributor save/restore\n",
+	    RSC_PHYS, RSC_HIDDEN_CMD0_DATA);
 }
 
 /* Arm the RSC/PDC wakeup at qtimer value cval (the broadcast frame's CVAL = the next deadline). */
@@ -487,15 +487,10 @@ psci_rsc_program_wakeup(uint64_t cval)
 	if (psci_rsc_base == 0) {
 		return;
 	}
-	/* command 0: upper time + valid bit */
-	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_MSGID(0))) = 0;
-	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_ADDR(0))) = 0;
-	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_DATA(0))) =
+	/* hidden-TCS cmd0: upper time (24 bits) + valid; cmd1: lower time. Data only. */
+	*(volatile uint32_t *)(psci_rsc_base + RSC_HIDDEN_CMD0_DATA) =
 	    (hi & PDC_TIME_UPPER_MASK) | PDC_TIME_VALID;
-	/* command 1: lower time */
-	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_MSGID(1))) = 0;
-	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_ADDR(1))) = 0;
-	*(volatile uint32_t *)(psci_rsc_base + RSC_TCS(RSC_CONTROL_TCS, RSC_CMD_DATA(1))) = lo;
+	*(volatile uint32_t *)(psci_rsc_base + RSC_HIDDEN_CMD0_DATA + RSC_HIDDEN_CMD_SHIFT) = lo;
 	__builtin_arm_dsb(DSB_SY);
 }
 
