@@ -269,9 +269,10 @@ psci_cpu_powerdown(int cpu, uint32_t state)
  * always-on timer to wake it. SDM845's memory-mapped timer (timer@0x17c90000) frame 0 at
  * 0x17ca0000 is in an always-on domain and survives the collapse; its physical compare, armed
  * before the last core goes down, fires GIC SPI 7 (intid 39) to wake the system through the
- * (still-powered at cluster level) GIC. The frame shares the system counter, so a mach_absolute
- * deadline (what rtcPop holds) is directly comparable -- here we arm a short relative wake to
- * prove the mechanism before wiring the real deadline.
+ * (still-powered at cluster level) GIC. The frame shares the system counter with mach_absolute_time
+ * at the same 19.2 MHz rate (possibly a different zero point), so a core's next deadline converts
+ * into the frame's domain through the current interval; psci_bcast_cover() keeps the compare at the
+ * earliest such deadline of every core going down, and psci_bcast_wake() wakes the whole cluster.
  */
 #define BCAST_TIMER_PHYS        0x17ca0000u
 #define BCAST_TIMER_SIZE        0x1000u
@@ -282,9 +283,40 @@ psci_cpu_powerdown(int cpu, uint32_t state)
 #define BCAST_CNTP_CVAL_LO      0x20
 #define BCAST_CNTP_CVAL_HI      0x24
 #define BCAST_CNTP_CTL          0x2c            /* bit0 enable, bit1 imask */
+#define PSCI_BCAST_SAFETY_SECS  3u              /* bring-up backstop wake when no core has a real deadline */
 
 static vm_offset_t      psci_bcast_base;
 static uint32_t         psci_bcast_freq;
+static uint64_t         psci_bcast_deadline;    /* broadcast-domain CNTPCT the compare is armed at; 0 = disarmed */
+static _Atomic uint32_t psci_bcast_spin;        /* guards the deadline bookkeeping (interrupts are already off here) */
+
+/*
+ * A tiny spinlock around the broadcast deadline. Several cores can race to arm the timer to their
+ * own next deadline as they enter idle; the lock makes "program the compare to the EARLIEST of them"
+ * atomic (otherwise a later writer could clobber an earlier deadline and we would wake too late).
+ * Interrupts are already disabled on the idle path, so this can never deadlock against an IRQ.
+ */
+static inline void
+psci_bcast_spin_lock(void)
+{
+	while (os_atomic_xchg(&psci_bcast_spin, 1, acquire)) {
+		__builtin_arm_yield();
+	}
+}
+
+static inline void
+psci_bcast_spin_unlock(void)
+{
+	os_atomic_store(&psci_bcast_spin, 0, release);
+}
+
+/* Read the always-on frame's system counter (the broadcast domain). */
+static inline uint64_t
+psci_bcast_now(void)
+{
+	return ((uint64_t)*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTPCT_HI) << 32) |
+	       *(volatile uint32_t *)(psci_bcast_base + BCAST_CNTPCT_LO);
+}
 
 static void
 psci_bcast_disarm(void)
@@ -295,27 +327,92 @@ psci_bcast_disarm(void)
 	}
 }
 
+/* Program the compare to an absolute broadcast-domain value. Mask while writing the two halves so a
+ * torn 64-bit compare can never momentarily read as due. Caller holds psci_bcast_spin. */
 static void
-psci_bcast_arm(uint64_t ticks)
+psci_bcast_arm_at(uint64_t cval)
 {
-	uint64_t now;
-
 	if (psci_bcast_base == 0) {
 		return;
 	}
-	now = ((uint64_t)*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTPCT_HI) << 32) |
-	    *(volatile uint32_t *)(psci_bcast_base + BCAST_CNTPCT_LO);
-	now += ticks;
-	*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTP_CVAL_HI) = (uint32_t)(now >> 32);
-	*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTP_CVAL_LO) = (uint32_t)now;
-	*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTP_CTL) = 1;   /* enable, unmasked */
+	*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTP_CTL) = 0;    /* disable while retargeting */
+	*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTP_CVAL_HI) = (uint32_t)(cval >> 32);
+	*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTP_CVAL_LO) = (uint32_t)cval;
+	*(volatile uint32_t *)(psci_bcast_base + BCAST_CNTP_CTL) = 1;    /* enable, unmasked */
 	__builtin_arm_dsb(DSB_SY);
 }
 
+/* Relative-interval arm (bring-up safety net only). Caller holds psci_bcast_spin. */
+static void
+psci_bcast_arm(uint64_t ticks)
+{
+	if (psci_bcast_base == 0) {
+		return;
+	}
+	psci_bcast_deadline = psci_bcast_now() + ticks;
+	psci_bcast_arm_at(psci_bcast_deadline);
+}
+
+/*
+ * Register an idle core's next timer deadline with the broadcast timer. rtcPop is a finite
+ * mach_absolute_time() deadline; the frame runs the same 19.2 MHz counter at (possibly) a different
+ * zero point, so convert through the current interval -- timebase-offset-agnostic -- into the
+ * broadcast domain, then keep the compare at the EARLIEST deadline of every core now going down.
+ * Returns true once the broadcast is guaranteed to fire no later than rtcPop (safe to collapse a
+ * core whose per-core timer the power-down will stop); false if there is no always-on wake or the
+ * deadline is already due, in which case the caller must not power down (it does a plain WFI).
+ */
+static bool
+psci_bcast_cover(uint64_t rtcPop)
+{
+	uint64_t mach_now, bcast_dl;
+
+	if (psci_bcast_base == 0) {
+		return false;                   /* no always-on wake available: cannot collapse with a deadline */
+	}
+	mach_now = mach_absolute_time();
+	if (rtcPop <= mach_now) {
+		return false;                   /* already due: stay out of the power-down */
+	}
+	psci_bcast_spin_lock();
+	bcast_dl = psci_bcast_now() + (rtcPop - mach_now);
+	if (psci_bcast_deadline == 0 || bcast_dl < psci_bcast_deadline) {
+		psci_bcast_deadline = bcast_dl;
+		psci_bcast_arm_at(bcast_dl);
+	}
+	psci_bcast_spin_unlock();
+	return true;
+}
+
+/*
+ * The broadcast fired: the earliest registered deadline is due. Stop it re-firing, forget the
+ * deadline, and wake the whole cluster -- every core still collapsed gets a cpu_signal SGI so it
+ * leaves CPU_SUSPEND, services its own (now due or still-pending) timer, and re-registers on its
+ * next idle. Waking all of them (rather than only the owner of the earliest deadline) keeps this
+ * correct without per-core deadline tracking: no deadline can be missed because every core is back
+ * up to evaluate its own, and the only cost is an occasional early wake that immediately re-idles.
+ */
 static void
 psci_bcast_wake(void *context __unused, uint32_t intid __unused)
 {
+	int me = cpu_number(), max_cpu = ml_get_max_cpu_number();
+
+	psci_bcast_spin_lock();
+	psci_bcast_deadline = 0;
 	psci_bcast_disarm();            /* the wake has happened; stop it re-firing */
+	psci_bcast_spin_unlock();
+
+	for (int cpu = 0; cpu <= max_cpu; cpu++) {
+		cpu_data_t *cdp;
+
+		if (cpu == me || cpu >= MAX_CPUS || !psci_idle_collapsed[cpu]) {
+			continue;
+		}
+		cdp = cpu_datap(cpu);
+		if (cdp != NULL) {
+			gic_v3_irq_signal(cdp->cpu_phys_id);
+		}
+	}
 }
 
 static void
@@ -409,13 +506,14 @@ psci_smp_idle_selftest_init(void)
  * cpu_psci_idle=2 (Phase 2). Returns true when it handled the idle (collapsed-and-resumed, or
  * fell back to WFI itself); false means the caller should do the ordinary WFI.
  *
- * It collapses ONLY when the core has no finite timer deadline pending (rtcPop == EndOfAllTime):
- * a powered-down core loses its per-core architected timer and can be woken only by an interrupt
- * at its redistributor -- a device IRQ, or the reschedule SGI another core sends (gic_send_sgi) --
- * so a pending local deadline would simply be missed until some unrelated interrupt arrived. That
- * same test is the residency gate: with no finite deadline the expected residency is effectively
- * unbounded, well past this state's ~1.9ms min-residency. A finite deadline falls through to WFI
- * (a broadcast-timer substitute, needed to collapse with a deadline pending, is a later phase).
+ * A powered-down core loses its per-core architected timer, so it can be woken only by an interrupt
+ * at its redistributor -- a device IRQ, or an SGI another core sends. In the shallow paths
+ * (cpu_psci_idle=1/2, no broadcast) that means it collapses ONLY with no finite deadline pending
+ * (rtcPop == EndOfAllTime), falling through to WFI otherwise. In the cluster path (cpu_psci_idle=3)
+ * a finite deadline is fine: psci_bcast_cover() registers it with the always-on broadcast timer,
+ * which is kept at the earliest deadline of every core going down and, when it fires, wakes the
+ * whole cluster so each core services its own timer (tick broadcast). The no-deadline case is still
+ * the residency gate too: expected residency is then effectively unbounded, well past min-res.
  */
 bool
 psci_smp_idle(int cpu, uint64_t rtcPop)
@@ -433,9 +531,18 @@ psci_smp_idle(int cpu, uint64_t rtcPop)
 		return false;                   /* single-core mode and not the chosen core: ordinary WFI */
 	}
 	if (rtcPop != PSCI_END_OF_ALL_TIME) {
-		os_atomic_inc(&psci_prod_skipped, relaxed);
-		if (!psci_prod_force) {
-			return false;           /* a finite deadline we would lose across the power-down: WFI (unless forced, to test firmware wake) */
+		/*
+		 * A finite deadline. The cluster path can keep it across the power-down by arming the
+		 * always-on broadcast timer (tick broadcast); the shallow paths have no such wake, so they
+		 * must fall back to WFI. Either way, if we cannot cover the deadline we do not power down.
+		 */
+		bool covered = psci_prod_cluster && psci_bcast_cover(rtcPop);
+
+		if (!covered) {
+			os_atomic_inc(&psci_prod_skipped, relaxed);
+			if (!psci_prod_force) {
+				return false;   /* deadline we would lose across the power-down: WFI (unless forced, to test the firmware wake) */
+			}
 		}
 	}
 
@@ -459,16 +566,32 @@ psci_smp_idle(int cpu, uint64_t rtcPop)
 		uint32_t down = os_atomic_inc_orig(&psci_cpus_down, relaxed) + 1;
 		bool last = down >= num;
 
-		if (last) {
-			/* The whole APSS is going down: arm the always-on broadcast timer so the system has a
-			 * wake (the per-core timers are gone). A short relative wake for now, to prove it. */
-			psci_bcast_arm(psci_bcast_freq ? psci_bcast_freq / 10 : 0);     /* ~100 ms */
+		if (last && psci_bcast_freq != 0) {
+			/*
+			 * The whole APSS is about to go down. If some core already registered a deadline, the
+			 * broadcast is armed to it and covers the wake. If NONE did (every core idle with no
+			 * finite timer -- real suspend), a device IRQ via the GIC/PDC is the intended wake, but
+			 * as a bring-up safety net arm a far backstop wake so an untested wake path can never
+			 * hang the system silently; a real deadline, being sooner, always wins the min.
+			 */
+			psci_bcast_spin_lock();
+			if (psci_bcast_deadline == 0) {
+				psci_bcast_arm(psci_bcast_freq * PSCI_BCAST_SAFETY_SECS);
+			}
+			psci_bcast_spin_unlock();
 		}
 		status = psci_cpu_powerdown(cpu, last ? PSCI_CLUSTER_PD_STATE : PSCI_PERCORE_RAIL_STATE);
-		if (last) {
-			psci_bcast_disarm();                    /* only reached if it did NOT collapse */
+		/*
+		 * Only here if it did NOT collapse (a successful collapse returns through the resume path,
+		 * which does the decrement). Back this core out of the down-count; if it was the last one
+		 * still notionally down, nothing is left to wake, so drop the broadcast too.
+		 */
+		if (os_atomic_dec(&psci_cpus_down, relaxed) == 0) {
+			psci_bcast_spin_lock();
+			psci_bcast_deadline = 0;
+			psci_bcast_disarm();
+			psci_bcast_spin_unlock();
 		}
-		os_atomic_dec(&psci_cpus_down, relaxed);        /* only reached if it did NOT collapse (resume does the decrement otherwise) */
 	} else {
 		status = psci_cpu_powerdown(cpu, PSCI_IDLE_PD_STATE);
 	}
@@ -539,8 +662,17 @@ psci_smp_idle_resumed(int cpu)
 	}
 	psci_idle_collapsed[cpu] = 0;
 	if (psci_prod_cluster) {
-		os_atomic_dec(&psci_cpus_down, relaxed);        /* this core is back up: balance the last-man-down count */
-		psci_bcast_disarm();                            /* woke (by the broadcast timer or anything else): stop it */
+		/*
+		 * This core is back up: balance the last-man-down count. Drop the broadcast only once the
+		 * LAST core is up -- a lone device-IRQ wake must not strip the timer out from under the
+		 * cores still collapsed (they are still relying on it for their deadlines).
+		 */
+		if (os_atomic_dec(&psci_cpus_down, relaxed) == 0) {
+			psci_bcast_spin_lock();
+			psci_bcast_deadline = 0;
+			psci_bcast_disarm();
+			psci_bcast_spin_unlock();
+		}
 	}
 	gic_v3_irq_cpu_resume();                /* the GIC CPU interface is gone; bring it back before anything needs it */
 	os_atomic_inc(&psci_idle_resumes, relaxed);
